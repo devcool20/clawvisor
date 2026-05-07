@@ -1,0 +1,346 @@
+package llm_test
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/clawvisor/clawvisor/internal/llm"
+	"github.com/clawvisor/clawvisor/pkg/config"
+)
+
+// geminiResponse builds a minimal generateContent response with usageMetadata.
+func geminiResponse(text string, cachedTokens int) []byte {
+	b, _ := json.Marshal(map[string]any{
+		"candidates": []map[string]any{
+			{
+				"content": map[string]any{
+					"parts": []map[string]any{{"text": text}},
+					"role":  "model",
+				},
+				"finishReason": "STOP",
+			},
+		},
+		"usageMetadata": map[string]any{
+			"promptTokenCount":        cachedTokens + 100,
+			"candidatesTokenCount":    20,
+			"cachedContentTokenCount": cachedTokens,
+			"totalTokenCount":         cachedTokens + 120,
+		},
+	})
+	return b
+}
+
+func newGeminiServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, config.LLMProviderConfig) {
+	t.Helper()
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+	return ts, config.LLMProviderConfig{
+		Provider:       "gemini",
+		Endpoint:       ts.URL, // bypass URL construction; client uses Endpoint as-is
+		Model:          "gemini-test",
+		TimeoutSeconds: 5,
+	}
+}
+
+func TestClient_Gemini_UncachedPath_InlinesSystemInstruction(t *testing.T) {
+	var captured map[string]any
+	ts, cfg := newGeminiServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &captured)
+		if r.Header.Get("Authorization") == "" {
+			t.Error("expected Authorization header")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(geminiResponse("hello", 0))
+	})
+	_ = ts
+
+	client := llm.NewClient(cfg).WithTokenSource(staticToken{})
+
+	got, err := client.Complete(context.Background(), []llm.ChatMessage{
+		{Role: "system", Content: "you are a verifier"},
+		{Role: "user", Content: "verify this"},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if got != "hello" {
+		t.Errorf("got %q, want hello", got)
+	}
+
+	// systemInstruction must be present (no cache).
+	si, ok := captured["systemInstruction"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected systemInstruction in body; got %v", captured)
+	}
+	parts, _ := si["parts"].([]any)
+	if len(parts) != 1 {
+		t.Fatalf("expected one part in systemInstruction; got %v", parts)
+	}
+	if part, _ := parts[0].(map[string]any); part["text"] != "you are a verifier" {
+		t.Errorf("system text: %v", part)
+	}
+	// cachedContent must NOT be present.
+	if _, has := captured["cachedContent"]; has {
+		t.Error("cachedContent should not be set on the uncached path")
+	}
+	// generationConfig defaults.
+	gc, _ := captured["generationConfig"].(map[string]any)
+	tc, _ := gc["thinkingConfig"].(map[string]any)
+	if tc["thinkingLevel"] != "MINIMAL" {
+		t.Errorf("default thinkingLevel: got %v, want MINIMAL", tc["thinkingLevel"])
+	}
+}
+
+func TestClient_Gemini_CachedPath_ReferencesCacheAndOmitsSystem(t *testing.T) {
+	var captured map[string]any
+	_, cfg := newGeminiServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &captured)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(geminiResponse("ok", 5500))
+	})
+
+	client := llm.NewClient(cfg).WithTokenSource(staticToken{})
+	const cacheName = "projects/p/locations/global/cachedContents/abc123"
+	client.AttachGeminiCacheNameFn(func() string { return cacheName })
+
+	_, usage, err := client.CompleteWithUsage(context.Background(), []llm.ChatMessage{
+		{Role: "system", Content: "you are a verifier"},
+		{Role: "user", Content: "verify"},
+	})
+	if err != nil {
+		t.Fatalf("CompleteWithUsage: %v", err)
+	}
+	if got := captured["cachedContent"]; got != cacheName {
+		t.Errorf("cachedContent: got %v, want %s", got, cacheName)
+	}
+	if _, has := captured["systemInstruction"]; has {
+		t.Error("systemInstruction must be omitted when cachedContent is set (mutually exclusive on the API)")
+	}
+	if usage.CacheReadInputTokens != 5500 {
+		t.Errorf("CacheReadInputTokens: got %d, want 5500", usage.CacheReadInputTokens)
+	}
+}
+
+func TestClient_Gemini_CachedPath_FallsThroughWhenCacheNameEmpty(t *testing.T) {
+	var captured map[string]any
+	_, cfg := newGeminiServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &captured)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(geminiResponse("ok", 0))
+	})
+
+	client := llm.NewClient(cfg).WithTokenSource(staticToken{})
+	// Cache function returns "" — should fall through to inline systemInstruction.
+	client.AttachGeminiCacheNameFn(func() string { return "" })
+
+	_, err := client.Complete(context.Background(), []llm.ChatMessage{
+		{Role: "system", Content: "system text"},
+		{Role: "user", Content: "user text"},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if _, has := captured["cachedContent"]; has {
+		t.Error("cachedContent should not be sent when cache function returns empty")
+	}
+	if _, has := captured["systemInstruction"]; !has {
+		t.Error("systemInstruction must be present when cache is unavailable")
+	}
+}
+
+func TestClient_Gemini_ConvertsAssistantToModelRole(t *testing.T) {
+	var captured map[string]any
+	_, cfg := newGeminiServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &captured)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(geminiResponse("ok", 0))
+	})
+	client := llm.NewClient(cfg).WithTokenSource(staticToken{})
+
+	_, err := client.Complete(context.Background(), []llm.ChatMessage{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "u"},
+		{Role: "assistant", Content: "a"},
+		{Role: "user", Content: "u2"},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	contents, _ := captured["contents"].([]any)
+	if len(contents) != 3 {
+		t.Fatalf("expected 3 conversation turns (system extracted); got %d", len(contents))
+	}
+	roles := []string{}
+	for _, c := range contents {
+		if m, _ := c.(map[string]any); m != nil {
+			if r, _ := m["role"].(string); r != "" {
+				roles = append(roles, r)
+			}
+		}
+	}
+	if strings.Join(roles, ",") != "user,model,user" {
+		t.Errorf("roles: got %v, want [user model user]", roles)
+	}
+}
+
+func TestClient_Gemini_404OnCachedRequest_RetriesWithInlineSystem(t *testing.T) {
+	// First request references cachedContent and gets a 404 (cache TTL
+	// elapsed server-side or refresh is failing). Client should retry once
+	// with systemInstruction inlined, succeeding the second attempt.
+	var bodies []map[string]any
+	_, cfg := newGeminiServer(t, func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		bodies = append(bodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":{"code":404,"message":"cached content gone"}}`))
+			return
+		}
+		w.Write(geminiResponse("recovered", 0))
+	})
+
+	client := llm.NewClient(cfg).WithTokenSource(staticToken{})
+	client.AttachGeminiCacheNameFn(func() string {
+		return "projects/p/locations/global/cachedContents/abc"
+	})
+
+	got, err := client.Complete(context.Background(), []llm.ChatMessage{
+		{Role: "system", Content: "system text"},
+		{Role: "user", Content: "user text"},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if got != "recovered" {
+		t.Errorf("got %q, want recovered", got)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("expected 2 requests (cached attempt + inline retry), got %d", len(bodies))
+	}
+	// First request must have used cachedContent.
+	if _, has := bodies[0]["cachedContent"]; !has {
+		t.Error("first request should have set cachedContent")
+	}
+	if _, has := bodies[0]["systemInstruction"]; has {
+		t.Error("first request should NOT have set systemInstruction")
+	}
+	// Second request must have inlined systemInstruction and dropped cachedContent.
+	if _, has := bodies[1]["cachedContent"]; has {
+		t.Error("retry should NOT have set cachedContent")
+	}
+	if _, has := bodies[1]["systemInstruction"]; !has {
+		t.Error("retry should have inlined systemInstruction")
+	}
+}
+
+func TestClient_Gemini_404Uncached_NoRetry(t *testing.T) {
+	// 404 on a request that was already uncached should NOT retry — there's
+	// nothing to fall back to. The error surfaces to the caller.
+	calls := 0
+	_, cfg := newGeminiServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":{"code":404,"message":"model not found"}}`))
+	})
+	client := llm.NewClient(cfg).WithTokenSource(staticToken{})
+	// No AttachGeminiCacheNameFn — uncached path.
+
+	_, err := client.Complete(context.Background(), []llm.ChatMessage{
+		{Role: "system", Content: "s"},
+		{Role: "user", Content: "u"},
+	})
+	if err == nil {
+		t.Fatal("expected 404 error to surface")
+	}
+	if calls != 1 {
+		t.Errorf("expected exactly 1 call (no retry), got %d", calls)
+	}
+}
+
+func TestClient_Gemini_NewClient_BuildsEndpointFromProjectAndRegion(t *testing.T) {
+	cfg := config.LLMProviderConfig{
+		Provider: "gemini",
+		Project:  "my-project",
+		Region:   "us-central1",
+		Model:    "gemini-3.1-flash-lite-preview",
+	}
+	c := llm.NewClient(cfg)
+	got := c.Endpoint()
+	want := "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-3.1-flash-lite-preview:generateContent"
+	if got != want {
+		t.Errorf("Endpoint:\n  got:  %s\n  want: %s", got, want)
+	}
+}
+
+func TestClient_Gemini_NewClient_GlobalRegionUsesUnprefixedHost(t *testing.T) {
+	cfg := config.LLMProviderConfig{
+		Provider: "gemini",
+		Project:  "my-project",
+		Region:   "global",
+		Model:    "gemini-3.1-flash-lite-preview",
+	}
+	c := llm.NewClient(cfg)
+	got := c.Endpoint()
+	want := "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global/publishers/google/models/gemini-3.1-flash-lite-preview:generateContent"
+	if got != want {
+		t.Errorf("global endpoint:\n  got:  %s\n  want: %s", got, want)
+	}
+}
+
+func TestNewGeminiCacheManager_RejectsNegativeTTL(t *testing.T) {
+	// Regression: negative TTL would propagate to time.NewTicker in the
+	// refresh goroutine and panic the process. Constructor must reject it.
+	_, err := llm.NewGeminiCacheManager(llm.GeminiCacheManagerConfig{
+		Project:      "p",
+		Region:       "global",
+		Model:        "gemini-test",
+		SystemPrompt: "sys",
+		TTL:          -1 * time.Second,
+		TokenSource:  staticToken{},
+	})
+	if err == nil {
+		t.Fatal("expected error for negative TTL, got nil")
+	}
+	if !strings.Contains(err.Error(), "TTL") {
+		t.Errorf("error should mention TTL, got: %v", err)
+	}
+}
+
+func TestClient_Gemini_LargeSuccessResponse_ReadInFull(t *testing.T) {
+	// Regression: an earlier version capped resp body reads at 64KB even on
+	// success, so long extraction outputs (8192-token cap, plus per-part
+	// thoughtSignature blobs) silently truncated mid-JSON and the decoder
+	// returned a parse error on otherwise valid responses. The success path
+	// must read the entire body.
+	const partLen = 200 * 1024 // 200KB of text — well past the old 64KB cap
+	largeText := strings.Repeat("x", partLen)
+	_, cfg := newGeminiServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(geminiResponse(largeText, 0))
+	})
+	client := llm.NewClient(cfg).WithTokenSource(staticToken{})
+
+	got, err := client.Complete(context.Background(), []llm.ChatMessage{
+		{Role: "system", Content: "s"},
+		{Role: "user", Content: "u"},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if len(got) != partLen {
+		t.Errorf("text length: got %d bytes, want %d (response was truncated)", len(got), partLen)
+	}
+}

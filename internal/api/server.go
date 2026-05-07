@@ -419,13 +419,16 @@ func (s *Server) routes() http.Handler {
 		if s.verdictCache != nil {
 			v.SetVerdictCache(s.verdictCache)
 		}
+		startGeminiCacheIfConfigured(s.llmCfg.Verification.LLMProviderConfig, s.logger, "verifier", v.StartGeminiCache)
 		verifier = v
 	}
 
 	// Construct chain context extractor (noop if disabled).
 	var extractor intent.Extractor = intent.NoopExtractor{}
 	if s.llmCfg.ChainContext.Enabled {
-		extractor = intent.NewLLMExtractor(s.llmHealth, s.logger)
+		ext := intent.NewLLMExtractor(s.llmHealth, s.logger)
+		startGeminiCacheIfConfigured(s.llmCfg.ChainContext.LLMProviderConfig, s.logger, "extractor", ext.StartGeminiCache)
+		extractor = ext
 	}
 
 	gatewayHandler := handlers.NewGatewayHandler(
@@ -1196,4 +1199,45 @@ func relayHostFromCfg(cfgURL string) string {
 		u = version.RelayURL()
 	}
 	return strings.TrimPrefix(strings.TrimPrefix(u, "wss://"), "ws://")
+}
+
+// startGeminiCacheIfConfigured runs the Gemini explicit-context-cache start
+// dance for an LLM-backed component (verifier, extractor, etc.). No-op
+// unless the provider is "gemini" and a cache is configured. Failures are
+// logged and swallowed — the caller continues uncached. The cache resource
+// auto-expires by TTL on Vertex's side, so no shutdown hook is needed.
+func startGeminiCacheIfConfigured(
+	cfg config.LLMProviderConfig,
+	logger *slog.Logger,
+	label string,
+	start func(context.Context, llm.GeminiCacheManagerConfig) error,
+) {
+	if cfg.Provider != "gemini" || cfg.GeminiCache == nil || !cfg.GeminiCache.Enabled {
+		return
+	}
+	cacheRegion := cfg.GeminiCache.Region
+	if cacheRegion == "" {
+		cacheRegion = cfg.Region
+	}
+	if cacheRegion != "" && cfg.Region != "" && cacheRegion != cfg.Region {
+		// Cross-region caching works for some Vertex models (notably
+		// global-only preview models with the cache pinned to a real
+		// region) but isn't broadly documented. Log a warning so the
+		// configuration is visible if requests start failing.
+		logger.Warn("gemini "+label+" cache region differs from inference region",
+			"cache_region", cacheRegion, "inference_region", cfg.Region)
+	}
+	cacheCfg := llm.GeminiCacheManagerConfig{
+		Project: cfg.Project,
+		Region:  cacheRegion,
+		Model:   cfg.Model,
+		TTL:     time.Duration(cfg.GeminiCache.TTLSeconds) * time.Second,
+		Logger:  logger,
+	}
+	startCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := start(startCtx, cacheCfg); err != nil {
+		logger.Error("gemini "+label+" cache start failed; running uncached",
+			"err", err)
+	}
 }

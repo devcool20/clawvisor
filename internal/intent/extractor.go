@@ -77,11 +77,38 @@ func (NoopExtractor) Extract(_ context.Context, _ ExtractRequest) ([]*store.Chai
 type LLMExtractor struct {
 	health *llm.Health
 	logger *slog.Logger
+
+	// geminiCacheNameFn returns the current Gemini cachedContents resource
+	// name, or "" when no cache is registered. Set via StartGeminiCache.
+	// Attached to every per-call llm.Client so the cache is referenced on
+	// Gemini provider requests.
+	geminiCacheNameFn func() string
+	// geminiCacheMgr owns the cache lifecycle when StartGeminiCache was
+	// used. Nil when no cache was set up.
+	geminiCacheMgr *llm.GeminiCacheManager
 }
 
 // NewLLMExtractor creates an LLM-backed chain context extractor.
 func NewLLMExtractor(health *llm.Health, logger *slog.Logger) *LLMExtractor {
 	return &LLMExtractor{health: health, logger: logger}
+}
+
+// StartGeminiCache initializes the Gemini explicit context cache for the
+// extractor's system prompt and registers it so per-request clients
+// reference it automatically. cfg.SystemPrompt is filled in by the
+// extractor and should be left empty by callers. On creation failure the
+// extractor proceeds without caching (slower, but functional).
+func (e *LLMExtractor) StartGeminiCache(ctx context.Context, cfg llm.GeminiCacheManagerConfig) error {
+	if cfg.Logger == nil {
+		cfg.Logger = e.logger
+	}
+	mgr, nameFn, err := llm.StartCachedSystemPrompt(ctx, cfg, extractionSystemPrompt)
+	if err != nil {
+		return fmt.Errorf("extractor gemini cache: %w", err)
+	}
+	e.geminiCacheMgr = mgr
+	e.geminiCacheNameFn = nameFn
+	return nil
 }
 
 const extractionSystemPrompt = `You extract structural references from API results for a security system.
@@ -477,7 +504,16 @@ func (e *LLMExtractor) ExtractLLM(ctx context.Context, req ExtractRequest, exist
 	userMsg := fmt.Sprintf("Service: %s\nAction: %s\n\nResult:\n%s", req.Service, req.Action, result)
 
 	cfg := e.health.ChainContextConfig()
-	client := llm.NewClient(cfg.LLMProviderConfig)
+	// Extraction outputs are larger than verification (full facts array +
+	// regex patterns) — bump max_tokens above the package default 1024 so
+	// large list responses don't get truncated mid-JSON. Haiku is compact
+	// enough that 1024 usually fits, but Gemini's output is more verbose
+	// per fact emitted. Sized at 8192 — enough for any reasonable list
+	// response without wasting tokens.
+	client := llm.NewClient(cfg.LLMProviderConfig).WithMaxTokens(8192)
+	if e.geminiCacheNameFn != nil {
+		client.AttachGeminiCacheNameFn(e.geminiCacheNameFn)
+	}
 	messages := []llm.ChatMessage{
 		{Role: "system", Content: extractionSystemPrompt, CacheControl: true},
 		{Role: "user", Content: userMsg},

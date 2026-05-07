@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"time"
@@ -63,6 +64,15 @@ type LLMVerifier struct {
 	health *llm.Health
 	logger *slog.Logger
 	cache  VerdictCacher
+
+	// geminiCacheNameFn returns the current Gemini cachedContents resource
+	// name, or "" when no cache is registered. Set via SetGeminiCacheNameFn
+	// at app startup. Attached to every per-call llm.Client so the cache
+	// is referenced on Gemini provider requests.
+	geminiCacheNameFn func() string
+	// geminiCacheMgr owns the cache lifecycle when StartGeminiCache was
+	// used. Nil when SetGeminiCacheNameFn was used directly (e.g. by tests).
+	geminiCacheMgr *llm.GeminiCacheManager
 }
 
 // NewLLMVerifier creates an LLM-backed intent verifier.
@@ -86,6 +96,32 @@ func (v *LLMVerifier) SetVerdictCache(c VerdictCacher) {
 	v.cache = c
 }
 
+// SetGeminiCacheNameFn registers a function the verifier calls (per-request,
+// via the llm.Client) to discover the current Gemini cachedContents
+// resource name. Pass nil to disable cache attachment. No effect when the
+// configured provider is not "gemini".
+func (v *LLMVerifier) SetGeminiCacheNameFn(fn func() string) {
+	v.geminiCacheNameFn = fn
+}
+
+// StartGeminiCache initializes the Gemini explicit context cache for the
+// verifier's system prompt and registers it so per-request clients
+// reference it automatically. cfg.SystemPrompt is filled in by the
+// verifier and should be left empty by callers. On creation failure the
+// verifier proceeds without caching (slower, but functional).
+func (v *LLMVerifier) StartGeminiCache(ctx context.Context, cfg llm.GeminiCacheManagerConfig) error {
+	if cfg.Logger == nil {
+		cfg.Logger = v.logger
+	}
+	mgr, nameFn, err := llm.StartCachedSystemPrompt(ctx, cfg, verificationSystemPrompt)
+	if err != nil {
+		return fmt.Errorf("verifier gemini cache: %w", err)
+	}
+	v.geminiCacheMgr = mgr
+	v.geminiCacheNameFn = nameFn
+	return nil
+}
+
 func (v *LLMVerifier) Verify(ctx context.Context, req VerifyRequest) (*VerificationVerdict, error) {
 	cfg := v.health.VerificationConfig()
 	if !cfg.Enabled {
@@ -101,6 +137,14 @@ func (v *LLMVerifier) Verify(ctx context.Context, req VerifyRequest) (*Verificat
 	start := time.Now()
 
 	client := llm.NewClient(cfg.LLMProviderConfig)
+	// Lenient mode appends a per-call addendum to the system prompt. The
+	// Gemini cached system instruction holds only the strict base prompt,
+	// and Gemini drops systemInstruction when cachedContent is set, so a
+	// cached lenient call would silently revert to strict. Bypass the
+	// cache so the full system prompt is inlined.
+	if v.geminiCacheNameFn != nil && !req.Lenient {
+		client.AttachGeminiCacheNameFn(v.geminiCacheNameFn)
+	}
 	userMsg := buildVerificationUserMessage(req)
 	systemPrompt := verificationSystemPrompt
 	if req.Lenient {

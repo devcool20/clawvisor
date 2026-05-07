@@ -149,12 +149,33 @@ type ApprovalConfig struct {
 // LLMProviderConfig holds settings for one LLM provider endpoint.
 type LLMProviderConfig struct {
 	Enabled        bool   `yaml:"enabled"`
-	Provider       string `yaml:"provider"` // "openai" (default) | "anthropic"
-	Endpoint       string `yaml:"endpoint"` // Base URL, e.g. https://api.anthropic.com/v1
+	Provider       string `yaml:"provider"` // "openai" (default) | "anthropic" | "vertex" | "gemini"
+	Endpoint       string `yaml:"endpoint"` // Base URL. Optional for "gemini" when Project+Region are set (built from those).
 	APIKey         string `yaml:"api_key"`  // Overridable via env
 	Model          string `yaml:"model"`
 	TimeoutSeconds int    `yaml:"timeout_seconds"`
 	SkipReadonly   bool   `yaml:"skip_readonly"` // Safety only: skip check for read actions
+
+	// Vertex / Gemini settings. For "gemini" provider, Project and Region
+	// are required (Endpoint is built from them) unless Endpoint is set
+	// explicitly to override.
+	Project string `yaml:"project,omitempty"`
+	Region  string `yaml:"region,omitempty"` // "global" (preview models) | regional ID like "us-central1"
+
+	// Gemini-only knobs.
+	GeminiThinkingLevel string             `yaml:"gemini_thinking_level,omitempty"` // MINIMAL | LOW | MEDIUM | HIGH; default MINIMAL
+	GeminiCache         *GeminiCacheConfig `yaml:"gemini_cache,omitempty"`
+}
+
+// GeminiCacheConfig configures the explicit context cache lifecycle for a
+// Gemini provider. When enabled, a cachedContents resource is created at
+// app startup and refreshed before TTL expiry; the client references it on
+// every request. Set Enabled=false (or omit the block) to use uncached
+// generateContent calls.
+type GeminiCacheConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	Region     string `yaml:"region,omitempty"`      // defaults to LLMProviderConfig.Region
+	TTLSeconds int    `yaml:"ttl_seconds,omitempty"` // default 1800 (30 min)
 }
 
 // VerificationConfig holds settings for intent verification.
@@ -193,6 +214,13 @@ type LLMConfig struct {
 	APIKey         string `yaml:"api_key"`         // Shared default; overridable via CLAWVISOR_LLM_API_KEY
 	Model          string `yaml:"model"`           // Shared default: "claude-haiku-4-5-20251001"
 	TimeoutSeconds int    `yaml:"timeout_seconds"` // Shared default: 10
+
+	// Shared defaults for the "gemini" provider. Sub-block (verification/
+	// task_risk/chain_context) values override; absent values inherit
+	// from these via inheritLLMDefaults.
+	Project             string `yaml:"project,omitempty"`
+	Region              string `yaml:"region,omitempty"`
+	GeminiThinkingLevel string `yaml:"gemini_thinking_level,omitempty"`
 
 	Verification   VerificationConfig   `yaml:"verification"`    // Intent verification (runtime)
 	TaskRisk       TaskRiskConfig       `yaml:"task_risk"`       // Task risk assessment (creation time)
@@ -472,6 +500,15 @@ func Load(path string) (*Config, error) {
 			cfg.LLM.TimeoutSeconds = n
 		}
 	}
+	if v := os.Getenv("CLAWVISOR_LLM_PROJECT"); v != "" {
+		cfg.LLM.Project = v
+	}
+	if v := os.Getenv("CLAWVISOR_LLM_REGION"); v != "" {
+		cfg.LLM.Region = v
+	}
+	if v := os.Getenv("CLAWVISOR_LLM_GEMINI_THINKING_LEVEL"); v != "" {
+		cfg.LLM.GeminiThinkingLevel = v
+	}
 
 	// Per-subsection overrides (take precedence over shared)
 	if v := os.Getenv("CLAWVISOR_LLM_VERIFICATION_ENABLED"); v != "" {
@@ -491,6 +528,17 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("CLAWVISOR_LLM_VERIFICATION_FAIL_CLOSED"); v != "" {
 		cfg.LLM.Verification.FailClosed = v == "true" || v == "1"
+	}
+	if v := os.Getenv("CLAWVISOR_LLM_VERIFICATION_GEMINI_CACHE_ENABLED"); v != "" {
+		ensureGeminiCache(&cfg.LLM.Verification.GeminiCache).Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("CLAWVISOR_LLM_VERIFICATION_GEMINI_CACHE_REGION"); v != "" {
+		ensureGeminiCache(&cfg.LLM.Verification.GeminiCache).Region = v
+	}
+	if v := os.Getenv("CLAWVISOR_LLM_VERIFICATION_GEMINI_CACHE_TTL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			ensureGeminiCache(&cfg.LLM.Verification.GeminiCache).TTLSeconds = n
+		}
 	}
 
 	if v := os.Getenv("CLAWVISOR_LLM_TASK_RISK_ENABLED"); v != "" {
@@ -523,6 +571,17 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("CLAWVISOR_LLM_CHAIN_CONTEXT_MODEL"); v != "" {
 		cfg.LLM.ChainContext.Model = v
+	}
+	if v := os.Getenv("CLAWVISOR_LLM_CHAIN_CONTEXT_GEMINI_CACHE_ENABLED"); v != "" {
+		ensureGeminiCache(&cfg.LLM.ChainContext.GeminiCache).Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("CLAWVISOR_LLM_CHAIN_CONTEXT_GEMINI_CACHE_REGION"); v != "" {
+		ensureGeminiCache(&cfg.LLM.ChainContext.GeminiCache).Region = v
+	}
+	if v := os.Getenv("CLAWVISOR_LLM_CHAIN_CONTEXT_GEMINI_CACHE_TTL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			ensureGeminiCache(&cfg.LLM.ChainContext.GeminiCache).TTLSeconds = n
+		}
 	}
 
 	if v := os.Getenv("CLAWVISOR_LLM_ADAPTER_GEN_ENABLED"); v != "" {
@@ -680,13 +739,32 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// ensureGeminiCache lazily allocates a sub-block's GeminiCache and returns
+// the pointer for chained field assignment from env-var overrides.
+func ensureGeminiCache(p **GeminiCacheConfig) *GeminiCacheConfig {
+	if *p == nil {
+		*p = &GeminiCacheConfig{}
+	}
+	return *p
+}
+
 // inheritLLMDefaults fills empty fields in sub with the shared LLM-level defaults.
 func inheritLLMDefaults(sub *LLMProviderConfig, shared *LLMConfig) {
 	if sub.Provider == "" {
 		sub.Provider = shared.Provider
 	}
 	if sub.Endpoint == "" {
-		sub.Endpoint = shared.Endpoint
+		// Don't inherit the Anthropic-default endpoint when this sub-block's
+		// effective provider is non-Anthropic. Default() bakes
+		// Endpoint="https://api.anthropic.com/v1" so existing Anthropic users
+		// don't have to set it; but if a sub-block runs on gemini/vertex,
+		// inheriting that URL would cause provider-shaped JSON to POST to
+		// Anthropic's API (Cloudflare empty-body 404). Leaving Endpoint empty
+		// lets the per-provider URL builder in NewClient kick in. Covers both
+		// "top-level switched to gemini" and "mixed providers" configs.
+		if sub.Provider == "anthropic" || shared.Endpoint != "https://api.anthropic.com/v1" {
+			sub.Endpoint = shared.Endpoint
+		}
 	}
 	if sub.APIKey == "" {
 		sub.APIKey = shared.APIKey
@@ -697,6 +775,22 @@ func inheritLLMDefaults(sub *LLMProviderConfig, shared *LLMConfig) {
 	if sub.TimeoutSeconds == 0 {
 		sub.TimeoutSeconds = shared.TimeoutSeconds
 	}
+	// Gemini-specific fields. Shared defaults live on LLMConfig (sourced
+	// from the top-level llm: block) so users can set Project/Region once
+	// and have all sub-blocks inherit. Sub-block overrides win.
+	if sub.Project == "" {
+		sub.Project = shared.Project
+	}
+	if sub.Region == "" {
+		sub.Region = shared.Region
+	}
+	if sub.GeminiThinkingLevel == "" {
+		sub.GeminiThinkingLevel = shared.GeminiThinkingLevel
+	}
+	// GeminiCache is intentionally NOT inherited. Each sub-block caches a
+	// different system prompt (verification vs. extraction vs. ...) and may
+	// want different TTLs or even cache only on a subset of components, so
+	// the cache config must be set explicitly per sub-block.
 }
 
 // Validate checks for configuration errors that should prevent startup.
