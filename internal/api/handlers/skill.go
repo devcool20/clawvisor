@@ -206,7 +206,7 @@ func (h *SkillHandler) Catalog(w http.ResponseWriter, r *http.Request) {
 			if m.ServiceID != baseID {
 				continue
 			}
-			vKey := h.adapterReg.VaultKeyWithAlias(baseID, m.Alias)
+			vKey := h.adapterReg.VaultKeyWithAliasForUser(baseID, m.Alias, agent.UserID)
 			if !keySet[vKey] {
 				continue
 			}
@@ -226,7 +226,7 @@ func (h *SkillHandler) Catalog(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !shown {
-			baseKey := h.adapterReg.VaultKey(baseID)
+			baseKey := h.adapterReg.VaultKeyForUser(baseID, agent.UserID)
 			usesSharedKey := baseKey != baseID
 			if !usesSharedKey && keySet[baseKey] {
 				entries[baseID] = &catalogEntry{

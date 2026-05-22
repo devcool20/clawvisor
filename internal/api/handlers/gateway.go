@@ -2452,7 +2452,7 @@ func parseServiceAlias(service string) (serviceType, alias string) {
 // hasAnyAlias reports whether any vault entry exists for the given service type
 // (under any alias). It uses vault.List and checks for matching key prefixes.
 func hasAnyAlias(ctx context.Context, v vault.Vault, reg *adapters.Registry, userID, serviceType string) bool {
-	base := reg.VaultKey(serviceType)
+	base := reg.VaultKeyForUser(serviceType, userID)
 	keys, err := v.List(ctx, userID)
 	if err != nil {
 		return false
@@ -2488,7 +2488,7 @@ func listServiceAliases(
 		}
 		return aliases
 	}
-	base := reg.VaultKey(serviceType)
+	base := reg.VaultKeyForUser(serviceType, userID)
 	keys, err := v.List(ctx, userID)
 	if err != nil {
 		return nil

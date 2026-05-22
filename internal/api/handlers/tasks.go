@@ -2566,7 +2566,7 @@ func (h *TasksHandler) serviceActivated(ctx context.Context, userID, serviceType
 		_, err := h.st.GetServiceMeta(ctx, userID, serviceType, alias)
 		return err == nil
 	}
-	vKey := h.adapterReg.VaultKeyWithAlias(serviceType, alias)
+	vKey := h.adapterReg.VaultKeyWithAliasForUser(serviceType, alias, userID)
 	_, err := h.vault.Get(ctx, userID, vKey)
 	return err == nil
 }
@@ -2595,7 +2595,7 @@ func (h *TasksHandler) missingCredentialScopes(ctx context.Context, userID, serv
 	if len(required) == 0 {
 		return nil
 	}
-	vKey := h.adapterReg.VaultKeyWithAlias(serviceType, alias)
+	vKey := h.adapterReg.VaultKeyWithAliasForUser(serviceType, alias, userID)
 	credBytes, err := h.vault.Get(ctx, userID, vKey)
 	if err != nil || len(credBytes) == 0 {
 		return nil

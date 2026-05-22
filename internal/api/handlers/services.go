@@ -23,12 +23,12 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/clawvisor/clawvisor/internal/adapters/google/credential"
-	"github.com/clawvisor/clawvisor/pkg/adapters/mcpadapter"
 	"github.com/clawvisor/clawvisor/internal/api/middleware"
 	"github.com/clawvisor/clawvisor/internal/callback"
 	"github.com/clawvisor/clawvisor/internal/display"
 	"github.com/clawvisor/clawvisor/internal/events"
 	"github.com/clawvisor/clawvisor/pkg/adapters"
+	"github.com/clawvisor/clawvisor/pkg/adapters/mcpadapter"
 	"github.com/clawvisor/clawvisor/pkg/adapters/yamldef"
 	"github.com/clawvisor/clawvisor/pkg/store"
 	"github.com/clawvisor/clawvisor/pkg/vault"
@@ -240,30 +240,30 @@ func (h *ServicesHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type serviceEntry struct {
-		ID                   string                  `json:"id"`
-		Name                 string                  `json:"name"`
-		Description          string                  `json:"description"`
-		IconSVG              string                  `json:"icon_svg,omitempty"`
-		IconURL              string                  `json:"icon_url,omitempty"`
-		Alias                string                  `json:"alias,omitempty"`
-		OAuth                bool                    `json:"oauth"`
+		ID                    string                  `json:"id"`
+		Name                  string                  `json:"name"`
+		Description           string                  `json:"description"`
+		IconSVG               string                  `json:"icon_svg,omitempty"`
+		IconURL               string                  `json:"icon_url,omitempty"`
+		Alias                 string                  `json:"alias,omitempty"`
+		OAuth                 bool                    `json:"oauth"`
 		OAuthEndpoint         string                  `json:"oauth_endpoint,omitempty"`
 		OAuthClientIDRequired bool                    `json:"oauth_client_id_required,omitempty"`
 		Deprecated            bool                    `json:"deprecated,omitempty"`
 		DeviceFlow            bool                    `json:"device_flow,omitempty"`
-		PKCEFlow             bool                    `json:"pkce_flow,omitempty"`
-		PKCEClientIDRequired bool                    `json:"pkce_client_id_required,omitempty"`
-		AutoIdentity         bool                    `json:"auto_identity,omitempty"`
-		RequiresActivation   bool                    `json:"requires_activation"`
-		CredentialFree       bool                    `json:"credential_free"`
-		Actions              []actionEntry           `json:"actions"`
-		Variables            []adapters.VariableMeta `json:"variables,omitempty"`
-		Status               string                  `json:"status"`
-		ActivatedAt          *time.Time              `json:"activated_at,omitempty"`
-		SetupURL             string                  `json:"setup_url,omitempty"`
-		KeyHint              string                  `json:"key_hint,omitempty"`
-		KeyDisplayName       string                  `json:"key_display_name,omitempty"`
-		KeyDescription       string                  `json:"key_description,omitempty"`
+		PKCEFlow              bool                    `json:"pkce_flow,omitempty"`
+		PKCEClientIDRequired  bool                    `json:"pkce_client_id_required,omitempty"`
+		AutoIdentity          bool                    `json:"auto_identity,omitempty"`
+		RequiresActivation    bool                    `json:"requires_activation"`
+		CredentialFree        bool                    `json:"credential_free"`
+		Actions               []actionEntry           `json:"actions"`
+		Variables             []adapters.VariableMeta `json:"variables,omitempty"`
+		Status                string                  `json:"status"`
+		ActivatedAt           *time.Time              `json:"activated_at,omitempty"`
+		SetupURL              string                  `json:"setup_url,omitempty"`
+		KeyHint               string                  `json:"key_hint,omitempty"`
+		KeyDisplayName        string                  `json:"key_display_name,omitempty"`
+		KeyDescription        string                  `json:"key_description,omitempty"`
 	}
 
 	// buildEntry creates a serviceEntry from an adapter, using MetadataProvider when available.
@@ -406,7 +406,7 @@ func (h *ServicesHandler) List(w http.ResponseWriter, r *http.Request) {
 			if m.ServiceID != a.ServiceID() {
 				continue
 			}
-			vKey := h.adapterReg.VaultKeyWithAlias(a.ServiceID(), m.Alias)
+			vKey := h.adapterReg.VaultKeyWithAliasForUser(a.ServiceID(), m.Alias, user.ID)
 			if !keySet[vKey] {
 				continue
 			}
@@ -423,7 +423,7 @@ func (h *ServicesHandler) List(w http.ResponseWriter, r *http.Request) {
 			services = append(services, entry)
 		}
 
-		baseKey := h.adapterReg.VaultKey(a.ServiceID())
+		baseKey := h.adapterReg.VaultKeyForUser(a.ServiceID(), user.ID)
 		usesSharedKey := baseKey != a.ServiceID()
 		if !shown && !usesSharedKey && keySet[baseKey] {
 			var activatedAt *time.Time
@@ -478,7 +478,7 @@ func (h *ServicesHandler) OAuthGetURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	adapter, ok := h.adapterReg.Get(serviceID)
+	adapter, ok := h.adapterReg.GetForUser(r.Context(), serviceID, user.ID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("service %q not found", serviceID))
 		return
@@ -587,7 +587,7 @@ func (h *ServicesHandler) OAuthStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	adapter, ok := h.adapterReg.Get(serviceID)
+	adapter, ok := h.adapterReg.GetForUser(r.Context(), serviceID, user.ID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("service %q not found", serviceID))
 		return
@@ -675,7 +675,7 @@ func (h *ServicesHandler) OAuthCallback(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	adapter, ok := h.adapterReg.Get(entry.ServiceID)
+	adapter, ok := h.adapterReg.GetForUser(r.Context(), entry.ServiceID, entry.UserID)
 	if !ok {
 		oauthPopupClose(w, "Service not found.", "", entry.OpenerOrigin)
 		return
@@ -805,9 +805,9 @@ func (h *ServicesHandler) OAuthCallback(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Auto-detect identity (e.g. email) before storing so the vault key is correct.
-	alias = h.resolveIdentityAlias(r.Context(), entry.ServiceID, alias, credBytes, entry.Config)
+	alias = h.resolveIdentityAlias(r.Context(), entry.UserID, entry.ServiceID, alias, credBytes, entry.Config)
 
-	vKey := h.adapterReg.VaultKeyWithAlias(entry.ServiceID, alias)
+	vKey := h.adapterReg.VaultKeyWithAliasForUser(entry.ServiceID, alias, entry.UserID)
 	if err := h.vault.Set(r.Context(), entry.UserID, vKey, credBytes); err != nil {
 		h.logger.Warn("vault set failed", "service", entry.ServiceID, "err", err)
 		oauthPopupClose(w, "Failed to store credential in vault.", "", entry.OpenerOrigin)
@@ -942,7 +942,7 @@ func (h *ServicesHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	adapter, ok := h.adapterReg.Get(serviceID)
+	adapter, ok := h.adapterReg.GetForUser(r.Context(), serviceID, user.ID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("service %q not found", serviceID))
 		return
@@ -1046,7 +1046,7 @@ func (h *ServicesHandler) ActivateWithKey(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	adapter, ok := h.adapterReg.Get(serviceID)
+	adapter, ok := h.adapterReg.GetForUser(r.Context(), serviceID, user.ID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("service %q not found", serviceID))
 		return
@@ -1103,9 +1103,9 @@ func (h *ServicesHandler) ActivateWithKey(w http.ResponseWriter, r *http.Request
 	}
 
 	// Auto-detect identity (e.g. GitHub username) before storing.
-	alias = h.resolveIdentityAlias(r.Context(), serviceID, alias, credBytes, body.Config)
+	alias = h.resolveIdentityAlias(r.Context(), user.ID, serviceID, alias, credBytes, body.Config)
 
-	vKey := h.adapterReg.VaultKeyWithAlias(serviceID, alias)
+	vKey := h.adapterReg.VaultKeyWithAliasForUser(serviceID, alias, user.ID)
 	if err := h.vault.Set(r.Context(), user.ID, vKey, credBytes); err != nil {
 		h.logger.Warn("vault set failed (api key)", "service", serviceID, "err", err)
 		writeError(w, http.StatusInternalServerError, "VAULT_ERROR", "failed to store credential")
@@ -1188,7 +1188,7 @@ func (h *ServicesHandler) Deactivate(w http.ResponseWriter, r *http.Request) {
 	h.adapterReg.RemoveForUser(serviceID, user.ID)
 
 	// Credential-free services have no vault credential to clean up.
-	adapter, ok := h.adapterReg.Get(serviceID)
+	adapter, ok := h.adapterReg.GetForUser(r.Context(), serviceID, user.ID)
 	if ok && adapter.ValidateCredential(nil) == nil {
 		h.revokeTasksForService(r.Context(), user.ID, serviceID, alias)
 		h.logger.Info("credential-free service deactivated", "user", user.ID, "service", serviceID)
@@ -1201,18 +1201,18 @@ func (h *ServicesHandler) Deactivate(w http.ResponseWriter, r *http.Request) {
 	// deactivated service's scopes from the stored credential instead of
 	// deleting it. This ensures resolveOAuthScopes will re-request consent
 	// if the service is re-activated later.
-	vKey := h.adapterReg.VaultKeyWithAlias(serviceID, alias)
+	vKey := h.adapterReg.VaultKeyWithAliasForUser(serviceID, alias, user.ID)
 	metas, _ := h.st.ListServiceMetas(r.Context(), user.ID)
 	otherUsesKey := false
 	for _, m := range metas {
-		if h.adapterReg.VaultKeyWithAlias(m.ServiceID, m.Alias) == vKey {
+		if h.adapterReg.VaultKeyWithAliasForUser(m.ServiceID, m.Alias, user.ID) == vKey {
 			otherUsesKey = true
 			break
 		}
 	}
 	if otherUsesKey {
 		// Strip the deactivated service's scopes from the shared credential.
-		adapter, ok := h.adapterReg.Get(serviceID)
+		adapter, ok := h.adapterReg.GetForUser(r.Context(), serviceID, user.ID)
 		if ok {
 			h.removeAdapterScopes(r.Context(), user.ID, vKey, adapter)
 		}
@@ -1360,8 +1360,8 @@ func (h *ServicesHandler) RenameAlias(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Move the vault credential (if the service has one).
-	oldVKey := h.adapterReg.VaultKeyWithAlias(serviceID, body.OldAlias)
-	newVKey := h.adapterReg.VaultKeyWithAlias(serviceID, body.NewAlias)
+	oldVKey := h.adapterReg.VaultKeyWithAliasForUser(serviceID, body.OldAlias, user.ID)
+	newVKey := h.adapterReg.VaultKeyWithAliasForUser(serviceID, body.NewAlias, user.ID)
 	if oldVKey != newVKey {
 		credBytes, err := h.vault.Get(r.Context(), user.ID, oldVKey)
 		if err == nil && len(credBytes) > 0 {
@@ -1393,7 +1393,7 @@ func (h *ServicesHandler) RenameAlias(w http.ResponseWriter, r *http.Request) {
 		if m.ServiceID == serviceID {
 			continue // already handled
 		}
-		if h.adapterReg.VaultKeyWithAlias(m.ServiceID, m.Alias) == oldVKey {
+		if h.adapterReg.VaultKeyWithAliasForUser(m.ServiceID, m.Alias, user.ID) == oldVKey {
 			_ = h.st.UpsertServiceMeta(r.Context(), user.ID, m.ServiceID, body.NewAlias, m.ActivatedAt)
 			_ = h.st.DeleteServiceMeta(r.Context(), user.ID, m.ServiceID, m.Alias)
 			h.logger.Info("alias renamed (shared key)", "user", user.ID, "service", m.ServiceID, "old", m.Alias, "new", body.NewAlias)
@@ -1450,7 +1450,7 @@ func (h *ServicesHandler) repairMCPToolsForUser(
 	if raw, err := h.st.GetMCPTools(ctx, userID, serviceID, alias); err == nil && len(raw) > 2 {
 		return nil // already cached
 	}
-	vKey := h.adapterReg.VaultKeyWithAlias(serviceID, alias)
+	vKey := h.adapterReg.VaultKeyWithAliasForUser(serviceID, alias, userID)
 	credBytes, err := h.vault.Get(ctx, userID, vKey)
 	if err != nil {
 		return fmt.Errorf("vault get: %w", err)
@@ -1463,13 +1463,13 @@ func (h *ServicesHandler) repairMCPToolsForUser(
 // it fetches the identity and returns it as the new alias. On failure or if the
 // adapter doesn't support identity fetching, it returns the original alias unchanged.
 func (h *ServicesHandler) resolveIdentityAlias(
-	ctx context.Context, serviceID, currentAlias string, credBytes []byte, config map[string]string,
+	ctx context.Context, userID, serviceID, currentAlias string, credBytes []byte, config map[string]string,
 ) string {
 	if currentAlias != "default" {
 		return currentAlias // user explicitly chose an alias
 	}
 
-	adapter, ok := h.adapterReg.Get(serviceID)
+	adapter, ok := h.adapterReg.GetForUser(ctx, serviceID, userID)
 	if !ok {
 		return currentAlias
 	}
@@ -1525,7 +1525,7 @@ func (h *ServicesHandler) reactivatePendingRequest(ctx context.Context, userID, 
 	}
 
 	serviceType, alias := parseServiceAlias(blob.Service)
-	vKey := h.adapterReg.VaultKeyWithAlias(serviceType, alias)
+	vKey := h.adapterReg.VaultKeyWithAliasForUser(serviceType, alias, userID)
 	result, execErr := executeAdapterRequest(ctx, h.vault, h.adapterReg, h.st,
 		userID, blob.Service, blob.Action, blob.Params, vKey)
 
@@ -1577,7 +1577,7 @@ func (h *ServicesHandler) resolveOAuthScopes(
 	}
 
 	// Check for existing credential in the vault.
-	vKey := h.adapterReg.VaultKeyWithAlias(serviceID, alias)
+	vKey := h.adapterReg.VaultKeyWithAliasForUser(serviceID, alias, userID)
 	existingBytes, err := h.vault.Get(ctx, userID, vKey)
 	if err != nil || len(existingBytes) == 0 {
 		// No existing credential — just use this adapter's scopes.
@@ -1665,7 +1665,7 @@ func oauthAuthURL(cfg *oauth2.Config, stateToken string, selectAccount bool, sco
 // loadExistingRefreshToken retrieves the refresh token from an existing vault
 // credential, if any. Google may not re-issue a refresh token on re-consent.
 func (h *ServicesHandler) loadExistingRefreshToken(ctx context.Context, userID, serviceID, alias string) string {
-	vKey := h.adapterReg.VaultKeyWithAlias(serviceID, alias)
+	vKey := h.adapterReg.VaultKeyWithAliasForUser(serviceID, alias, userID)
 	existingBytes, err := h.vault.Get(ctx, userID, vKey)
 	if err != nil || len(existingBytes) == 0 {
 		return ""
@@ -1748,7 +1748,7 @@ func (h *ServicesHandler) DeviceFlowStart(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	adapter, ok := h.adapterReg.Get(serviceID)
+	adapter, ok := h.adapterReg.GetForUser(r.Context(), serviceID, user.ID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("service %q not found", serviceID))
 		return
@@ -1985,9 +1985,9 @@ func (h *ServicesHandler) DeviceFlowPoll(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Auto-detect identity before storing.
-	alias := h.resolveIdentityAlias(r.Context(), entry.ServiceID, entry.Alias, credBytes, entry.Config)
+	alias := h.resolveIdentityAlias(r.Context(), entry.UserID, entry.ServiceID, entry.Alias, credBytes, entry.Config)
 
-	vKey := h.adapterReg.VaultKeyWithAlias(entry.ServiceID, alias)
+	vKey := h.adapterReg.VaultKeyWithAliasForUser(entry.ServiceID, alias, entry.UserID)
 	if err := h.vault.Set(r.Context(), entry.UserID, vKey, credBytes); err != nil {
 		h.logger.Warn("device flow: vault set failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "VAULT_ERROR", "failed to store credential")
@@ -2040,7 +2040,7 @@ func (h *ServicesHandler) PKCEFlowStart(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	adapter, ok := h.adapterReg.Get(serviceID)
+	adapter, ok := h.adapterReg.GetForUser(r.Context(), serviceID, user.ID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("service %q not found", serviceID))
 		return
@@ -2202,7 +2202,7 @@ func (h *ServicesHandler) PKCEFlowCallback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	adapter, ok := h.adapterReg.Get(entry.ServiceID)
+	adapter, ok := h.adapterReg.GetForUser(r.Context(), entry.ServiceID, entry.UserID)
 	if !ok {
 		oauthPopupClose(w, "Service not found.", "", entry.OpenerOrigin)
 		return
@@ -2277,9 +2277,9 @@ func (h *ServicesHandler) PKCEFlowCallback(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Auto-detect identity before storing.
-	alias = h.resolveIdentityAlias(r.Context(), entry.ServiceID, alias, credBytes, entry.Config)
+	alias = h.resolveIdentityAlias(r.Context(), entry.UserID, entry.ServiceID, alias, credBytes, entry.Config)
 
-	vKey := h.adapterReg.VaultKeyWithAlias(entry.ServiceID, alias)
+	vKey := h.adapterReg.VaultKeyWithAliasForUser(entry.ServiceID, alias, entry.UserID)
 	if err := h.vault.Set(r.Context(), entry.UserID, vKey, credBytes); err != nil {
 		h.logger.Warn("pkce flow: vault set failed", "err", err)
 		oauthPopupClose(w, "Failed to store credential.", "", entry.OpenerOrigin)

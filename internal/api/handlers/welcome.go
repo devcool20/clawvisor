@@ -275,7 +275,7 @@ func (h *WelcomeHandler) listActivatedServices(ctx context.Context, userID strin
 			if m.ServiceID != a.ServiceID() {
 				continue
 			}
-			vKey := h.adapterReg.VaultKeyWithAlias(a.ServiceID(), m.Alias)
+			vKey := h.adapterReg.VaultKeyWithAliasForUser(a.ServiceID(), m.Alias, userID)
 			if !keySet[vKey] {
 				continue
 			}
@@ -287,7 +287,7 @@ func (h *WelcomeHandler) listActivatedServices(ctx context.Context, userID strin
 			out = append(out, buildEntry(a, m.Alias))
 		}
 
-		baseKey := h.adapterReg.VaultKey(a.ServiceID())
+		baseKey := h.adapterReg.VaultKeyForUser(a.ServiceID(), userID)
 		usesSharedKey := baseKey != a.ServiceID()
 		if !usesSharedKey && keySet[baseKey] {
 			key := a.ServiceID() + ":default"
