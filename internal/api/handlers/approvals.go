@@ -35,6 +35,13 @@ type ApprovalsHandler struct {
 	logger     *slog.Logger
 	eventHub   events.EventHub
 	cbDispatch *CallbackDispatcher // bounded callback delivery; may be nil (falls back to inline panic-safe goroutines)
+	resolver   ApprovalNotificationResolver
+}
+
+// ApprovalNotificationResolver resolves an approval escalation and cleans up
+// every channel that received that approval notification.
+type ApprovalNotificationResolver interface {
+	Resolve(ctx context.Context, targetType, targetID, userID, text string)
 }
 
 func NewApprovalsHandler(st store.Store, v vault.Vault, adapterReg *adapters.Registry, notifier notify.Notifier, cfg config.Config, assessor taskrisk.Assessor, logger *slog.Logger, eventHub events.EventHub) *ApprovalsHandler {
@@ -55,6 +62,12 @@ func NewApprovalsHandler(st store.Store, v vault.Vault, adapterReg *adapters.Reg
 // inline goroutine — still panic-safe but with no concurrency cap.
 func (h *ApprovalsHandler) SetCallbackDispatcher(d *CallbackDispatcher) {
 	h.cbDispatch = d
+}
+
+// SetApprovalNotificationResolver enables multi-channel approval notification
+// cleanup. Nil preserves the legacy Telegram-only update path.
+func (h *ApprovalsHandler) SetApprovalNotificationResolver(resolver ApprovalNotificationResolver) {
+	h.resolver = resolver
 }
 
 // dispatchCallback enqueues a payload for delivery via the bounded
@@ -357,7 +370,7 @@ func (h *ApprovalsHandler) markApproved(ctx context.Context, pa *store.PendingAp
 			notifyText = "✅ <b>Approved</b> — session task created and waiting for agent execution."
 		}
 	}
-	h.updateNotificationMsg(ctx, "approval", approvalNotifyTargetID(pa.RequestID, paTaskID(pa)), pa.UserID, notifyText)
+	h.resolveApprovalNotificationMsg(ctx, approvalNotifyTargetID(pa.RequestID, paTaskID(pa)), pa.UserID, notifyText)
 	h.decrementNotifierPolling(pa.UserID)
 
 	if pa.CallbackURL != nil && *pa.CallbackURL != "" {
@@ -429,7 +442,7 @@ func (h *ApprovalsHandler) DenyByRequestID(ctx context.Context, requestID, userI
 		h.logger.Error("failed to delete pending approval", "request_id", requestID, "err", err)
 	}
 
-	h.updateNotificationMsg(ctx, "approval", approvalNotifyTargetID(requestID, taskID), pa.UserID, "❌ <b>Denied</b> — request rejected.")
+	h.resolveApprovalNotificationMsg(ctx, approvalNotifyTargetID(requestID, taskID), pa.UserID, "❌ <b>Denied</b> — request rejected.")
 	h.decrementNotifierPolling(pa.UserID)
 	h.publishQueueAndAudit(userID, pa.AuditID)
 
@@ -492,7 +505,7 @@ func (h *ApprovalsHandler) Deny(w http.ResponseWriter, r *http.Request) {
 		h.logger.Error("failed to delete pending approval", "request_id", requestID, "err", err)
 	}
 
-	h.updateNotificationMsg(r.Context(), "approval", approvalNotifyTargetID(requestID, taskID), pa.UserID, "❌ <b>Denied</b> — request rejected.")
+	h.resolveApprovalNotificationMsg(r.Context(), approvalNotifyTargetID(requestID, taskID), pa.UserID, "❌ <b>Denied</b> — request rejected.")
 	h.decrementNotifierPolling(pa.UserID)
 	h.publishQueueAndAudit(user.ID, pa.AuditID)
 
@@ -547,7 +560,7 @@ func (h *ApprovalsHandler) executeApproval(ctx context.Context, pa *store.Pendin
 	if errMsg != "" {
 		notifyText = "✅ <b>Approved</b> — execution failed: " + errMsg
 	}
-	h.updateNotificationMsg(ctx, "approval", approvalNotifyTargetID(pa.RequestID, paTaskID(pa)), pa.UserID, notifyText)
+	h.resolveApprovalNotificationMsg(ctx, approvalNotifyTargetID(pa.RequestID, paTaskID(pa)), pa.UserID, notifyText)
 
 	if pa.CallbackURL != nil && *pa.CallbackURL != "" {
 		var cbResult *adapters.Result
@@ -609,7 +622,7 @@ func (h *ApprovalsHandler) RunExpiryCleanup(ctx context.Context) {
 //     pending-only guard, paging on every recovery sweep.
 func (h *ApprovalsHandler) processExpiredApproval(ctx context.Context, pa *store.PendingApproval, reason, telegramMsg string) {
 	_ = h.st.UpdateAuditOutcome(ctx, pa.AuditID, "timeout", "", 0)
-	h.updateNotificationMsg(ctx, "approval", approvalNotifyTargetID(pa.RequestID, paTaskID(pa)), pa.UserID, telegramMsg)
+	h.resolveApprovalNotificationMsg(ctx, approvalNotifyTargetID(pa.RequestID, paTaskID(pa)), pa.UserID, telegramMsg)
 	// For the regular expired path the caller relies on us to delete the
 	// row; for the stranded path the CAS DELETE already happened, so the
 	// best-effort DELETE here is a no-op (zero rows affected).
@@ -879,6 +892,14 @@ func (h *ApprovalsHandler) decrementNotifierPolling(userID string) {
 	if pd, ok := h.notifier.(notify.PollingDecrementer); ok {
 		pd.DecrementPolling(userID)
 	}
+}
+
+func (h *ApprovalsHandler) resolveApprovalNotificationMsg(ctx context.Context, targetID, userID, text string) {
+	if h.resolver != nil {
+		h.resolver.Resolve(ctx, "approval", targetID, userID, text)
+		return
+	}
+	h.updateNotificationMsg(ctx, "approval", targetID, userID, text)
 }
 
 // updateNotificationMsg updates the Telegram message for a target
