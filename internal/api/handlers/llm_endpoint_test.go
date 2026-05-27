@@ -1440,6 +1440,11 @@ func TestLLMEndpoint_VaultMissReturnsClearError(t *testing.T) {
 	emptyVault := &stubVault{}
 	h.Forwarder = llmproxy.NewForwarder(emptyVault)
 	h.Forwarder.Upstream = llmproxy.UpstreamSelector{AnthropicBaseURL: upstream.URL}
+	h.DashboardBaseURL = "http://localhost:25297"
+	agent, err := st.GetAgentByToken(context.Background(), auth.HashToken(rawToken))
+	if err != nil {
+		t.Fatalf("GetAgentByToken: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mw := middleware.RequireAgentLLM(st)
@@ -1457,8 +1462,75 @@ func TestLLMEndpoint_VaultMissReturnsClearError(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 harness-shaped error on vault miss, got %d (%s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "no upstream API key is configured") {
-		t.Fatalf("body should explain vault miss:\n%s", rec.Body.String())
+	body := rec.Body.String()
+	if !strings.Contains(body, "no Anthropic API key configured") {
+		t.Fatalf("body should explain vault miss:\n%s", body)
+	}
+	// Deep links: the Anthropic console + this agent's vault page on
+	// the configured dashboard host (local in this test — must NOT
+	// fall through to the build-env default app.clawvisor.com).
+	if !strings.Contains(body, "https://console.anthropic.com/settings/keys") {
+		t.Fatalf("body should link to the Anthropic console:\n%s", body)
+	}
+	wantAgentURL := "http://localhost:25297/dashboard/agents/" + agent.ID
+	if !strings.Contains(body, wantAgentURL) {
+		t.Fatalf("body should deep-link to the configured dashboard (%s):\n%s", wantAgentURL, body)
+	}
+	if strings.Contains(body, "app.clawvisor.com") || strings.Contains(body, "app.staging.clawvisor.com") {
+		t.Fatalf("local handler should not link to the hosted dashboard:\n%s", body)
+	}
+}
+
+func TestLLMEndpoint_VaultMissUnderPassthroughUsesSameMessage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be hit when vault is empty and passthrough has no bearer")
+	}))
+	defer upstream.Close()
+
+	h, st, rawToken, _ := newSeededHandler(t, upstream.URL)
+	emptyVault := &stubVault{}
+	h.Forwarder = llmproxy.NewForwarder(emptyVault)
+	h.Forwarder.Upstream = llmproxy.UpstreamSelector{AnthropicBaseURL: upstream.URL}
+	h.DashboardBaseURL = "http://localhost:25297"
+	agent, err := st.GetAgentByToken(context.Background(), auth.HashToken(rawToken))
+	if err != nil {
+		t.Fatalf("GetAgentByToken: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mw := middleware.RequireAgentLLM(st)
+	mux.Handle("POST /v1/messages", mw(http.HandlerFunc(h.Messages)))
+
+	// Caller signals passthrough intent via X-Clawvisor-Agent-Token but
+	// sends no upstream Authorization. The user sees the same friendly
+	// "get a key, paste it here" message as the plain vault-miss path —
+	// the failure modes are distinguishable only via the audit outcome.
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude","messages":[]}`))
+	req.Header.Set(middleware.AgentTokenHeader, rawToken)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 harness-shaped error, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "no Anthropic API key configured") {
+		t.Fatalf("body should carry the friendly vault-miss message:\n%s", body)
+	}
+	// The user message must NOT leak implementation jargon — these
+	// belong in the audit outcome (upstream_auth_missing_for_passthrough),
+	// not the chat-rendered text.
+	for _, term := range []string{"X-Clawvisor-Agent-Token", "passthrough", "Bearer"} {
+		if strings.Contains(body, term) {
+			t.Fatalf("user-facing message must not leak %q:\n%s", term, body)
+		}
+	}
+	if !strings.Contains(body, "https://console.anthropic.com/settings/keys") {
+		t.Fatalf("body should link to the Anthropic console:\n%s", body)
+	}
+	wantAgentURL := "http://localhost:25297/dashboard/agents/" + agent.ID
+	if !strings.Contains(body, wantAgentURL) {
+		t.Fatalf("body should deep-link to the configured dashboard (%s):\n%s", wantAgentURL, body)
 	}
 }
 
