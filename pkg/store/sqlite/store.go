@@ -1103,12 +1103,10 @@ func (s *Store) GetAuditEntryByRequestID(ctx context.Context, requestID, userID 
 	return e, err
 }
 
-// GetAuditEntryByRequestIDAndTask returns the request-level canonical row for an exact
-// (request_id, user_id, task_id) — inverting FindDedupCandidate's pre-task
-// precedence. taskID == "" matches the pre-task scope (task_id IS NULL).
-// Pre-task is the fallback when no task-scoped canonical exists so the
-// feedback handler can still resolve a request_id that was classified
-// pre-task even after a later task_id was attached.
+// GetAuditEntryByRequestIDAndTask returns the request-level canonical row for
+// (request_id, user_id, task_id). Exact task_id matches win over pre-task
+// fallback; within that tier this getter returns the newest row for
+// status/feedback consumers.
 func (s *Store) GetAuditEntryByRequestIDAndTask(ctx context.Context, requestID, userID, taskID string) (*store.AuditEntry, error) {
 	var taskFilter string
 	args := []any{requestID, userID}

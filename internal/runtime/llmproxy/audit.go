@@ -317,7 +317,7 @@ func (e *AuditEmitter) LogToolUseInspected(ctx context.Context, agent *store.Age
 		Outcome:    outcome,
 		Reason:     nilIfEmpty(reason),
 	}
-	if err := e.Store.LogAudit(ctx, entry); err != nil {
+	if err := e.Store.LogAudit(ctx, entry); err != nil && !errors.Is(err, store.ErrConflict) {
 		e.Logger.WarnContext(ctx, "lite-proxy: tool_use audit failed",
 			"agent_id", agent.ID, "tool_use_id", tu.ID, "err", err.Error())
 	}
@@ -392,7 +392,7 @@ func (e *AuditEmitter) LogApprovalRelease(ctx context.Context, agent *store.Agen
 		Outcome:    outcome,
 		Reason:     nilIfEmpty(reason),
 	}
-	if err := e.Store.LogAudit(ctx, entry); err != nil {
+	if err := e.Store.LogAudit(ctx, entry); err != nil && !errors.Is(err, store.ErrConflict) {
 		e.Logger.WarnContext(ctx, "lite-proxy: approval release audit failed",
 			"agent_id", agent.ID, "approval_id", pending.ID, "err", err.Error())
 	}
@@ -446,7 +446,7 @@ func (e *AuditEmitter) LogInlineTaskApproved(ctx context.Context, agent *store.A
 		Decision:   "allow",
 		Outcome:    "inline_task_approved",
 	}
-	if err := e.Store.LogAudit(ctx, entry); err != nil {
+	if err := e.Store.LogAudit(ctx, entry); err != nil && !errors.Is(err, store.ErrConflict) {
 		e.Logger.WarnContext(ctx, "lite-proxy: inline task approval audit failed",
 			"agent_id", agent.ID, "approval_id", inner.ID, "task_id", task.ID, "err", err.Error())
 	}
@@ -509,7 +509,7 @@ func (e *AuditEmitter) LogInlineTaskAutoApproved(ctx context.Context, agent *sto
 		Decision:   "allow",
 		Outcome:    "inline_task_auto_approved",
 	}
-	if err := e.Store.LogAudit(ctx, entry); err != nil {
+	if err := e.Store.LogAudit(ctx, entry); err != nil && !errors.Is(err, store.ErrConflict) {
 		e.Logger.WarnContext(ctx, "lite-proxy: inline task auto-approval audit failed",
 			"agent_id", agent.ID, "task_id", task.ID, "err", err.Error())
 	}
@@ -580,7 +580,7 @@ func (e *AuditEmitter) LogContinuationSkippedSiblingTools(ctx context.Context, a
 		Decision:   "allow",
 		Outcome:    "continuation_skipped_sibling_tools",
 	}
-	if err := e.Store.LogAudit(ctx, entry); err != nil {
+	if err := e.Store.LogAudit(ctx, entry); err != nil && !errors.Is(err, store.ErrConflict) {
 		e.Logger.WarnContext(ctx, "lite-proxy: continuation-skipped audit failed",
 			"agent_id", agent.ID, "request_id", requestID, "err", err.Error())
 	}
@@ -621,7 +621,7 @@ func (e *AuditEmitter) LogResolverSwap(ctx context.Context, agent *store.Agent, 
 		Reason:     nilIfEmpty(reason),
 		DurationMS: int(duration.Milliseconds()),
 	}
-	if err := e.Store.LogAudit(ctx, entry); err != nil {
+	if err := e.Store.LogAudit(ctx, entry); err != nil && !errors.Is(err, store.ErrConflict) {
 		e.Logger.WarnContext(ctx, "lite-proxy: resolver swap audit failed",
 			"agent_id", agent.ID, "target_host", targetHost, "err", err.Error())
 	}

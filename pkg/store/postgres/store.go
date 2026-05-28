@@ -938,23 +938,26 @@ func (s *Store) GetAuditEntryByRequestID(ctx context.Context, requestID, userID 
 	return e, err
 }
 
-// GetAuditEntryByRequestIDAndTask returns the request-level canonical row for an exact
-// (request_id, user_id, task_id) — inverting FindDedupCandidate's
-// precedence so the feedback handler can resolve the task's row first.
+// GetAuditEntryByRequestIDAndTask returns the request-level canonical row for
+// (request_id, user_id, task_id). Exact task_id matches win over pre-task
+// fallback; within that tier this getter returns the newest row for
+// status/feedback consumers.
 func (s *Store) GetAuditEntryByRequestIDAndTask(ctx context.Context, requestID, userID, taskID string) (*store.AuditEntry, error) {
 	var taskFilter string
+	orderBy := "timestamp DESC"
 	args := []any{requestID, userID}
 	if taskID == "" {
 		taskFilter = "task_id IS NULL"
 	} else {
 		taskFilter = "(task_id = $3 OR task_id IS NULL)"
+		orderBy = "CASE WHEN task_id = $3 THEN 0 ELSE 1 END, timestamp DESC"
 		args = append(args, taskID)
 	}
 	q := `SELECT ` + auditColumns + ` FROM audit_log
 		WHERE request_id = $1 AND user_id = $2 AND deduped_of IS NULL
 		  AND dedup_key IS NULL
 		  AND ` + taskFilter + `
-		ORDER BY CASE WHEN task_id IS NULL THEN 1 ELSE 0 END, timestamp DESC
+		ORDER BY ` + orderBy + `
 		LIMIT 1`
 	e, err := scanAuditRow(s.pool.QueryRow(ctx, q, args...).Scan)
 	if errors.Is(err, pgx.ErrNoRows) {

@@ -136,12 +136,10 @@ type Store interface {
 	// DedupKey set are excluded so per-tool history cannot shadow the request
 	// outcome.
 	GetAuditEntryByRequestID(ctx context.Context, requestID, userID string) (*AuditEntry, error)
-	// GetAuditEntryByRequestIDAndTask returns the canonical audit entry for
-	// (request_id, user_id, task_id). Inverts FindDedupCandidate's precedence:
-	// an exact task_id match wins over a pre-task (task_id IS NULL) canonical,
-	// because callers (the feedback handler) want the row that actually fired
-	// in the agent's task. Pre-task is the fallback when no task-scoped row
-	// exists.
+	// GetAuditEntryByRequestIDAndTask returns the request-level canonical audit
+	// entry for (request_id, user_id, task_id). Exact task_id matches win over
+	// pre-task (task_id IS NULL) fallback; within that tier this getter returns
+	// the newest row for status/feedback consumers.
 	GetAuditEntryByRequestIDAndTask(ctx context.Context, requestID, userID, taskID string) (*AuditEntry, error)
 	// FindDedupCandidate returns the request-level canonical audit entry that a new
 	// (request_id, user_id, task_id) request should dedup against, or
