@@ -236,8 +236,8 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 		// Cost-extraction state populated once the upstream response
 		// has been buffered. The deferred audit emission below reads
 		// these to write a paired llm_request_cost row.
-		auditUsage   *llmproxy.ExtractUsageResult
-		auditTaskID  string
+		auditUsage  *llmproxy.ExtractUsageResult
+		auditTaskID string
 	)
 	defer func() {
 		// One-liner summary at handler exit — visible in slog even
@@ -661,7 +661,8 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 
 	upstreamURL := ""
 	if h.Forwarder != nil {
-		if u, urlErr := h.Forwarder.Upstream.URL(provider, r.URL.Path); urlErr == nil {
+		upstreamPath := llmproxy.ProviderPath(provider, r.URL.Path)
+		if u, urlErr := h.Forwarder.Upstream.URL(provider, upstreamPath); urlErr == nil {
 			u.RawQuery = r.URL.RawQuery
 			upstreamURL = u.String()
 		} else {
@@ -669,7 +670,7 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 				"request_id", requestID,
 				"agent_id", agent.ID,
 				"provider", string(provider),
-				"path", r.URL.Path,
+				"path", upstreamPath,
 				"query", r.URL.RawQuery,
 				"err", urlErr.Error(),
 			)
@@ -679,6 +680,7 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 		"request_id", requestID,
 		"agent_id", agent.ID,
 		"provider", string(provider),
+		"inbound_path", r.URL.RequestURI(),
 		"upstream_url", upstreamURL,
 		"model", reqSummary.Model,
 	)
@@ -773,6 +775,205 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 	// decisions must still run on local proxy-lite installs that do not set
 	// server.public_url.
 	if h.Inspector != nil {
+		if conversation.IsSSEContentType(upstreamCT) {
+			candidateTasks, toolRules, egressRules, decisionLoadErr := h.loadLiteProxyDecisionInputs(r.Context(), agent)
+			if decisionLoadErr != nil {
+				h.Logger.WarnContext(r.Context(), "lite-proxy decision-input load failed; failing closed",
+					"request_id", requestID, "agent_id", agent.ID, "err", decisionLoadErr.Error())
+				auditStatus = http.StatusServiceUnavailable
+				auditDecide = "deny"
+				auditOutcome = "decision_input_load_failed"
+				auditReason = decisionLoadErr.Error()
+				h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusServiceUnavailable, "DECISION_INPUT_UNAVAILABLE",
+					"couldn't load authorization data right now. Please retry in a moment.")
+				return
+			}
+			preferredTaskID, preferredTaskErr := h.checkedOutTaskID(r.Context(), agent, conversationID, candidateTasks)
+			if preferredTaskErr != nil {
+				h.Logger.WarnContext(r.Context(), "lite-proxy task checkout lookup failed; continuing without preferred task",
+					"request_id", requestID, "agent_id", agent.ID, "err", preferredTaskErr.Error())
+				auditParams["task_checkout_unavailable"] = true
+				preferredTaskID = ""
+			}
+			if preferredTaskID != "" {
+				auditTaskID = preferredTaskID
+			}
+			h.Logger.DebugContext(r.Context(), "lite-proxy decision inputs loaded (streaming)",
+				"request_id", requestID,
+				"agent_id", agent.ID,
+				"provider", string(provider),
+				"posture", string(liteProxyDecisionPosture(agent)),
+				"candidate_tasks", len(candidateTasks),
+				"tool_rules", len(toolRules),
+				"egress_rules", len(egressRules),
+				"preferred_task_id", preferredTaskID,
+			)
+
+			recentTurns := llmproxy.ExtractRecentHumanTurns(llmproxy.ExtractHumanTurnsRequest{
+				Provider: provider,
+				Body:     body,
+			})
+			autoApproveThreshold := agentConversationAutoApproveThreshold(agent)
+
+			callerToken := middleware.CallerTokenFromContext(r.Context())
+			if callerToken == "" {
+				callerToken = inboundAgentToken(r)
+			}
+			opts := inspector.DefaultRewriteOpts(h.ResolverBaseURL)
+			opts.CallerToken = callerToken
+
+			var catalogIface interface {
+				Resolve(host, method, path string) (llmproxy.ResolvedAction, bool)
+			}
+			if h.Catalog != nil {
+				catalogIface = h.Catalog
+			}
+
+			cfg := llmproxy.PostprocessConfig{
+				Inspector:                        h.Inspector,
+				RewriteOpts:                      opts,
+				Store:                            h.Store,
+				AgentUserID:                      agent.UserID,
+				AgentID:                          agent.ID,
+				ConversationID:                   conversationID,
+				Audit:                            h.AuditEmitter,
+				RequestID:                        requestID,
+				Catalog:                          catalogIface,
+				TaskScope:                        h.TaskScope,
+				IntentVerifier:                   h.IntentVerifier,
+				Posture:                          liteProxyDecisionPosture(agent),
+				CandidateTasks:                   candidateTasks,
+				ToolRules:                        toolRules,
+				EgressRules:                      egressRules,
+				PreferredTaskID:                  preferredTaskID,
+				PendingApprovals:                 h.PendingApprovals,
+				ControlBaseURL:                   h.ControlBaseURL,
+				CallerNonces:                     h.CallerNonces,
+				Trace:                            h.TraceLogger,
+				TaskRiskAssessor:                 h.taskRiskBridge(),
+				AgentName:                        agent.Name,
+				RecentUserTurns:                  recentTurns,
+				ConversationAutoApproveThreshold: autoApproveThreshold,
+				InlineTaskCreator:                h.InlineTaskCreator,
+				Checkouts:                        h.TaskCheckouts,
+				DefaultTaskExpirySeconds:         h.DefaultTaskExpirySeconds,
+			}
+
+			w.Header().Del("Content-Length")
+			w.Header().Del("Content-Encoding")
+			if upstreamCT != "" {
+				w.Header().Set("Content-Type", upstreamCT)
+			}
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("X-Accel-Buffering", "no")
+
+			streamResp := newDelayedHeaderWriter(w, resp.StatusCode)
+			flushingW := newFlushingWriter(streamResp)
+			timingW := newStreamingTimingWriter(flushingW, h.Logger, requestID, string(provider), upstreamHeadersMs)
+			emittedStream := newLimitedCaptureWriter(h.MaxResponseBytes)
+			streamW := io.MultiWriter(timingW, emittedStream)
+
+			var capturedUpstream bytes.Buffer
+			teeReader := io.TeeReader(resp.Body, &capturedUpstream)
+
+			processed, err := llmproxy.PostprocessStream(r.Context(), r, teeReader, streamW, upstreamCT, cfg)
+			if err != nil {
+				h.Logger.WarnContext(r.Context(), "lite-proxy postprocess streaming error",
+					"request_id", requestID, "agent_id", agent.ID, "err", err.Error())
+				auditStatus = http.StatusBadGateway
+				auditOutcome = "postprocess_stream_error"
+				auditReason = err.Error()
+				if !streamResp.WroteHeader() {
+					clearHeaders(w.Header())
+					h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadGateway, "POSTPROCESS_STREAM_ERROR",
+						"couldn't process the upstream stream. Please retry; details are in the Clawvisor audit log.")
+				}
+				return
+			}
+			streamResp.Commit()
+
+			h.Logger.DebugContext(r.Context(), "lite-proxy streaming postprocess complete",
+				"request_id", requestID,
+				"agent_id", agent.ID,
+				"provider", string(provider),
+				"status", resp.StatusCode,
+				"rewritten", processed.Rewritten,
+				"decisions", len(processed.Decisions),
+				"skipped_reason", processed.SkippedReason,
+			)
+
+			if auditTaskID == "" {
+				for _, dec := range processed.Decisions {
+					if dec.Verdict.ContinueWithToolResult != "" && dec.Verdict.CreatedTaskID != "" {
+						auditTaskID = dec.Verdict.CreatedTaskID
+						break
+					}
+				}
+			}
+
+			if resp.StatusCode < 400 {
+				if usage := llmproxy.ExtractUsage(provider, upstreamCT, capturedUpstream.Bytes(), reqSummary.Model); usage.Found {
+					u := usage
+					if auditUsage == nil {
+						auditUsage = &u
+					} else if pricingModelMatch(auditUsage.Model, u.Model) {
+						auditUsage.Usage.InputTokens += u.Usage.InputTokens
+						auditUsage.Usage.OutputTokens += u.Usage.OutputTokens
+						auditUsage.Usage.CacheReadTokens += u.Usage.CacheReadTokens
+						auditUsage.Usage.CacheWriteTokens += u.Usage.CacheWriteTokens
+						auditUsage.Usage.CacheWrite1hTokens += u.Usage.CacheWrite1hTokens
+					} else {
+						h.Logger.WarnContext(r.Context(), "lite-proxy streaming usage dropped: model mismatch with continuation usage",
+							"request_id", requestID,
+							"agent_id", agent.ID,
+							"original_model", u.Model,
+							"continuation_model", auditUsage.Model,
+						)
+						auditParams["streaming_usage_dropped_model_mismatch"] = true
+					}
+					auditParams["usage_input_tokens"] = usage.Usage.InputTokens
+					auditParams["usage_output_tokens"] = usage.Usage.OutputTokens
+					if usage.Usage.CacheReadTokens > 0 {
+						auditParams["usage_cache_read_tokens"] = usage.Usage.CacheReadTokens
+					}
+					if usage.Usage.CacheWriteTokens > 0 {
+						auditParams["usage_cache_write_tokens"] = usage.Usage.CacheWriteTokens
+					}
+				}
+			}
+
+			if h.RawIOLogger != nil {
+				emittedBody := emittedStream.Bytes()
+				bodyStr, bodyEnc := llmproxy.EncodeBody(emittedBody)
+				marker := "streaming"
+				if processed.Rewritten {
+					marker = "streaming_rewritten"
+				}
+				h.RawIOLogger.Emit(llmproxy.RawIOEvent{
+					Phase:        "harness_response",
+					RequestID:    requestID,
+					UserID:       agent.UserID,
+					AgentID:      agent.ID,
+					Provider:     string(provider),
+					Method:       r.Method,
+					Path:         r.URL.RequestURI(),
+					Status:       resp.StatusCode,
+					ContentType:  upstreamCT,
+					Headers:      llmproxy.SafeHeaderSnapshot(w.Header()),
+					Body:         bodyStr,
+					BodyEncoding: bodyEnc,
+					BodyBytes:    len(emittedBody),
+					Marker:       marker,
+				})
+			}
+
+			auditStatus = resp.StatusCode
+			if auditOutcome == "" {
+				auditOutcome = outcomeFromStatus(resp.StatusCode)
+			}
+			return
+		}
+
 		// Wrap the upstream body so we get TTFB / progress / final
 		// stats in slog and the raw log. Reads pass through unchanged;
 		// it's purely observational. Stalls in this read are the
@@ -1600,6 +1801,132 @@ func (h *LLMEndpointHandler) tryContinuation(
 	return &newProcessed, resp.StatusCode, contCT, contUsage, nil
 }
 
+type flushingWriter struct {
+	w       io.Writer
+	flusher http.Flusher
+}
+
+func (fw *flushingWriter) Write(p []byte) (n int, err error) {
+	n, err = fw.w.Write(p)
+	if fw.flusher != nil {
+		fw.flusher.Flush()
+	}
+	return n, err
+}
+
+func newFlushingWriter(w io.Writer) io.Writer {
+	flusher, _ := w.(http.Flusher)
+	return &flushingWriter{w: w, flusher: flusher}
+}
+
+type delayedHeaderWriter struct {
+	w      http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func newDelayedHeaderWriter(w http.ResponseWriter, status int) *delayedHeaderWriter {
+	return &delayedHeaderWriter{w: w, status: status}
+}
+
+func (w *delayedHeaderWriter) Write(p []byte) (int, error) {
+	w.Commit()
+	return w.w.Write(p)
+}
+
+func (w *delayedHeaderWriter) Flush() {
+	w.Commit()
+	if flusher, ok := w.w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *delayedHeaderWriter) Commit() {
+	if w.wrote {
+		return
+	}
+	w.wrote = true
+	w.w.WriteHeader(w.status)
+}
+
+func (w *delayedHeaderWriter) WroteHeader() bool {
+	return w != nil && w.wrote
+}
+
+func clearHeaders(h http.Header) {
+	for k := range h {
+		delete(h, k)
+	}
+}
+
+type streamingTimingWriter struct {
+	w                 io.Writer
+	logger            *slog.Logger
+	requestID         string
+	provider          string
+	start             time.Time
+	upstreamHeadersMs int64
+	mu                sync.Mutex
+	sawWrite          bool
+	sawTextStart      bool
+	sawTextDelta      bool
+}
+
+func newStreamingTimingWriter(w io.Writer, logger *slog.Logger, requestID, provider string, upstreamHeadersMs int64) io.Writer {
+	return &streamingTimingWriter{
+		w:                 w,
+		logger:            logger,
+		requestID:         requestID,
+		provider:          provider,
+		start:             time.Now(),
+		upstreamHeadersMs: upstreamHeadersMs,
+	}
+}
+
+func (tw *streamingTimingWriter) Write(p []byte) (int, error) {
+	n, err := tw.w.Write(p)
+	tw.observe(p)
+	return n, err
+}
+
+func (tw *streamingTimingWriter) observe(p []byte) {
+	if tw == nil || tw.logger == nil {
+		return
+	}
+	tw.mu.Lock()
+	defer tw.mu.Unlock()
+
+	elapsedMs := time.Since(tw.start).Milliseconds()
+	if !tw.sawWrite {
+		tw.sawWrite = true
+		tw.logger.InfoContext(context.Background(), "lite-proxy stream forwarded first SSE bytes",
+			"request_id", tw.requestID,
+			"provider", tw.provider,
+			"elapsed_ms", elapsedMs,
+			"ttfb_headers_ms", tw.upstreamHeadersMs,
+			"chunk_bytes", len(p),
+		)
+	}
+	if !tw.sawTextStart && bytes.Contains(p, []byte(`"type":"text"`)) {
+		tw.sawTextStart = true
+		tw.logger.InfoContext(context.Background(), "lite-proxy stream forwarded text block start",
+			"request_id", tw.requestID,
+			"provider", tw.provider,
+			"elapsed_ms", elapsedMs,
+			"ttfb_headers_ms", tw.upstreamHeadersMs,
+		)
+	}
+	if !tw.sawTextDelta && bytes.Contains(p, []byte(`"type":"text_delta"`)) {
+		tw.sawTextDelta = true
+		tw.logger.InfoContext(context.Background(), "lite-proxy stream forwarded first text delta",
+			"request_id", tw.requestID,
+			"provider", tw.provider,
+			"elapsed_ms", elapsedMs,
+			"ttfb_headers_ms", tw.upstreamHeadersMs,
+		)
+	}
+}
+
 // readResponseLimited mirrors readLimited for upstream responses. Default
 // max applies when 0 is passed (32 MiB).
 func readResponseLimited(r io.Reader, max int64) ([]byte, error) {
@@ -1953,7 +2280,8 @@ func (h *LLMEndpointHandler) activeLitePassthrough(ctx context.Context, agent *s
 func (h *LLMEndpointHandler) forwardLitePassthrough(w http.ResponseWriter, r *http.Request, agent *store.Agent, provider conversation.Provider, requestID string, body []byte, auditStatus *int, auditDecide, auditOutcome, auditReason *string, auditParams map[string]any) {
 	upstreamURL := ""
 	if h.Forwarder != nil {
-		if u, urlErr := h.Forwarder.Upstream.URL(provider, r.URL.Path); urlErr == nil {
+		upstreamPath := llmproxy.ProviderPath(provider, r.URL.Path)
+		if u, urlErr := h.Forwarder.Upstream.URL(provider, upstreamPath); urlErr == nil {
 			u.RawQuery = r.URL.RawQuery
 			upstreamURL = u.String()
 		}
