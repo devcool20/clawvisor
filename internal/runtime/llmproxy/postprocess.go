@@ -258,6 +258,15 @@ type PostprocessConfig struct {
 	// via cfg.ProxyLite.TraceLogPath. Calls on a nil *TraceLogger are
 	// no-ops, so production code doesn't branch.
 	Trace *TraceLogger
+
+	// FirstTurnNotice, when non-empty, is the assistant-text notice the
+	// streaming postprocess path prepends to the response so the user
+	// sees a one-liner ("[Clawvisor] Routing this conversation…")
+	// before the model's first content on a fresh conversation. Only
+	// consulted by PostprocessStream; the buffered Postprocess path
+	// keeps its existing inline prepend at the handler level. Empty
+	// disables injection.
+	FirstTurnNotice string
 }
 
 // PostprocessResult reports what happened during postprocess. The handler
@@ -1669,23 +1678,53 @@ func PostprocessStream(
 	contentType string,
 	cfg PostprocessConfig,
 ) (PostprocessResult, error) {
-	if cfg.Inspector == nil {
-		_, err := io.Copy(w, r)
-		return PostprocessResult{SkippedReason: "no inspector configured"}, err
-	}
-
 	registry := cfg.ResponseRegistry
 	if registry == nil {
 		registry = conversation.DefaultResponseRegistry()
 	}
 
 	streamingRewriter := matchByRouteStreaming(req, registry)
+
+	// First-turn routing notice. Wrap the destination so the per-event
+	// SSE state machine emits through an injector that prepends the
+	// notice block at index 0 and shifts the rest by +1. Mirrors the
+	// buffered path's PrependAssistantNotice call in the handler —
+	// kept here (not in the handler) so the rewriter itself doesn't
+	// need to grow a notice parameter, and so any future streaming
+	// caller picks up the behavior automatically.
+	//
+	// Wrap BEFORE the inspector / rewriter early returns so the notice
+	// still surfaces on the inspector-disabled pass-through path —
+	// matching the buffered Postprocess flow, which injects regardless
+	// of inspector state. Skip when there's no rewriter (we'd have no
+	// provider to derive the wire shape from) or when the shape is
+	// unrecognized (the constructor turns that into a no-op anyway, so
+	// this is belt-and-suspenders).
+	if cfg.FirstTurnNotice != "" && streamingRewriter != nil {
+		shape := conversation.DetectStreamShape(req, streamingRewriter.Name())
+		noticeW := conversation.NewStreamingFirstTurnNoticeWriter(w, shape, cfg.FirstTurnNotice)
+		// The injector buffers partial SSE events; ensure trailing
+		// state flushes when the stream completes. Closer-only
+		// wrappers (the real injector) flush; the no-op case
+		// (StreamShapeUnknown / blank text) returns dest unchanged
+		// and is not closeable.
+		if closer, ok := noticeW.(io.Closer); ok {
+			defer func() { _ = closer.Close() }()
+		}
+		w = noticeW
+	}
+
+	if cfg.Inspector == nil {
+		_, err := io.Copy(w, r)
+		return PostprocessResult{SkippedReason: "no inspector configured"}, err
+	}
 	if streamingRewriter == nil {
 		_, err := io.Copy(w, r)
 		return PostprocessResult{SkippedReason: "no streaming rewriter for route"}, err
 	}
 
 	provider := streamingRewriter.Name()
+
 	auditAgent := auditAgentForCfg(cfg)
 
 	originalPendingApprovals := cfg.PendingApprovals
