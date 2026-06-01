@@ -984,6 +984,7 @@ func SynthOpenAIResponsesFunctionCallsSSE(calls []SyntheticToolCall) []byte {
 		}))
 	}
 	b.WriteString(sseEventBlock("response.completed", map[string]any{"type": "response.completed", "response": map[string]any{"id": "resp_clawvisor_approve", "status": "completed"}}))
+	b.WriteString("data: [DONE]\n\n")
 	return []byte(b.String())
 }
 
@@ -1236,6 +1237,7 @@ func synthOpenAIResponsesFunctionCallSSE(toolUseID, toolName string, toolInput m
 		"item":         map[string]any{"id": "fc_" + toolUseID, "type": "function_call", "status": "completed", "call_id": toolUseID, "name": toolName, "arguments": string(args)},
 	}))
 	b.WriteString(sseEventBlock("response.completed", map[string]any{"type": "response.completed", "response": map[string]any{"id": "resp_clawvisor_approve", "status": "completed"}}))
+	b.WriteString("data: [DONE]\n\n")
 	return []byte(b.String())
 }
 
@@ -1507,7 +1509,7 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 		}
 		if trimmed == "data: [DONE]" {
 			if len(pending) == 0 {
-				_, _ = fmt.Fprintln(w, line)
+				_, _ = fmt.Fprintf(w, "%s\n\n", line)
 			}
 			continue
 		}
@@ -1521,7 +1523,7 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 			Choices []openAIChatChoice `json:"choices"`
 		}
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
-			_, _ = fmt.Fprintln(w, line)
+			_, _ = fmt.Fprintf(w, "%s\n\n", line)
 			continue
 		}
 		if event.ID != "" && streamID == "" {
@@ -1595,7 +1597,7 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 			continue
 		}
 
-		_, _ = fmt.Fprintln(w, line)
+		_, _ = fmt.Fprintf(w, "%s\n\n", line)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -1658,7 +1660,8 @@ func (rw OpenAIResponseRewriter) streamRewriteResponses(ctx context.Context, r i
 	var lastEvent string
 	var dataLns []string
 	withheldTool := false
-	streamID := "resp_clawvisor_rewrite"
+	var streamID string
+	responseCreated := false
 
 	flushEvent := func() error {
 		if len(dataLns) == 0 {
@@ -1671,17 +1674,23 @@ func (rw OpenAIResponseRewriter) streamRewriteResponses(ctx context.Context, r i
 		dataLns = dataLns[:0]
 
 		if data == "[DONE]" {
+			if !withheldTool {
+				_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+			}
 			return nil
 		}
 
 		switch event {
 		case "response.created":
+			responseCreated = true
 			var raw struct {
 				Response struct {
 					ID string `json:"id"`
 				} `json:"response"`
 			}
-			if err := json.Unmarshal([]byte(data), &raw); err == nil && raw.Response.ID != "" {
+			if err := json.Unmarshal([]byte(data), &raw); err != nil {
+				return writeSSE(w, event, data)
+			} else if raw.Response.ID != "" {
 				streamID = raw.Response.ID
 			}
 			return writeSSE(w, event, data)
@@ -1924,11 +1933,12 @@ func (rw OpenAIResponseRewriter) streamRewriteResponses(ctx context.Context, r i
 	}
 
 	return StreamingRewriteResult{
-		ToolUses:              tus,
-		AssistantTurn:         turn,
-		StreamID:              streamID,
-		StreamFormat:          "openai_responses",
-		NextOpenAIOutputIndex: nextOutputIndex,
+		ToolUses:                 tus,
+		AssistantTurn:            turn,
+		StreamID:                 streamID,
+		StreamFormat:             "openai_responses",
+		NextOpenAIOutputIndex:    nextOutputIndex,
+		HasOpenAIResponseCreated: responseCreated,
 	}, nil
 }
 
