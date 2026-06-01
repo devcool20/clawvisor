@@ -1,8 +1,10 @@
 package conversation
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -78,10 +80,32 @@ func MakeToolInputPreview(in json.RawMessage) string {
 	return s[:toolInputPreviewLimit] + "..."
 }
 
+type ContinuationToolResult struct {
+	ToolUseID string
+	Content   string
+}
+
+type StreamingRewriteResult struct {
+	ToolUses                  []ToolUse
+	AssistantTurn             *Turn
+	StreamID                  string
+	Model                     string
+	Role                      string
+	StreamFormat              string
+	NextAnthropicContentIndex int
+	NextOpenAIOutputIndex     int
+}
+
 type ResponseRewriter interface {
 	Name() Provider
 	MatchesResponse(req *http.Request, resp *http.Response) bool
 	Rewrite(body []byte, contentType string, eval ToolUseEvaluator) (RewriteResult, error)
+}
+
+type StreamingResponseRewriter interface {
+	Name() Provider
+	MatchesResponse(req *http.Request, resp *http.Response) bool
+	StreamRewrite(ctx context.Context, r io.Reader, w io.Writer) (StreamingRewriteResult, error)
 }
 
 type ResponseRegistry struct {
@@ -93,6 +117,17 @@ func DefaultResponseRegistry() *ResponseRegistry {
 		&AnthropicResponseRewriter{},
 		&OpenAIResponseRewriter{},
 	}}
+}
+
+func (r *ResponseRegistry) ForProviderStreaming(p Provider) StreamingResponseRewriter {
+	rw := r.ForProvider(p)
+	if rw == nil {
+		return nil
+	}
+	if srw, ok := rw.(StreamingResponseRewriter); ok {
+		return srw
+	}
+	return nil
 }
 
 func (r *ResponseRegistry) Match(req *http.Request, resp *http.Response) ResponseRewriter {
@@ -191,7 +226,7 @@ func applyBlockSubstitutions(frags []assistantFragment, decisions []ToolUseDecis
 	return out
 }
 
-func blockedReasonText(decisions []ToolUseDecisionRecord) string {
+func BlockedReasonText(decisions []ToolUseDecisionRecord) string {
 	var substitutions []string
 	for _, decision := range decisions {
 		if decision.Verdict.SubstituteWith != "" {
@@ -217,6 +252,14 @@ func blockedReasonText(decisions []ToolUseDecisionRecord) string {
 		return ""
 	}
 	return "Tool use was blocked by the Clawvisor proxy:\n" + strings.Join(parts, "\n")
+}
+
+func blockedReasonTextForAssistant(decisions []ToolUseDecisionRecord) string {
+	text := strings.TrimSpace(BlockedReasonText(decisions))
+	if text != "" {
+		return text
+	}
+	return "Tool use was blocked by the Clawvisor proxy."
 }
 
 func isSSE(contentType string) bool {

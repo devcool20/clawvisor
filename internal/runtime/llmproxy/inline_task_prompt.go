@@ -2,6 +2,7 @@ package llmproxy
 
 import (
 	"strings"
+	"unicode"
 
 	runtimetasks "github.com/clawvisor/clawvisor/internal/runtime/tasks"
 	"github.com/clawvisor/clawvisor/internal/taskrisk"
@@ -52,7 +53,7 @@ func renderTaskApprovalPromptWithRisk(req *runtimetasks.TaskCreateRequest, appro
 	if req == nil {
 		return "Clawvisor wants to create a task.\n\nReply `yes` or `y` to authorize, `no` or `n` to cancel." + suffix
 	}
-	purpose := strings.TrimSpace(req.Purpose)
+	purpose := sanitizeUserText(strings.TrimSpace(req.Purpose))
 	if purpose == "" {
 		return "Clawvisor wants to create a task: unnamed.\n\nReply `yes` or `y` to authorize, `no` or `n` to cancel." + suffix
 	}
@@ -65,13 +66,13 @@ func renderTaskApprovalPromptWithRisk(req *runtimetasks.TaskCreateRequest, appro
 	if len(req.ExpectedTools) > 0 {
 		b.WriteString("\n\nTools requested")
 		for _, tool := range req.ExpectedTools {
-			name := strings.TrimSpace(tool.ToolName)
+			name := sanitizeUserText(strings.TrimSpace(tool.ToolName))
 			if name == "" {
 				continue
 			}
 			b.WriteString("\n  • ")
 			b.WriteString(name)
-			if why := strings.TrimSpace(tool.Why); why != "" {
+			if why := sanitizeUserText(strings.TrimSpace(tool.Why)); why != "" {
 				b.WriteString(" — ")
 				b.WriteString(wrapForPrompt(why, 80, "      "))
 			}
@@ -81,13 +82,13 @@ func renderTaskApprovalPromptWithRisk(req *runtimetasks.TaskCreateRequest, appro
 	if len(req.ExpectedEgress) > 0 {
 		b.WriteString("\n\nNetwork egress")
 		for _, eg := range req.ExpectedEgress {
-			host := strings.TrimSpace(eg.Host)
+			host := sanitizeUserText(strings.TrimSpace(eg.Host))
 			if host == "" {
 				continue
 			}
 			b.WriteString("\n  • ")
 			b.WriteString(host)
-			if why := strings.TrimSpace(eg.Why); why != "" {
+			if why := sanitizeUserText(strings.TrimSpace(eg.Why)); why != "" {
 				b.WriteString(" — ")
 				b.WriteString(wrapForPrompt(why, 80, "      "))
 			}
@@ -97,16 +98,16 @@ func renderTaskApprovalPromptWithRisk(req *runtimetasks.TaskCreateRequest, appro
 	if len(req.RequiredCredentials) > 0 {
 		b.WriteString("\n\nCredentials requested")
 		for _, cred := range req.RequiredCredentials {
-			name := strings.TrimSpace(cred.VaultItemID)
+			name := sanitizeUserText(strings.TrimSpace(cred.VaultItemID))
 			if name == "" {
-				name = strings.TrimSpace(cred.VaultItemHandle)
+				name = sanitizeUserText(strings.TrimSpace(cred.VaultItemHandle))
 			}
 			if name == "" {
 				continue
 			}
 			b.WriteString("\n  • ")
 			b.WriteString(name)
-			if why := strings.TrimSpace(cred.Why); why != "" {
+			if why := sanitizeUserText(strings.TrimSpace(cred.Why)); why != "" {
 				b.WriteString(" — ")
 				b.WriteString(wrapForPrompt(why, 80, "      "))
 			}
@@ -271,6 +272,21 @@ func humanizeExpiresIn(seconds int) string {
 	default:
 		return itoaShort(seconds) + " sec"
 	}
+}
+
+func sanitizeUserText(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\t' || r == '\n' || r == '\r' {
+			return r
+		}
+		if r < 0x20 || r == 0x7F {
+			return -1
+		}
+		if unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // wrapForPrompt soft-wraps text at column width, breaking on word

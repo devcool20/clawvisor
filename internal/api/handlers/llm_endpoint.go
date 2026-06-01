@@ -236,8 +236,8 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 		// Cost-extraction state populated once the upstream response
 		// has been buffered. The deferred audit emission below reads
 		// these to write a paired llm_request_cost row.
-		auditUsage   *llmproxy.ExtractUsageResult
-		auditTaskID  string
+		auditUsage  *llmproxy.ExtractUsageResult
+		auditTaskID string
 	)
 	defer func() {
 		// One-liner summary at handler exit — visible in slog even
@@ -661,7 +661,8 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 
 	upstreamURL := ""
 	if h.Forwarder != nil {
-		if u, urlErr := h.Forwarder.Upstream.URL(provider, r.URL.Path); urlErr == nil {
+		upstreamPath := llmproxy.ProviderPath(provider, r.URL.Path)
+		if u, urlErr := h.Forwarder.Upstream.URL(provider, upstreamPath); urlErr == nil {
 			u.RawQuery = r.URL.RawQuery
 			upstreamURL = u.String()
 		} else {
@@ -669,7 +670,7 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 				"request_id", requestID,
 				"agent_id", agent.ID,
 				"provider", string(provider),
-				"path", r.URL.Path,
+				"path", upstreamPath,
 				"query", r.URL.RawQuery,
 				"err", urlErr.Error(),
 			)
@@ -679,6 +680,7 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 		"request_id", requestID,
 		"agent_id", agent.ID,
 		"provider", string(provider),
+		"inbound_path", r.URL.RequestURI(),
 		"upstream_url", upstreamURL,
 		"model", reqSummary.Model,
 	)
@@ -773,6 +775,268 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 	// decisions must still run on local proxy-lite installs that do not set
 	// server.public_url.
 	if h.Inspector != nil {
+		if conversation.IsSSEContentType(upstreamCT) {
+			candidateTasks, toolRules, egressRules, decisionLoadErr := h.loadLiteProxyDecisionInputs(r.Context(), agent)
+			if decisionLoadErr != nil {
+				h.Logger.WarnContext(r.Context(), "lite-proxy decision-input load failed; failing closed",
+					"request_id", requestID, "agent_id", agent.ID, "err", decisionLoadErr.Error())
+				auditStatus = http.StatusServiceUnavailable
+				auditDecide = "deny"
+				auditOutcome = "decision_input_load_failed"
+				auditReason = decisionLoadErr.Error()
+				h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusServiceUnavailable, "DECISION_INPUT_UNAVAILABLE",
+					"couldn't load authorization data right now. Please retry in a moment.")
+				return
+			}
+			preferredTaskID, preferredTaskErr := h.checkedOutTaskID(r.Context(), agent, conversationID, candidateTasks)
+			if preferredTaskErr != nil {
+				h.Logger.WarnContext(r.Context(), "lite-proxy task checkout lookup failed; continuing without preferred task",
+					"request_id", requestID, "agent_id", agent.ID, "err", preferredTaskErr.Error())
+				auditParams["task_checkout_unavailable"] = true
+				preferredTaskID = ""
+			}
+			if preferredTaskID != "" {
+				auditTaskID = preferredTaskID
+			}
+			h.Logger.DebugContext(r.Context(), "lite-proxy decision inputs loaded (streaming)",
+				"request_id", requestID,
+				"agent_id", agent.ID,
+				"provider", string(provider),
+				"posture", string(liteProxyDecisionPosture(agent)),
+				"candidate_tasks", len(candidateTasks),
+				"tool_rules", len(toolRules),
+				"egress_rules", len(egressRules),
+				"preferred_task_id", preferredTaskID,
+			)
+
+			recentTurns := llmproxy.ExtractRecentHumanTurns(llmproxy.ExtractHumanTurnsRequest{
+				Provider: provider,
+				Body:     body,
+			})
+			autoApproveThreshold := agentConversationAutoApproveThreshold(agent)
+
+			callerToken := middleware.CallerTokenFromContext(r.Context())
+			if callerToken == "" {
+				callerToken = inboundAgentToken(r)
+			}
+			opts := inspector.DefaultRewriteOpts(h.ResolverBaseURL)
+			opts.CallerToken = callerToken
+
+			var catalogIface interface {
+				Resolve(host, method, path string) (llmproxy.ResolvedAction, bool)
+			}
+			if h.Catalog != nil {
+				catalogIface = h.Catalog
+			}
+
+			cfg := llmproxy.PostprocessConfig{
+				Inspector:                        h.Inspector,
+				RewriteOpts:                      opts,
+				Store:                            h.Store,
+				AgentUserID:                      agent.UserID,
+				AgentID:                          agent.ID,
+				ConversationID:                   conversationID,
+				Audit:                            h.AuditEmitter,
+				RequestID:                        requestID,
+				Catalog:                          catalogIface,
+				TaskScope:                        h.TaskScope,
+				IntentVerifier:                   h.IntentVerifier,
+				Posture:                          liteProxyDecisionPosture(agent),
+				CandidateTasks:                   candidateTasks,
+				ToolRules:                        toolRules,
+				EgressRules:                      egressRules,
+				PreferredTaskID:                  preferredTaskID,
+				PendingApprovals:                 h.PendingApprovals,
+				ControlBaseURL:                   h.ControlBaseURL,
+				CallerNonces:                     h.CallerNonces,
+				Trace:                            h.TraceLogger,
+				TaskRiskAssessor:                 h.taskRiskBridge(),
+				AgentName:                        agent.Name,
+				RecentUserTurns:                  recentTurns,
+				ConversationAutoApproveThreshold: autoApproveThreshold,
+				InlineTaskCreator:                h.InlineTaskCreator,
+				Checkouts:                        h.TaskCheckouts,
+				DefaultTaskExpirySeconds:         h.DefaultTaskExpirySeconds,
+			}
+
+			w.Header().Del("Content-Length")
+			w.Header().Del("Content-Encoding")
+			if upstreamCT != "" {
+				w.Header().Set("Content-Type", upstreamCT)
+			}
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("X-Accel-Buffering", "no")
+
+			streamResp := newDelayedHeaderWriter(w, resp.StatusCode)
+			flushingW := newFlushingWriter(streamResp)
+			timingW := newStreamingTimingWriter(flushingW, h.Logger, requestID, string(provider), upstreamHeadersMs)
+			emittedStream := newLimitedCaptureWriter(h.MaxResponseBytes)
+			streamW := io.MultiWriter(timingW, emittedStream)
+
+			var capturedUpstream bytes.Buffer
+			teeReader := io.TeeReader(resp.Body, &capturedUpstream)
+
+			processed, err := llmproxy.PostprocessStream(r.Context(), r, teeReader, streamW, upstreamCT, cfg)
+			if err != nil {
+				h.Logger.WarnContext(r.Context(), "lite-proxy postprocess streaming error",
+					"request_id", requestID, "agent_id", agent.ID, "err", err.Error())
+				auditStatus = http.StatusBadGateway
+				auditOutcome = "postprocess_stream_error"
+				auditReason = err.Error()
+				if !streamResp.WroteHeader() {
+					clearHeaders(w.Header())
+					h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadGateway, "POSTPROCESS_STREAM_ERROR",
+						"couldn't process the upstream stream. Please retry; details are in the Clawvisor audit log.")
+				}
+				return
+			}
+
+			h.Logger.DebugContext(r.Context(), "lite-proxy streaming postprocess complete",
+				"request_id", requestID,
+				"agent_id", agent.ID,
+				"provider", string(provider),
+				"status", resp.StatusCode,
+				"rewritten", processed.Rewritten,
+				"decisions", len(processed.Decisions),
+				"skipped_reason", processed.SkippedReason,
+			)
+
+			if auditTaskID == "" {
+				for _, dec := range processed.Decisions {
+					if dec.Verdict.ContinueWithToolResult != "" && dec.Verdict.CreatedTaskID != "" {
+						auditTaskID = dec.Verdict.CreatedTaskID
+						break
+					}
+				}
+			}
+
+			firstUpstreamCT := upstreamCT
+			streamStatus := resp.StatusCode
+			if len(processed.ContinuationToolResults) > 0 {
+				contFinal, contStatus, contCT, contUsage, contErr := h.tryContinuation(r, agent, provider, requestID, body, capturedUpstream.Bytes(), upstreamCT, resp.StatusCode, processed, cfg)
+				switch {
+				case contErr != nil:
+					h.Logger.WarnContext(r.Context(), "lite-proxy streaming continuation failed",
+						"request_id", requestID, "agent_id", agent.ID, "err", contErr.Error())
+					if !streamResp.WroteHeader() {
+						clearHeaders(w.Header())
+						auditStatus = http.StatusBadGateway
+						auditOutcome = "streaming_continuation_failed"
+						auditReason = contErr.Error()
+						h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadGateway, "STREAMING_CONTINUATION_FAILED",
+							"couldn't continue the streamed tool result. Please retry; details are in the Clawvisor audit log.")
+					}
+					return
+				case contFinal != nil:
+					if contFinal.SkippedReason != "" {
+						h.Logger.WarnContext(r.Context(), "lite-proxy streaming continuation postprocess reported SkippedReason",
+							"request_id", requestID,
+							"agent_id", agent.ID,
+							"skipped_reason", contFinal.SkippedReason,
+							"body_bytes", len(contFinal.Body),
+						)
+						if !streamResp.WroteHeader() {
+							clearHeaders(w.Header())
+							auditStatus = http.StatusBadGateway
+							auditOutcome = "streaming_continuation_postprocess_error"
+							auditReason = contFinal.SkippedReason
+							h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadGateway, "STREAMING_CONTINUATION_POSTPROCESS_ERROR",
+								"couldn't process the streamed continuation response. Please retry; details are in the Clawvisor audit log.")
+						}
+						return
+					}
+					originalStreamResult := processed.StreamingResult
+					processed = *contFinal
+					if contStatus != 0 {
+						streamStatus = contStatus
+						auditStatus = contStatus
+						auditOutcome = outcomeFromStatus(contStatus)
+					}
+					if contCT != "" && contCT != upstreamCT && !streamResp.WroteHeader() {
+						upstreamCT = contCT
+						w.Header().Set("Content-Type", contCT)
+					}
+					if contUsage != nil {
+						mergeAuditUsage(&auditUsage, auditParams, contUsage, r.Context(), h.Logger, requestID, agent.ID, "streaming_continuation")
+					}
+					if len(contFinal.Body) > 0 {
+						continuationBody, spliceErr := spliceStreamingContinuationBody(provider, originalStreamResult, contCT, contFinal.Body)
+						if spliceErr != nil {
+							h.Logger.WarnContext(r.Context(), "lite-proxy streaming continuation splice failed",
+								"request_id", requestID, "agent_id", agent.ID, "err", spliceErr.Error())
+							if !streamResp.WroteHeader() {
+								clearHeaders(w.Header())
+								auditStatus = http.StatusBadGateway
+								auditOutcome = "streaming_continuation_splice_failed"
+								auditReason = spliceErr.Error()
+								h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadGateway, "STREAMING_CONTINUATION_SPLICE_FAILED",
+									"couldn't merge the streamed continuation response. Please retry; details are in the Clawvisor audit log.")
+							}
+							return
+						}
+						if _, writeErr := streamW.Write(continuationBody); writeErr != nil {
+							h.Logger.WarnContext(r.Context(), "lite-proxy streaming continuation write failed",
+								"request_id", requestID, "agent_id", agent.ID, "err", writeErr.Error())
+							return
+						}
+					}
+				}
+			}
+
+			streamResp.Commit()
+
+			if resp.StatusCode < 400 {
+				if usage := llmproxy.ExtractUsage(provider, firstUpstreamCT, capturedUpstream.Bytes(), reqSummary.Model); usage.Found {
+					u := usage
+					mergeAuditUsage(&auditUsage, auditParams, &u, r.Context(), h.Logger, requestID, agent.ID, "streaming")
+				}
+			}
+			if auditUsage != nil {
+				auditParams["usage_input_tokens"] = auditUsage.Usage.InputTokens
+				auditParams["usage_output_tokens"] = auditUsage.Usage.OutputTokens
+				if auditUsage.Usage.CacheReadTokens > 0 {
+					auditParams["usage_cache_read_tokens"] = auditUsage.Usage.CacheReadTokens
+				}
+				if auditUsage.Usage.CacheWriteTokens > 0 {
+					auditParams["usage_cache_write_tokens"] = auditUsage.Usage.CacheWriteTokens
+				}
+				if auditUsage.Usage.CacheWrite1hTokens > 0 {
+					auditParams["usage_cache_write_1h_tokens"] = auditUsage.Usage.CacheWrite1hTokens
+				}
+			}
+
+			if h.RawIOLogger != nil {
+				emittedBody := emittedStream.Bytes()
+				bodyStr, bodyEnc := llmproxy.EncodeBody(emittedBody)
+				marker := "streaming"
+				if processed.Rewritten {
+					marker = "streaming_rewritten"
+				}
+				h.RawIOLogger.Emit(llmproxy.RawIOEvent{
+					Phase:        "harness_response",
+					RequestID:    requestID,
+					UserID:       agent.UserID,
+					AgentID:      agent.ID,
+					Provider:     string(provider),
+					Method:       r.Method,
+					Path:         r.URL.RequestURI(),
+					Status:       streamStatus,
+					ContentType:  upstreamCT,
+					Headers:      llmproxy.SafeHeaderSnapshot(w.Header()),
+					Body:         bodyStr,
+					BodyEncoding: bodyEnc,
+					BodyBytes:    len(emittedBody),
+					Marker:       marker,
+				})
+			}
+
+			auditStatus = streamStatus
+			if auditOutcome == "" {
+				auditOutcome = outcomeFromStatus(streamStatus)
+			}
+			return
+		}
+
 		// Wrap the upstream body so we get TTFB / progress / final
 		// stats in slog and the raw log. Reads pass through unchanged;
 		// it's purely observational. Stalls in this read are the
@@ -1600,6 +1864,215 @@ func (h *LLMEndpointHandler) tryContinuation(
 	return &newProcessed, resp.StatusCode, contCT, contUsage, nil
 }
 
+type flushingWriter struct {
+	w       io.Writer
+	flusher http.Flusher
+}
+
+func (fw *flushingWriter) Write(p []byte) (n int, err error) {
+	n, err = fw.w.Write(p)
+	if fw.flusher != nil {
+		fw.flusher.Flush()
+	}
+	return n, err
+}
+
+func newFlushingWriter(w io.Writer) io.Writer {
+	flusher, _ := w.(http.Flusher)
+	return &flushingWriter{w: w, flusher: flusher}
+}
+
+type delayedHeaderWriter struct {
+	w      http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func newDelayedHeaderWriter(w http.ResponseWriter, status int) *delayedHeaderWriter {
+	return &delayedHeaderWriter{w: w, status: status}
+}
+
+func (w *delayedHeaderWriter) Write(p []byte) (int, error) {
+	w.Commit()
+	return w.w.Write(p)
+}
+
+func (w *delayedHeaderWriter) Flush() {
+	w.Commit()
+	if flusher, ok := w.w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *delayedHeaderWriter) Commit() {
+	if w.wrote {
+		return
+	}
+	w.wrote = true
+	w.w.WriteHeader(w.status)
+}
+
+func (w *delayedHeaderWriter) WroteHeader() bool {
+	return w != nil && w.wrote
+}
+
+func clearHeaders(h http.Header) {
+	for k := range h {
+		delete(h, k)
+	}
+}
+
+type streamingTimingWriter struct {
+	w                 io.Writer
+	logger            *slog.Logger
+	requestID         string
+	provider          string
+	start             time.Time
+	upstreamHeadersMs int64
+	mu                sync.Mutex
+	sawWrite          bool
+	sawTextStart      bool
+	sawTextDelta      bool
+	eventBuf          string
+}
+
+func newStreamingTimingWriter(w io.Writer, logger *slog.Logger, requestID, provider string, upstreamHeadersMs int64) io.Writer {
+	return &streamingTimingWriter{
+		w:                 w,
+		logger:            logger,
+		requestID:         requestID,
+		provider:          provider,
+		start:             time.Now(),
+		upstreamHeadersMs: upstreamHeadersMs,
+	}
+}
+
+func (tw *streamingTimingWriter) Write(p []byte) (int, error) {
+	n, err := tw.w.Write(p)
+	tw.observe(p)
+	return n, err
+}
+
+func (tw *streamingTimingWriter) observe(p []byte) {
+	if tw == nil || tw.logger == nil {
+		return
+	}
+	tw.mu.Lock()
+	defer tw.mu.Unlock()
+
+	elapsedMs := time.Since(tw.start).Milliseconds()
+	if !tw.sawWrite {
+		tw.sawWrite = true
+		tw.logger.InfoContext(context.Background(), "lite-proxy stream forwarded first SSE bytes",
+			"request_id", tw.requestID,
+			"provider", tw.provider,
+			"elapsed_ms", elapsedMs,
+			"ttfb_headers_ms", tw.upstreamHeadersMs,
+			"chunk_bytes", len(p),
+		)
+	}
+	tw.observeSSETextEvents(p, elapsedMs)
+}
+
+func (tw *streamingTimingWriter) observeSSETextEvents(p []byte, elapsedMs int64) {
+	tw.eventBuf += strings.ReplaceAll(string(p), "\r\n", "\n")
+	for {
+		idx := strings.Index(tw.eventBuf, "\n\n")
+		if idx < 0 {
+			if len(tw.eventBuf) > 64<<10 {
+				tw.eventBuf = tw.eventBuf[len(tw.eventBuf)-(32<<10):]
+			}
+			return
+		}
+		rawEvent := tw.eventBuf[:idx]
+		tw.eventBuf = tw.eventBuf[idx+2:]
+		var eventName string
+		var dataLines []string
+		for _, line := range strings.Split(rawEvent, "\n") {
+			line = strings.TrimSpace(line)
+			switch {
+			case strings.HasPrefix(line, "event:"):
+				eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			case strings.HasPrefix(line, "data:"):
+				dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			}
+		}
+		if len(dataLines) == 0 {
+			continue
+		}
+		data := strings.Join(dataLines, "\n")
+		if !tw.sawTextStart && sseEventIsTextStart(eventName, data) {
+			tw.sawTextStart = true
+			tw.logger.InfoContext(context.Background(), "lite-proxy stream forwarded text block start",
+				"request_id", tw.requestID,
+				"provider", tw.provider,
+				"elapsed_ms", elapsedMs,
+				"ttfb_headers_ms", tw.upstreamHeadersMs,
+			)
+		}
+		if !tw.sawTextDelta && sseEventIsTextDelta(eventName, data) {
+			tw.sawTextDelta = true
+			tw.logger.InfoContext(context.Background(), "lite-proxy stream forwarded first text delta",
+				"request_id", tw.requestID,
+				"provider", tw.provider,
+				"elapsed_ms", elapsedMs,
+				"ttfb_headers_ms", tw.upstreamHeadersMs,
+			)
+		}
+	}
+}
+
+func sseEventIsTextStart(eventName, data string) bool {
+	switch eventName {
+	case "content_block_start":
+		var payload struct {
+			ContentBlock struct {
+				Type string `json:"type"`
+			} `json:"content_block"`
+		}
+		return json.Unmarshal([]byte(data), &payload) == nil && payload.ContentBlock.Type == "text"
+	case "response.content_part.added":
+		var payload struct {
+			Part struct {
+				Type string `json:"type"`
+			} `json:"part"`
+		}
+		return json.Unmarshal([]byte(data), &payload) == nil && payload.Part.Type == "output_text"
+	}
+	return false
+}
+
+func sseEventIsTextDelta(eventName, data string) bool {
+	switch eventName {
+	case "content_block_delta":
+		var payload struct {
+			Delta struct {
+				Type string `json:"type"`
+			} `json:"delta"`
+		}
+		return json.Unmarshal([]byte(data), &payload) == nil && payload.Delta.Type == "text_delta"
+	case "response.output_text.delta":
+		return true
+	case "":
+		var payload struct {
+			Choices []struct {
+				Delta struct {
+					Content any `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(data), &payload) != nil {
+			return false
+		}
+		for _, choice := range payload.Choices {
+			if choice.Delta.Content != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // readResponseLimited mirrors readLimited for upstream responses. Default
 // max applies when 0 is passed (32 MiB).
 func readResponseLimited(r io.Reader, max int64) ([]byte, error) {
@@ -1658,6 +2131,177 @@ func pricingModelMatch(a, b string) bool {
 		return false
 	}
 	return pricing.Normalize(a) == pricing.Normalize(b)
+}
+
+func mergeAuditUsage(dst **llmproxy.ExtractUsageResult, auditParams map[string]any, next *llmproxy.ExtractUsageResult, ctx context.Context, logger *slog.Logger, requestID string, agentID string, label string) {
+	if next == nil {
+		return
+	}
+	if *dst == nil {
+		*dst = next
+		auditParams[label+"_usage_recorded"] = true
+		return
+	}
+	if pricingModelMatch((*dst).Model, next.Model) {
+		(*dst).Usage.InputTokens += next.Usage.InputTokens
+		(*dst).Usage.OutputTokens += next.Usage.OutputTokens
+		(*dst).Usage.CacheReadTokens += next.Usage.CacheReadTokens
+		(*dst).Usage.CacheWriteTokens += next.Usage.CacheWriteTokens
+		(*dst).Usage.CacheWrite1hTokens += next.Usage.CacheWrite1hTokens
+		auditParams[label+"_usage_recorded"] = true
+		return
+	}
+	if logger != nil {
+		logger.WarnContext(ctx, "lite-proxy usage dropped: model mismatch",
+			"request_id", requestID,
+			"agent_id", agentID,
+			"label", label,
+			"existing_model", (*dst).Model,
+			"dropped_model", next.Model,
+		)
+	}
+	auditParams[label+"_usage_dropped_model_mismatch"] = true
+}
+
+// spliceStreamingContinuationBody only consumes SSE bodies produced by
+// Clawvisor's own continuation rewriters. Those helpers JSON-encode every
+// data payload, so raw "\n\n" event separators cannot appear inside data.
+func spliceStreamingContinuationBody(provider conversation.Provider, result conversation.StreamingRewriteResult, contentType string, body []byte) ([]byte, error) {
+	if !conversation.IsSSEContentType(contentType) {
+		return body, nil
+	}
+	switch provider {
+	case conversation.ProviderAnthropic:
+		return spliceAnthropicContinuationSSE(result.NextAnthropicContentIndex, body)
+	case conversation.ProviderOpenAI:
+		if result.StreamFormat == "openai_responses" {
+			return spliceOpenAIResponsesContinuationSSE(result.StreamID, result.NextOpenAIOutputIndex, body)
+		}
+		return body, nil
+	default:
+		return body, nil
+	}
+}
+
+type liteProxySSEEvent struct {
+	event string
+	data  string
+}
+
+func parseLiteProxySSE(body []byte) []liteProxySSEEvent {
+	normalized := strings.ReplaceAll(string(body), "\r\n", "\n")
+	blocks := strings.Split(normalized, "\n\n")
+	events := make([]liteProxySSEEvent, 0, len(blocks))
+	for _, block := range blocks {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		var ev liteProxySSEEvent
+		var dataLines []string
+		for _, line := range strings.Split(block, "\n") {
+			line = strings.TrimSpace(line)
+			switch {
+			case strings.HasPrefix(line, "event:"):
+				ev.event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			case strings.HasPrefix(line, "data:"):
+				dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			}
+		}
+		if len(dataLines) == 0 {
+			continue
+		}
+		ev.data = strings.Join(dataLines, "\n")
+		events = append(events, ev)
+	}
+	return events
+}
+
+func appendLiteProxySSEEvent(b *bytes.Buffer, event string, payload any) error {
+	var data []byte
+	switch v := payload.(type) {
+	case string:
+		data = []byte(v)
+	default:
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		data = raw
+	}
+	if event != "" {
+		b.WriteString("event: ")
+		b.WriteString(event)
+		b.WriteByte('\n')
+	}
+	b.WriteString("data: ")
+	b.Write(data)
+	b.WriteString("\n\n")
+	return nil
+}
+
+func spliceAnthropicContinuationSSE(indexOffset int, body []byte) ([]byte, error) {
+	var out bytes.Buffer
+	for _, ev := range parseLiteProxySSE(body) {
+		if ev.data == "[DONE]" || ev.event == "message_start" {
+			continue
+		}
+		switch ev.event {
+		case "content_block_start", "content_block_delta", "content_block_stop":
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(ev.data), &payload); err != nil {
+				return nil, err
+			}
+			if idx, ok := numericJSONIndex(payload["index"]); ok {
+				payload["index"] = idx + indexOffset
+			}
+			if err := appendLiteProxySSEEvent(&out, ev.event, payload); err != nil {
+				return nil, err
+			}
+		default:
+			if err := appendLiteProxySSEEvent(&out, ev.event, ev.data); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out.Bytes(), nil
+}
+
+func spliceOpenAIResponsesContinuationSSE(responseID string, outputIndexOffset int, body []byte) ([]byte, error) {
+	var out bytes.Buffer
+	for _, ev := range parseLiteProxySSE(body) {
+		if ev.data == "[DONE]" || ev.event == "response.created" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(ev.data), &payload); err != nil {
+			return nil, err
+		}
+		if idx, ok := numericJSONIndex(payload["output_index"]); ok {
+			payload["output_index"] = idx + outputIndexOffset
+		}
+		if ev.event == "response.completed" && responseID != "" {
+			if resp, ok := payload["response"].(map[string]any); ok {
+				resp["id"] = responseID
+			}
+		}
+		if err := appendLiteProxySSEEvent(&out, ev.event, payload); err != nil {
+			return nil, err
+		}
+	}
+	out.WriteString("data: [DONE]\n\n")
+	return out.Bytes(), nil
+}
+
+func numericJSONIndex(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	default:
+		return 0, false
+	}
 }
 
 // actionForRoute maps a request path to an audit-log action label.
@@ -1953,7 +2597,8 @@ func (h *LLMEndpointHandler) activeLitePassthrough(ctx context.Context, agent *s
 func (h *LLMEndpointHandler) forwardLitePassthrough(w http.ResponseWriter, r *http.Request, agent *store.Agent, provider conversation.Provider, requestID string, body []byte, auditStatus *int, auditDecide, auditOutcome, auditReason *string, auditParams map[string]any) {
 	upstreamURL := ""
 	if h.Forwarder != nil {
-		if u, urlErr := h.Forwarder.Upstream.URL(provider, r.URL.Path); urlErr == nil {
+		upstreamPath := llmproxy.ProviderPath(provider, r.URL.Path)
+		if u, urlErr := h.Forwarder.Upstream.URL(provider, upstreamPath); urlErr == nil {
 			u.RawQuery = r.URL.RawQuery
 			upstreamURL = u.String()
 		}

@@ -13,10 +13,7 @@ import (
 // ContinuationToolResult is one synthetic tool_result the proxy is
 // feeding back to the model. The text is rendered into the provider's
 // tool_result block shape verbatim (no further escaping or wrapping).
-type ContinuationToolResult struct {
-	ToolUseID string
-	Content   string
-}
+type ContinuationToolResult = conversation.ContinuationToolResult
 
 // ErrContinuationUnsupportedProvider signals that the proxy does not
 // know how to build a continuation body for this provider. The caller

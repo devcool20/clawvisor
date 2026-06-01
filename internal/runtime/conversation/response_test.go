@@ -1,7 +1,11 @@
 package conversation
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -21,6 +25,31 @@ func TestSyntheticApprovalToolUseResponseOpenAIChatLiteProxyRoute(t *testing.T) 
 	}
 	if !strings.Contains(string(resp.Body), `"tool_calls"`) {
 		t.Fatalf("expected chat tool_calls response, got %s", resp.Body)
+	}
+}
+
+func TestResponseRegistryForProviderStreamingHandlesMissingProvider(t *testing.T) {
+	t.Parallel()
+
+	if got := DefaultResponseRegistry().ForProviderStreaming(ProviderAnthropic); got == nil {
+		t.Fatal("registered Anthropic streaming rewriter is nil")
+	}
+	if got := DefaultResponseRegistry().ForProviderStreaming(ProviderOpenAI); got == nil {
+		t.Fatal("registered OpenAI streaming rewriter is nil")
+	}
+	if got := DefaultResponseRegistry().ForProviderStreaming(Provider("missing")); got != nil {
+		t.Fatalf("missing provider streaming rewriter = %#v, want nil", got)
+	}
+}
+
+func TestBlockedReasonTextPreservesEmptyContract(t *testing.T) {
+	t.Parallel()
+
+	if got := BlockedReasonText(nil); got != "" {
+		t.Fatalf("BlockedReasonText(nil)=%q, want empty", got)
+	}
+	if got := blockedReasonTextForAssistant(nil); strings.TrimSpace(got) == "" {
+		t.Fatal("assistant blocked-reason fallback returned empty text")
 	}
 }
 
@@ -437,4 +466,507 @@ func TestOpenAIResponseRewriterSortsStreamingChatToolCallsByIndex(t *testing.T) 
 	if len(result.Decisions) != 2 || result.Decisions[0].ToolUse.Index != 0 || result.Decisions[1].ToolUse.Index != 1 {
 		t.Fatalf("unexpected decision indexes: %+v", result.Decisions)
 	}
+}
+
+func TestAnthropicStreamRewritePreservesIndices(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Thinking process..."}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"WebFetch","input":{}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"url\":\"https://example.test\"}"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":15}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	var output bytes.Buffer
+	rewriter := AnthropicResponseRewriter{}
+	res, err := rewriter.StreamRewrite(context.Background(), strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("StreamRewrite failed: %v", err)
+	}
+
+	if len(res.ToolUses) != 1 {
+		t.Fatalf("expected 1 tool use, got %d", len(res.ToolUses))
+	}
+
+	tu := res.ToolUses[0]
+	if tu.Index != 1 {
+		t.Errorf("expected tool use index to be 1, got %d", tu.Index)
+	}
+	if tu.Name != "WebFetch" {
+		t.Errorf("expected tool name WebFetch, got %q", tu.Name)
+	}
+
+	outStr := output.String()
+	if !strings.Contains(outStr, "Thinking process...") {
+		t.Errorf("expected output to contain text prose, got: %q", outStr)
+	}
+	if strings.Contains(outStr, "WebFetch") {
+		t.Errorf("expected output to buffer/exclude the tool use, but got: %q", outStr)
+	}
+	assertAnthropicStreamHasOnlyTextBlock(t, outStr, 0)
+}
+
+func TestAnthropicStreamRewriteTextOnlyPreservesEndTurn(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_text","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	var output bytes.Buffer
+	res, err := (AnthropicResponseRewriter{}).StreamRewrite(context.Background(), strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("StreamRewrite: %v", err)
+	}
+	if len(res.ToolUses) != 0 {
+		t.Fatalf("expected no tool uses, got %d", len(res.ToolUses))
+	}
+	out := output.String()
+	if !strings.Contains(out, `"stop_reason":"end_turn"`) {
+		t.Fatalf("text-only stream lost original end_turn stop: %s", out)
+	}
+	if strings.Contains(out, `"stop_reason":"tool_use"`) {
+		t.Fatalf("text-only stream must not synthesize tool_use stop: %s", out)
+	}
+	if res.NextAnthropicContentIndex != 1 {
+		t.Fatalf("NextAnthropicContentIndex=%d, want 1", res.NextAnthropicContentIndex)
+	}
+}
+
+func TestAnthropicStreamRewritePreservesThinkingBlocks(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_text","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[]}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"initial thought","signature":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"deep thought"}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig123"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Visible"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	var output bytes.Buffer
+	res, err := (AnthropicResponseRewriter{}).StreamRewrite(context.Background(), strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("StreamRewrite: %v", err)
+	}
+	out := output.String()
+	// Thinking blocks should now be preserved in the output.
+	if !strings.Contains(out, `"thinking"`) {
+		t.Fatalf("thinking block should be preserved in SSE output: %s", out)
+	}
+	if !strings.Contains(out, "deep thought") {
+		t.Fatalf("thinking delta content should be streamed: %s", out)
+	}
+	if got := fmt.Sprint(res.AssistantTurn.Content); !strings.Contains(got, "initial thought") {
+		t.Fatalf("assistant turn should retain thinking content from block start, got %v", res.AssistantTurn.Content)
+	}
+	if !strings.Contains(out, "sig123") {
+		t.Fatalf("signature delta should be streamed: %s", out)
+	}
+	if !strings.Contains(out, "Visible") {
+		t.Fatalf("text block should be preserved: %s", out)
+	}
+	// Both blocks should be present with sequential indices 0 and 1.
+	if !strings.Contains(out, `"index":0`) || !strings.Contains(out, `"index":1`) {
+		t.Fatalf("both blocks should have sequential indices: %s", out)
+	}
+	if res.NextAnthropicContentIndex != 2 {
+		t.Fatalf("NextAnthropicContentIndex=%d, want 2", res.NextAnthropicContentIndex)
+	}
+}
+
+func TestAnthropicStreamRewriteDropsNonClaudeThinkingBlocks(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_text","type":"message","role":"assistant","model":"openai/gpt-oss-120b:free","content":[]}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hidden thought"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Visible"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	var output bytes.Buffer
+	res, err := (AnthropicResponseRewriter{}).StreamRewrite(context.Background(), strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("StreamRewrite: %v", err)
+	}
+	out := output.String()
+	if strings.Contains(out, "thinking") || strings.Contains(out, "hidden thought") {
+		t.Fatalf("non-Claude thinking block should be filtered from SSE output: %s", out)
+	}
+	if !strings.Contains(out, "Visible") {
+		t.Fatalf("text block should be preserved: %s", out)
+	}
+	if !strings.Contains(out, `"index":0`) {
+		t.Fatalf("first visible block should be reindexed to 0: %s", out)
+	}
+	assertNoAnthropicSSEIndex(t, out, 1)
+	if res.NextAnthropicContentIndex != 1 {
+		t.Fatalf("NextAnthropicContentIndex=%d, want 1", res.NextAnthropicContentIndex)
+	}
+	if got := fmt.Sprint(res.AssistantTurn.Content); strings.Contains(got, "hidden thought") || !strings.Contains(got, "Visible") {
+		t.Fatalf("assistant turn should include visible text only, got %v", res.AssistantTurn.Content)
+	}
+}
+
+func TestAnthropicStreamRewriteKeepsThinkingForClaudeOnlyNames(t *testing.T) {
+	t.Parallel()
+
+	if isNonClaudeModel("anthropic/claude-3-5-sonnet") {
+		t.Fatal("provider-qualified claude model should be treated as Claude")
+	}
+	if !isNonClaudeModel("myclaude-clone") {
+		t.Fatal("myclaude-clone must not be treated as Claude")
+	}
+}
+
+func TestAnthropicStreamRewriteStopsOnContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var output bytes.Buffer
+	_, err := (AnthropicResponseRewriter{}).StreamRewrite(ctx, strings.NewReader("event: message_start\ndata: {}\n\n"), &output)
+	if err == nil {
+		t.Fatal("expected context cancellation error")
+	}
+}
+
+func TestAnthropicStreamRewriteStopsOnMidStreamCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	pr, pw := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		var output bytes.Buffer
+		_, err := (AnthropicResponseRewriter{}).StreamRewrite(ctx, pr, &output)
+		errCh <- err
+	}()
+
+	_, _ = pw.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"claude-test\"}}\n\n"))
+	cancel()
+	_ = pw.Close()
+
+	if err := <-errCh; err == nil {
+		t.Fatal("expected context cancellation error")
+	}
+}
+
+func TestAnthropicStreamRewriteNextIndexAfterMultipleTextBlocks(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[]}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"First"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":"Second"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pwd\"}"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":2}`,
+		``,
+	}, "\n")
+
+	var output bytes.Buffer
+	res, err := (AnthropicResponseRewriter{}).StreamRewrite(context.Background(), strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("StreamRewrite: %v", err)
+	}
+	if len(res.ToolUses) != 1 || res.ToolUses[0].Index != 2 {
+		t.Fatalf("unexpected tool uses: %+v", res.ToolUses)
+	}
+	if res.NextAnthropicContentIndex != 2 {
+		t.Fatalf("NextAnthropicContentIndex=%d, want 2", res.NextAnthropicContentIndex)
+	}
+}
+
+func TestAnthropicStreamRewriteBuffersContentAfterToolUse(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[]}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Before"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pwd\"}"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":"After"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":2}`,
+		``,
+	}, "\n")
+
+	var output bytes.Buffer
+	res, err := (AnthropicResponseRewriter{}).StreamRewrite(context.Background(), strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("StreamRewrite: %v", err)
+	}
+	if len(res.ToolUses) != 1 || res.ToolUses[0].Index != 1 {
+		t.Fatalf("unexpected tool indexes: %+v", res.ToolUses)
+	}
+	if out := output.String(); strings.Contains(out, "After") || !strings.Contains(out, "Before") {
+		t.Fatalf("stream should include only text before first withheld tool, got %s", out)
+	}
+	if got := fmt.Sprint(res.AssistantTurn.Content); !strings.Contains(got, "After") {
+		t.Fatalf("assistant turn should retain buffered post-tool text, got %v", res.AssistantTurn.Content)
+	}
+}
+
+func TestOpenAIChatStreamRewriteTextOnlyPreservesStopAndDone(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		`data: {"id":"chatcmpl_text","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl_text","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	var output bytes.Buffer
+	res, err := (OpenAIResponseRewriter{}).StreamRewrite(context.Background(), strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("StreamRewrite: %v", err)
+	}
+	if len(res.ToolUses) != 0 {
+		t.Fatalf("expected no tool uses, got %d", len(res.ToolUses))
+	}
+	out := output.String()
+	if !strings.Contains(out, `"content":"Hello"`) {
+		t.Fatalf("text-only chat stream lost assistant content: %s", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"stop"`) || !strings.Contains(out, `data: [DONE]`) {
+		t.Fatalf("text-only chat stream lost stop or DONE: %s", out)
+	}
+	if strings.Contains(out, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("text-only chat stream must not synthesize tool_calls finish: %s", out)
+	}
+}
+
+func TestOpenAIResponsesStreamRewriteTextOnlyPreservesCompleted(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}`,
+		``,
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","output_index":0,"delta":"Hello"}`,
+		``,
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}}`,
+		``,
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`,
+		``,
+	}, "\n")
+
+	var output bytes.Buffer
+	res, err := (OpenAIResponseRewriter{}).StreamRewrite(context.Background(), strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("StreamRewrite: %v", err)
+	}
+	if len(res.ToolUses) != 0 {
+		t.Fatalf("expected no tool uses, got %d", len(res.ToolUses))
+	}
+	if out := output.String(); !strings.Contains(out, "event: response.completed") {
+		t.Fatalf("text-only responses stream lost response.completed: %s", out)
+	}
+}
+
+func assertNoAnthropicSSEIndex(t *testing.T, stream string, forbidden int) {
+	t.Helper()
+	for _, event := range parseTestSSEEvents(t, stream) {
+		switch event.Event {
+		case "content_block_start", "content_block_delta", "content_block_stop":
+		default:
+			continue
+		}
+		var payload struct {
+			Index *int `json:"index"`
+		}
+		if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+			t.Fatalf("malformed SSE event data in %q: %v", event.Event, err)
+		}
+		if payload.Index != nil && *payload.Index == forbidden {
+			t.Fatalf("stream contains forbidden index %d in event %q: %s", forbidden, event.Event, stream)
+		}
+	}
+}
+
+func assertAnthropicStreamHasOnlyTextBlock(t *testing.T, stream string, wantIndex int) {
+	t.Helper()
+	sawStart, sawDelta, sawStop := false, false, false
+	for _, event := range parseTestSSEEvents(t, stream) {
+		switch event.Event {
+		case "content_block_start":
+			var payload struct {
+				Index        int `json:"index"`
+				ContentBlock struct {
+					Type string `json:"type"`
+				} `json:"content_block"`
+			}
+			if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+				t.Fatalf("parse content_block_start: %v", err)
+			}
+			if payload.Index != wantIndex || payload.ContentBlock.Type != "text" {
+				t.Fatalf("unexpected content_block_start: %+v", payload)
+			}
+			sawStart = true
+		case "content_block_delta":
+			var payload struct {
+				Index int `json:"index"`
+				Delta struct {
+					Type string `json:"type"`
+				} `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+				t.Fatalf("parse content_block_delta: %v", err)
+			}
+			if payload.Index != wantIndex || payload.Delta.Type != "text_delta" {
+				t.Fatalf("unexpected content_block_delta: %+v", payload)
+			}
+			sawDelta = true
+		case "content_block_stop":
+			var payload struct {
+				Index int `json:"index"`
+			}
+			if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+				t.Fatalf("parse content_block_stop: %v", err)
+			}
+			if payload.Index != wantIndex {
+				t.Fatalf("unexpected content_block_stop: %+v", payload)
+			}
+			sawStop = true
+		}
+	}
+	if !sawStart || !sawStop {
+		t.Fatalf("missing text block events: start=%v delta=%v stop=%v stream=%s", sawStart, sawDelta, sawStop, stream)
+	}
+}
+
+func parseTestSSEEvents(t *testing.T, stream string) []sseEvent {
+	t.Helper()
+	events, err := parseSSEEvents([]byte(stream))
+	if err != nil {
+		t.Fatalf("parse SSE events: %v", err)
+	}
+	return events
 }

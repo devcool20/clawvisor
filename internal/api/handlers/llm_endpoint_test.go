@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -284,16 +285,23 @@ func TestLLMEndpoint_InjectsControlNoticeWhenToolsAvailable(t *testing.T) {
 		"Clawvisor proxy-lite control plane",
 		"https://clawvisor.local/control/skill",
 		"https://clawvisor.local/control/tasks?surface=inline",
-		"Before creating the task, tell me I will need to approve it",
+		"When a task is required, POST the task shape below directly to the task endpoint",
+		"Create the task with exactly one foreground shell tool call",
+		"Do not print or summarize the JSON in chat",
 		// Proactive task-creation steer: the model should declare scope
 		// up front, not wait until a tool call gets refused.
 		"create a task before any tool call that is not on the ALLOWED WITHOUT A TASK list",
 		"Don't wait for a tool call to be refused",
 		// Vault-placeholder steer: tell the model these are SAFE to use
-		// directly, not raw credentials it should refuse to handle.
+		// directly. They are Clawvisor-minted, not raw secrets, and
+		// the model must not fabricate its own `autovault_*` strings.
 		"VAULT PLACEHOLDERS",
 		"autovault_",
-		"NOT raw credentials",
+		// Escape-stable substring of the "no fabricated autovault" rule.
+		// (The full sentence contains `<` which gets JSON-escaped on the
+		// wire; matching on the leading clause keeps the assertion
+		// independent of that encoding.)
+		"NEVER write your own `autovault_",
 		// Steer model to the actual shell tool + curl (Claude Code's WebFetch can't carry
 		// the headers/body the control plane needs).
 		"`Bash` with curl",
@@ -1922,7 +1930,7 @@ func TestLLMEndpoint_RewritesTaskApprovalReplyBeforeForwarding(t *testing.T) {
 		t.Fatalf("expected 200, got %d (%s)", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(string(seenBody), "https://clawvisor.local/control/tasks?surface=inline") ||
-		!strings.Contains(string(seenBody), "tell me that I will need to approve it") ||
+		!strings.Contains(string(seenBody), "Your next assistant message must be exactly one shell tool_use") ||
 		!strings.Contains(string(seenBody), "/tmp/greet.sh") ||
 		strings.Contains(string(seenBody), `"content":"task"`) {
 		t.Fatalf("upstream body was not rewritten with task guidance: %s", seenBody)
@@ -2036,5 +2044,170 @@ func TestLLMEndpoint_RejectsMissingAuth(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+}
+
+func TestLLMEndpoint_InspectorRewritesSSE_Streaming(t *testing.T) {
+	// Streaming version of the rewrite test: upstream returns SSE.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-4-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"WebFetch","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"url\":\"https://api.github.com/repos/x/y/issues\",\"method\":\"POST\",\"headers\":{\"Authorization\":\"Bearer autovault_github_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":15}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`))
+	}))
+	defer upstream.Close()
+
+	h, st, rawToken, _ := newSeededHandler(t, upstream.URL)
+	h.Inspector = inspector.NewInspector(inspector.DefaultParser{}, inspector.AmbiguousValidator{})
+	h.ResolverBaseURL = "https://clawvisor.example/api/proxy"
+	var rawBuf bytes.Buffer
+	h.RawIOLogger = llmproxy.NewRawIOLogger(&rawBuf)
+
+	mux := http.NewServeMux()
+	mw := middleware.RequireAgentLLM(st)
+	mux.Handle("POST /v1/messages", mw(http.HandlerFunc(h.Messages)))
+
+	// Send a 2nd turn request (contains prior assistant turn to make firstTurn=false)
+	body := []byte(`{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"create issue"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "https://clawvisor.example/api/proxy/repos/x/y/issues") {
+		t.Fatalf("SSE response missing rewritten URL:\n%s", out)
+	}
+	if !strings.Contains(out, "X-Clawvisor-Target-Host") {
+		t.Fatalf("SSE response missing X-Clawvisor-Target-Host:\n%s", out)
+	}
+	if !strings.Contains(out, "event: message_start") || !strings.Contains(out, "event: message_stop") {
+		t.Fatalf("SSE envelope missing:\n%s", out)
+	}
+
+	// Verify that it went through the streaming path (Marker is "streaming_rewritten")
+	rawEvents := rawBuf.String()
+	if !strings.Contains(rawEvents, `"marker":"streaming_rewritten"`) {
+		t.Fatalf("expected raw log marker to be streaming_rewritten; got:\n%s", rawEvents)
+	}
+}
+
+func TestLLMEndpoint_SSETextStreamsBeforeUpstreamCompletes(t *testing.T) {
+	firstTextSeen := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte(`event: message_start
+data: {"type":"message_start","message":{"id":"msg_text","type":"message","role":"assistant","model":"claude-haiku-4-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+`))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		select {
+		case <-firstTextSeen:
+		case <-time.After(5 * time.Second):
+			t.Error("client did not receive first text chunk before upstream completion")
+			return
+		}
+		_, _ = w.Write([]byte(`event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`))
+	}))
+	defer upstream.Close()
+
+	h, st, rawToken, _ := newSeededHandler(t, upstream.URL)
+	h.Inspector = inspector.NewInspector(inspector.DefaultParser{}, inspector.AmbiguousValidator{})
+
+	mux := http.NewServeMux()
+	mw := middleware.RequireAgentLLM(st)
+	mux.Handle("POST /v1/messages", mw(http.HandlerFunc(h.Messages)))
+	proxy := httptest.NewServer(mux)
+	defer proxy.Close()
+
+	body := []byte(`{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"stream text"}]}`)
+	req, err := http.NewRequest(http.MethodPost, proxy.URL+"/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := proxy.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		all, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, all)
+	}
+
+	lineCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReaderSize(resp.Body, 256<<10)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF && line == "" {
+					errCh <- err
+					return
+				}
+				if err != io.EOF {
+					errCh <- err
+					return
+				}
+			}
+			if strings.Contains(line, "Hello") {
+				lineCh <- line
+				return
+			}
+			if err == io.EOF {
+				errCh <- err
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-lineCh:
+		close(firstTextSeen)
+	case err := <-errCh:
+		t.Fatalf("reading stream: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for streamed text before upstream completion")
 	}
 }

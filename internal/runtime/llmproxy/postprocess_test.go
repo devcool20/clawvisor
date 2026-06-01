@@ -1,6 +1,7 @@
 package llmproxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http/httptest"
@@ -70,6 +71,117 @@ func anthropicJSONWithNamedToolUse(name, input string) []byte {
 		],
 		"stop_reason":"tool_use"
 	}`)
+}
+
+func TestPostprocessStream_BlockedAnthropicPromptUsesNextContentIndex(t *testing.T) {
+	placeholder := "autovault_github_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+	st, userID, agentID := seedPostprocessStore(t, placeholder)
+	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	insp := inspector.NewInspector(inspector.DefaultParser{}, inspector.AmbiguousValidator{})
+	input := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[]}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"First"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":"Second"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"WebFetch","input":{}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"url\":\"https://api.github.com/repos/x/y/issues\",\"method\":\"POST\",\"headers\":{\"Authorization\":\"Bearer ` + placeholder + `\"}}"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":2}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":15}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	var output bytes.Buffer
+	result, err := PostprocessStream(context.Background(), req, strings.NewReader(input), &output, "text/event-stream", PostprocessConfig{
+		Inspector:   insp,
+		Store:       st,
+		AgentUserID: userID,
+		AgentID:     agentID,
+	})
+	if err != nil {
+		t.Fatalf("PostprocessStream: %v", err)
+	}
+	if !result.Rewritten {
+		t.Fatal("expected blocked tool to rewrite stream with approval text")
+	}
+	out := output.String()
+	if !strings.Contains(out, "Tool use was blocked by the Clawvisor proxy") {
+		t.Fatalf("missing blocked prompt: %s", out)
+	}
+	promptIndex, ok := anthropicSSEIndexContaining(out, "Tool use was blocked by the Clawvisor proxy")
+	if !ok {
+		t.Fatalf("could not find blocked prompt index: %s", out)
+	}
+	firstToolIndex := -1
+	for _, dec := range result.Decisions {
+		if firstToolIndex < 0 || dec.ToolUse.Index < firstToolIndex {
+			firstToolIndex = dec.ToolUse.Index
+		}
+	}
+	if promptIndex != firstToolIndex {
+		t.Fatalf("blocked prompt index=%d must replace first withheld tool index=%d: %s", promptIndex, firstToolIndex, out)
+	}
+}
+
+func anthropicSSEIndexContaining(stream, needle string) (int, bool) {
+	events := strings.Split(strings.ReplaceAll(stream, "\r\n", "\n"), "\n\n")
+	for _, event := range events {
+		if !strings.Contains(event, needle) {
+			continue
+		}
+		for _, line := range strings.Split(event, "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			var payload struct {
+				Index *int `json:"index"`
+			}
+			if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &payload); err == nil && payload.Index != nil {
+				return *payload.Index, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func TestPostprocessStream_NoStreamingRewriterPassesThrough(t *testing.T) {
+	req := httptest.NewRequest("POST", "/api/unknown", nil)
+	input := "data: hello\n\n"
+	var output bytes.Buffer
+
+	result, err := PostprocessStream(context.Background(), req, strings.NewReader(input), &output, "text/event-stream", PostprocessConfig{
+		Inspector: inspector.NewInspector(inspector.DefaultParser{}, inspector.AmbiguousValidator{}),
+	})
+	if err != nil {
+		t.Fatalf("PostprocessStream: %v", err)
+	}
+	if result.SkippedReason == "" {
+		t.Fatal("expected skipped reason")
+	}
+	if output.String() != input {
+		t.Fatalf("expected passthrough body %q, got %q", input, output.String())
+	}
 }
 
 func TestPostprocess_JSONNoTrigger(t *testing.T) {
@@ -250,6 +362,32 @@ func TestPostprocess_ReadOnlyBashBypassesTaskScopeByDefault(t *testing.T) {
 				t.Fatalf("expected readonly_shell_pass_through, got %d rows outcome=%q", len(rows), rows[0].Outcome)
 			}
 		})
+	}
+}
+
+func TestPostprocess_SensitiveShellPathRequiresApprovalWithoutPolicyConfig(t *testing.T) {
+	body := anthropicJSONWithNamedToolUse("Bash", `{"command":"cat $HOME/.ssh/id_rsa"}`)
+	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	insp := inspector.NewInspector(inspector.DefaultParser{}, inspector.AmbiguousValidator{})
+	st, userID, agentID := seedPostprocessStore(t, "autovault_github_xxx")
+
+	got := Postprocess(req, body, "application/json", PostprocessConfig{
+		Inspector:        insp,
+		RewriteOpts:      inspector.DefaultRewriteOpts("https://proxy.example/api/proxy"),
+		CallerNonces:     NewMemoryCallerNonceCache(time.Minute),
+		Store:            st,
+		AgentUserID:      userID,
+		AgentID:          agentID,
+		Audit:            NewAuditEmitter(st, nil, nil),
+		RequestID:        "req-bash-sensitive-default",
+		PendingApprovals: NewMemoryPendingApprovalCache(time.Minute),
+		Posture:          runtimedecision.PostureEnforce,
+	})
+	if !got.Rewritten {
+		t.Fatalf("sensitive shell path should require approval even without policy config")
+	}
+	if text := anthropicResponseText(t, got.Body); !strings.Contains(text, "no matching task scope") {
+		t.Fatalf("approval prompt missing scope reason: %s", text)
 	}
 }
 
@@ -660,7 +798,10 @@ func TestTaskCreationPromptIncludesTaskCreationExample(t *testing.T) {
 		"Please request a Clawvisor task",
 		"proxy-lite control endpoint",
 		"https://clawvisor.local/control/tasks?surface=inline",
-		"tell me that I will need to approve it",
+		"The user will need to approve the task after it is created",
+		"Your next assistant message must be exactly one shell tool_use",
+		"Do not print, describe, or summarize the JSON in chat",
+		"Do not answer with a markdown code block",
 		`"tool_name": "Write"`,
 		"/tmp/report.txt",
 		"expected_tools",
@@ -671,6 +812,9 @@ func TestTaskCreationPromptIncludesTaskCreationExample(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("approval prompt missing %q:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "```") {
+		t.Fatalf("task creation prompt should not wrap the curl in markdown fences:\n%s", got)
 	}
 }
 
@@ -1208,6 +1352,9 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
 	if !strings.Contains(out, "function_call_arguments.done") {
 		t.Fatalf("function_call_arguments.done missing — Codex needs this signal:\n%s", out)
 	}
+	if got := strings.Count(out, "event: response.completed"); got != 1 {
+		t.Fatalf("response.completed count=%d, want 1:\n%s", got, out)
+	}
 }
 
 func TestPostprocess_OpenAIResponsesSSEAuditsCustomToolCall(t *testing.T) {
@@ -1266,6 +1413,56 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
 	input, ok := params["tool_input"].(map[string]any)
 	if !ok || !strings.Contains(input["input"].(string), "/tmp/hello.sh") {
 		t.Fatalf("tool_input=%v, want patch preview", params["tool_input"])
+	}
+}
+
+func TestPostprocessStream_OpenAIResponsesCustomToolCallIsInspectedAndBlocked(t *testing.T) {
+	placeholder := "autovault_github_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+	st, userID, agentID := seedPostprocessStore(t, placeholder)
+	req := httptest.NewRequest("POST", "/v1/responses", nil)
+	input := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+		``,
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"ctc_1","type":"custom_tool_call","status":"in_progress","call_id":"call_custom","name":"WebFetch"}}`,
+		``,
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"ctc_1","type":"custom_tool_call","status":"completed","call_id":"call_custom","name":"WebFetch","input":"{\"url\":\"https://api.github.com/repos/x/y/issues\",\"method\":\"POST\",\"headers\":{\"Authorization\":\"Bearer ` + placeholder + `\"}}"}}`,
+		``,
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`,
+		``,
+	}, "\n")
+
+	var output bytes.Buffer
+	result, err := PostprocessStream(context.Background(), req, strings.NewReader(input), &output, "text/event-stream", PostprocessConfig{
+		Inspector:   inspector.NewInspector(inspector.DefaultParser{}, inspector.AmbiguousValidator{}),
+		Store:       st,
+		AgentUserID: userID,
+		AgentID:     agentID,
+	})
+	if err != nil {
+		t.Fatalf("PostprocessStream: %v", err)
+	}
+	if len(result.Decisions) != 1 {
+		t.Fatalf("expected custom tool call to be inspected once, got %+v", result.Decisions)
+	}
+	if result.Decisions[0].ToolUse.ID != "call_custom" || result.Decisions[0].ToolUse.Name != "WebFetch" {
+		t.Fatalf("unexpected inspected tool use: %+v", result.Decisions[0].ToolUse)
+	}
+	if !result.Rewritten {
+		t.Fatal("expected blocked custom tool call to rewrite stream")
+	}
+	out := output.String()
+	if strings.Contains(out, `"custom_tool_call"`) {
+		t.Fatalf("custom tool call leaked before inspection: %s", out)
+	}
+	if !strings.Contains(out, "Tool use was blocked by the Clawvisor proxy") {
+		t.Fatalf("blocked prompt missing: %s", out)
+	}
+	if got := strings.Count(out, "event: response.completed"); got != 1 {
+		t.Fatalf("response.completed count=%d, want 1: %s", got, out)
 	}
 }
 

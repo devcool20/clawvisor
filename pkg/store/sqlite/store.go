@@ -252,10 +252,11 @@ func (s *Store) GetAgentByToken(ctx context.Context, tokenHash string) (*store.A
 	var createdAt string
 	var orgID *string
 	var tokenExpiresAt *string
+	var installContext string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, user_id, name, description, token_hash, created_at, org_id, token_expires_at FROM agents WHERE token_hash = ? AND deleted_at IS NULL`,
+		`SELECT id, user_id, name, description, token_hash, created_at, org_id, token_expires_at, install_context FROM agents WHERE token_hash = ? AND deleted_at IS NULL`,
 		tokenHash,
-	).Scan(&a.ID, &a.UserID, &a.Name, &a.Description, &a.TokenHash, &createdAt, &orgID, &tokenExpiresAt)
+	).Scan(&a.ID, &a.UserID, &a.Name, &a.Description, &a.TokenHash, &createdAt, &orgID, &tokenExpiresAt, &installContext)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}
@@ -277,6 +278,11 @@ func (s *Store) GetAgentByToken(ctx context.Context, tokenHash string) (*store.A
 			a.TokenExpiresAt = &t
 		}
 	}
+	ic, icErr := unmarshalInstallContext(installContext)
+	if icErr != nil {
+		return nil, fmt.Errorf("unmarshal install_context: %w", icErr)
+	}
+	a.InstallContext = ic
 	if settings, settingsErr := s.GetAgentRuntimeSettings(ctx, a.ID); settingsErr == nil {
 		a.RuntimeSettings = settings
 	} else if settingsErr != store.ErrNotFound {
@@ -287,7 +293,7 @@ func (s *Store) GetAgentByToken(ctx context.Context, tokenHash string) (*store.A
 
 func (s *Store) ListAgents(ctx context.Context, userID string) ([]*store.Agent, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT a.id, a.user_id, a.name, a.token_hash, a.created_at, a.org_id, a.description,
+		SELECT a.id, a.user_id, a.name, a.token_hash, a.created_at, a.org_id, a.description, a.install_context,
 		       COALESCE((SELECT COUNT(*) FROM tasks t
 		                 WHERE t.agent_id = a.id
 		                   AND t.status IN ('active','pending_approval','pending_scope_expansion')), 0),
@@ -312,6 +318,7 @@ func (s *Store) ListAgents(ctx context.Context, userID string) ([]*store.Agent, 
 		a := &store.Agent{}
 		var createdAt string
 		var orgID *string
+		var installContext string
 		var lastTaskAt *string
 		var settingsAgentID *string
 		var settingsEnabled *int
@@ -323,7 +330,7 @@ func (s *Store) ListAgents(ctx context.Context, userID string) ([]*store.Agent, 
 		var settingsConversationAutoApprove *string
 		var settingsCreatedAt *string
 		var settingsUpdatedAt *string
-		if err := rows.Scan(&a.ID, &a.UserID, &a.Name, &a.TokenHash, &createdAt, &orgID, &a.Description,
+		if err := rows.Scan(&a.ID, &a.UserID, &a.Name, &a.TokenHash, &createdAt, &orgID, &a.Description, &installContext,
 			&a.ActiveTaskCount, &lastTaskAt, &settingsAgentID, &settingsEnabled, &settingsMode, &settingsProfile,
 			&settingsOutbound, &settingsInject, &settingsLiteProxySecretDetectionDisabled,
 			&settingsConversationAutoApprove, &settingsCreatedAt, &settingsUpdatedAt); err != nil {
@@ -333,6 +340,11 @@ func (s *Store) ListAgents(ctx context.Context, userID string) ([]*store.Agent, 
 		if orgID != nil {
 			a.OrgID = *orgID
 		}
+		ic, icErr := unmarshalInstallContext(installContext)
+		if icErr != nil {
+			return nil, fmt.Errorf("unmarshal install_context: %w", icErr)
+		}
+		a.InstallContext = ic
 		if lastTaskAt != nil {
 			ts := parseTime(*lastTaskAt)
 			a.LastTaskAt = &ts
@@ -505,10 +517,11 @@ func (s *Store) getAgentByID(ctx context.Context, id string) (*store.Agent, erro
 	var createdAt string
 	var orgID *string
 	var tokenExpiresAt *string
+	var installContext string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, user_id, name, description, token_hash, created_at, org_id, token_expires_at FROM agents WHERE id = ? AND deleted_at IS NULL`,
+		`SELECT id, user_id, name, description, token_hash, created_at, org_id, token_expires_at, install_context FROM agents WHERE id = ? AND deleted_at IS NULL`,
 		id,
-	).Scan(&a.ID, &a.UserID, &a.Name, &a.Description, &a.TokenHash, &createdAt, &orgID, &tokenExpiresAt)
+	).Scan(&a.ID, &a.UserID, &a.Name, &a.Description, &a.TokenHash, &createdAt, &orgID, &tokenExpiresAt, &installContext)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}
@@ -524,12 +537,39 @@ func (s *Store) getAgentByID(ctx context.Context, id string) (*store.Agent, erro
 			a.TokenExpiresAt = &t
 		}
 	}
+	ic, icErr := unmarshalInstallContext(installContext)
+	if icErr != nil {
+		return nil, fmt.Errorf("unmarshal install_context: %w", icErr)
+	}
+	a.InstallContext = ic
 	if settings, settingsErr := s.GetAgentRuntimeSettings(ctx, a.ID); settingsErr == nil {
 		a.RuntimeSettings = settings
 	} else if settingsErr != store.ErrNotFound {
 		return nil, settingsErr
 	}
 	return a, nil
+}
+
+func (s *Store) SetAgentInstallContext(ctx context.Context, agentID string, ic *store.InstallContext) error {
+	raw, err := marshalInstallContext(ic)
+	if err != nil {
+		return fmt.Errorf("marshal install_context: %w", err)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET install_context = ? WHERE id = ? AND deleted_at IS NULL`,
+		raw, agentID,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return store.ErrNotFound
+	}
+	return nil
 }
 
 // ── Sessions ──────────────────────────────────────────────────────────────────
@@ -903,15 +943,15 @@ func (s *Store) LogAudit(ctx context.Context, e *store.AuditEntry) error {
 	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO audit_log (
-			id, user_id, agent_id, request_id, task_id, session_id, approval_id, lease_id,
+			id, user_id, agent_id, request_id, dedup_key, task_id, session_id, approval_id, lease_id,
 			tool_use_id, matched_task_id, lease_task_id, timestamp, service, action,
 			params_safe, decision, outcome, policy_id, rule_id, resolution_confidence,
 			intent_verdict, used_active_task_context, used_lease_bias, used_conv_judge_resolution,
 			would_block, would_review, would_prompt_inline,
 			safety_flagged, safety_reason, reason, data_origin, context_src,
 			duration_ms, filters_applied, verification, error_msg, deduped_of
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-	`, e.ID, e.UserID, e.AgentID, e.RequestID, e.TaskID, e.SessionID, e.ApprovalID, e.LeaseID,
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	`, e.ID, e.UserID, e.AgentID, e.RequestID, e.DedupKey, e.TaskID, e.SessionID, e.ApprovalID, e.LeaseID,
 		e.ToolUseID, e.MatchedTaskID, e.LeaseTaskID, e.Timestamp.UTC().Format(time.RFC3339),
 		e.Service, e.Action, paramsSafe, e.Decision, e.Outcome,
 		e.PolicyID, e.RuleID, resolutionConfidence, intentVerdict,
@@ -1030,7 +1070,7 @@ func (s *Store) UpdateAuditOutcome(ctx context.Context, id, outcome, errMsg stri
 // distinguish canonical rows (deduped_of IS NULL) from retry-attempt
 // rows.
 const auditColumns = `
-	id, user_id, agent_id, request_id, task_id, session_id, approval_id, lease_id,
+	id, user_id, agent_id, request_id, dedup_key, task_id, session_id, approval_id, lease_id,
 	tool_use_id, matched_task_id, lease_task_id, timestamp, service, action,
 	params_safe, decision, outcome, policy_id, rule_id, resolution_confidence,
 	intent_verdict, used_active_task_context, used_lease_bias, used_conv_judge_resolution,
@@ -1045,7 +1085,7 @@ func scanAuditRow(scan func(...any) error) (*store.AuditEntry, error) {
 	var safetyFlagged, usedActiveTaskContext, usedLeaseBias, usedConvJudgeResolution, wouldBlock, wouldReview, wouldPromptInline int
 	var filtersApplied, verification *string
 	err := scan(
-		&e.ID, &e.UserID, &e.AgentID, &e.RequestID, &e.TaskID, &e.SessionID, &e.ApprovalID, &e.LeaseID,
+		&e.ID, &e.UserID, &e.AgentID, &e.RequestID, &e.DedupKey, &e.TaskID, &e.SessionID, &e.ApprovalID, &e.LeaseID,
 		&e.ToolUseID, &e.MatchedTaskID, &e.LeaseTaskID, &timestamp,
 		&e.Service, &e.Action, &paramsSafe, &e.Decision, &e.Outcome,
 		&e.PolicyID, &e.RuleID, &e.ResolutionConfidence, &e.IntentVerdict,
@@ -1086,15 +1126,14 @@ func (s *Store) GetAuditEntry(ctx context.Context, id, userID string) (*store.Au
 	return e, err
 }
 
-// GetAuditEntryByRequestID returns the latest canonical row for
-// (request_id, user_id) — the polling endpoint's contract. Dedup-attempt
-// rows (deduped_of IS NOT NULL) are excluded; among canonicals, newer
-// wins because agents almost always poll right after submitting and want
-// the most recent canonical for that request_id.
+// GetAuditEntryByRequestID returns the latest request-level canonical row for
+// (request_id, user_id). Dedup-attempt rows and child audit observations are
+// excluded so per-tool history cannot shadow the request outcome.
 func (s *Store) GetAuditEntryByRequestID(ctx context.Context, requestID, userID string) (*store.AuditEntry, error) {
 	e, err := scanAuditRow(s.db.QueryRowContext(ctx,
 		`SELECT `+auditColumns+` FROM audit_log
 		 WHERE request_id = ? AND user_id = ? AND deduped_of IS NULL
+		   AND dedup_key IS NULL
 		 ORDER BY timestamp DESC LIMIT 1`,
 		requestID, userID,
 	).Scan)
@@ -1104,12 +1143,10 @@ func (s *Store) GetAuditEntryByRequestID(ctx context.Context, requestID, userID 
 	return e, err
 }
 
-// GetAuditEntryByRequestIDAndTask returns the canonical row for an exact
-// (request_id, user_id, task_id) — inverting FindDedupCandidate's pre-task
-// precedence. taskID == "" matches the pre-task scope (task_id IS NULL).
-// Pre-task is the fallback when no task-scoped canonical exists so the
-// feedback handler can still resolve a request_id that was classified
-// pre-task even after a later task_id was attached.
+// GetAuditEntryByRequestIDAndTask returns the request-level canonical row for
+// (request_id, user_id, task_id). Exact task_id matches win over pre-task
+// fallback; within that tier this getter returns the newest row for
+// status/feedback consumers.
 func (s *Store) GetAuditEntryByRequestIDAndTask(ctx context.Context, requestID, userID, taskID string) (*store.AuditEntry, error) {
 	var taskFilter string
 	args := []any{requestID, userID}
@@ -1121,6 +1158,7 @@ func (s *Store) GetAuditEntryByRequestIDAndTask(ctx context.Context, requestID, 
 	}
 	q := `SELECT ` + auditColumns + ` FROM audit_log
 		WHERE request_id = ? AND user_id = ? AND deduped_of IS NULL
+		  AND dedup_key IS NULL
 		  AND ` + taskFilter + `
 		ORDER BY CASE WHEN task_id IS NULL THEN 1 ELSE 0 END, timestamp DESC
 		LIMIT 1`
@@ -1131,12 +1169,10 @@ func (s *Store) GetAuditEntryByRequestIDAndTask(ctx context.Context, requestID, 
 	return e, err
 }
 
-// FindDedupCandidate returns the canonical audit row a new
-// (request_id, user_id, task_id) request should dedup against. Pre-task
-// canonicals (task_id IS NULL) always win over task-scoped canonicals for
-// the same request_id; within a tier the oldest row wins. taskID == ""
-// (runtime classification path before a task is bound) only matches
-// pre-task rows.
+// FindDedupCandidate returns the request-level canonical audit row a new
+// (request_id, user_id, task_id) request should dedup against. Exact task
+// canonicals win over pre-task fallback. Child audit observations are excluded
+// because gateway retries must resolve to request outcomes.
 func (s *Store) FindDedupCandidate(ctx context.Context, requestID, userID, taskID string) (*store.AuditEntry, error) {
 	var taskFilter string
 	args := []any{requestID, userID}
@@ -1148,8 +1184,9 @@ func (s *Store) FindDedupCandidate(ctx context.Context, requestID, userID, taskI
 	}
 	q := `SELECT ` + auditColumns + ` FROM audit_log
 		WHERE request_id = ? AND user_id = ? AND deduped_of IS NULL
+		  AND dedup_key IS NULL
 		  AND ` + taskFilter + `
-		ORDER BY CASE WHEN task_id IS NULL THEN 0 ELSE 1 END, timestamp ASC
+		ORDER BY CASE WHEN task_id IS NULL THEN 1 ELSE 0 END, timestamp ASC
 		LIMIT 1`
 	e, err := scanAuditRow(s.db.QueryRowContext(ctx, q, args...).Scan)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -3494,23 +3531,27 @@ func (s *Store) CreateConnectionRequest(ctx context.Context, req *store.Connecti
 	if req.ID == "" {
 		req.ID = uuid.New().String()
 	}
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO connection_requests (id, user_id, name, description, callback_url, status, ip_address, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	installContext, err := marshalInstallContext(req.InstallContext)
+	if err != nil {
+		return fmt.Errorf("marshal install_context: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO connection_requests (id, user_id, name, description, callback_url, status, ip_address, expires_at, install_context)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, req.ID, req.UserID, req.Name, req.Description, req.CallbackURL, req.Status, req.IPAddress,
-		req.ExpiresAt.UTC().Format(time.RFC3339))
+		req.ExpiresAt.UTC().Format(time.RFC3339), installContext)
 	return err
 }
 
 func (s *Store) GetConnectionRequest(ctx context.Context, id string) (*store.ConnectionRequest, error) {
 	r := &store.ConnectionRequest{}
-	var createdAt, expiresAt string
+	var createdAt, expiresAt, installContext string
 	var agentID sql.NullString
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, user_id, name, description, callback_url, status, agent_id, ip_address, created_at, expires_at
+		SELECT id, user_id, name, description, callback_url, status, agent_id, ip_address, created_at, expires_at, install_context
 		FROM connection_requests WHERE id = ?
 	`, id).Scan(&r.ID, &r.UserID, &r.Name, &r.Description, &r.CallbackURL, &r.Status,
-		&agentID, &r.IPAddress, &createdAt, &expiresAt)
+		&agentID, &r.IPAddress, &createdAt, &expiresAt, &installContext)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}
@@ -3522,12 +3563,15 @@ func (s *Store) GetConnectionRequest(ctx context.Context, id string) (*store.Con
 	}
 	r.CreatedAt = parseTime(createdAt)
 	r.ExpiresAt = parseTime(expiresAt)
+	if r.InstallContext, err = unmarshalInstallContext(installContext); err != nil {
+		return nil, fmt.Errorf("unmarshal install_context: %w", err)
+	}
 	return r, nil
 }
 
 func (s *Store) ListPendingConnectionRequests(ctx context.Context, userID string) ([]*store.ConnectionRequest, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, user_id, name, description, callback_url, status, agent_id, ip_address, created_at, expires_at
+		SELECT id, user_id, name, description, callback_url, status, agent_id, ip_address, created_at, expires_at, install_context
 		FROM connection_requests WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC
 	`, userID)
 	if err != nil {
@@ -3538,10 +3582,10 @@ func (s *Store) ListPendingConnectionRequests(ctx context.Context, userID string
 	var out []*store.ConnectionRequest
 	for rows.Next() {
 		r := &store.ConnectionRequest{}
-		var createdAt, expiresAt string
+		var createdAt, expiresAt, installContext string
 		var agentID sql.NullString
 		if err := rows.Scan(&r.ID, &r.UserID, &r.Name, &r.Description, &r.CallbackURL, &r.Status,
-			&agentID, &r.IPAddress, &createdAt, &expiresAt); err != nil {
+			&agentID, &r.IPAddress, &createdAt, &expiresAt, &installContext); err != nil {
 			return nil, err
 		}
 		if agentID.Valid {
@@ -3549,9 +3593,42 @@ func (s *Store) ListPendingConnectionRequests(ctx context.Context, userID string
 		}
 		r.CreatedAt = parseTime(createdAt)
 		r.ExpiresAt = parseTime(expiresAt)
+		ic, err := unmarshalInstallContext(installContext)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal install_context: %w", err)
+		}
+		r.InstallContext = ic
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// marshalInstallContext encodes the typed install context as JSON for storage.
+// Nil or empty contexts marshal to "" so the column stays NOT NULL without
+// requiring a separate sql.NullString wrapper.
+func marshalInstallContext(ic *store.InstallContext) (string, error) {
+	if ic == nil {
+		return "", nil
+	}
+	b, err := json.Marshal(ic)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// unmarshalInstallContext decodes a stored JSON blob back to a typed struct.
+// "" round-trips to nil so older rows (and rows from before this column was
+// added) deserialize as "no install context."
+func unmarshalInstallContext(raw string) (*store.InstallContext, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var ic store.InstallContext
+	if err := json.Unmarshal([]byte(raw), &ic); err != nil {
+		return nil, err
+	}
+	return &ic, nil
 }
 
 func (s *Store) UpdateConnectionRequestStatusIfPending(ctx context.Context, id, status string) (bool, error) {

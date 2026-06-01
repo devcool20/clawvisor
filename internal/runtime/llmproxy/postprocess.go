@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -277,6 +278,18 @@ type PostprocessResult struct {
 	// Skipped reports paths where rewrite logic was bypassed (e.g.
 	// streaming SSE in v0). Empty when the response was processed.
 	SkippedReason string
+
+	// ContinuationToolResults is non-empty if a streaming turn triggered a continuation
+	ContinuationToolResults []conversation.ContinuationToolResult
+
+	// AssistantTurn is the accumulated turn details for continuation building
+	AssistantTurn *conversation.Turn
+
+	// Streaming fallback state is populated when a streamed turn requested
+	// continuation. It is rendered before PostprocessStream returns so the
+	// caller receives one complete provider-shaped stream.
+	StreamingProvider conversation.Provider
+	StreamingResult   conversation.StreamingRewriteResult
 }
 
 // Postprocess inspects an upstream response body and applies tool_use
@@ -335,526 +348,7 @@ func Postprocess(req *http.Request, body []byte, contentType string, cfg Postpro
 	auditSink := &capturedAuditSink{}
 	var captures []evalCapture
 
-	innerEval := func(tu conversation.ToolUse) conversation.ToolUseVerdict {
-		var v inspector.Verdict
-		// matchedTaskID is set by branches that resolve a task scope
-		// (EvaluateAuthorization with a matched task, or
-		// TaskScope.Check returning Allowed). audit() reads it into
-		// the buffered row's TaskID so flushed audit rows carry the
-		// matched task — that's what the dashboard's per-task activity
-		// feed filters on (AuditEntry.task_id). Branches that never
-		// matched a task (trigger-miss pass-through, hard denials
-		// before any decision, control-tool inline-task creation where
-		// the task is being created here) leave it empty.
-		var matchedTaskID string
-		audit := func(decision, outcome, reason string) {
-			// Always buffer, even when no AuditEmitter is configured.
-			// The outer eval wrapper reads the last entry for this
-			// call to capture inspector metadata for coalesce
-			// siblings (auto-allow / auto-rewrite calls that don't
-			// create a hold). Without unconditional buffering, a
-			// caller with cfg.Audit=nil would lose target_host/method/path
-			// for those siblings in the coalesced hold's Additional
-			// entries. The flush helpers already check cfg.Audit and
-			// short-circuit, so this costs only a few struct copies
-			// per call in audit-disabled deployments.
-			auditSink.entries = append(auditSink.entries, bufferedAudit{
-				ToolUse:  tu,
-				Verdict:  v,
-				Decision: decision,
-				Outcome:  outcome,
-				Reason:   reason,
-				TaskID:   matchedTaskID,
-			})
-		}
-		// trace emits one JSONL line per decision point when
-		// cfg.Trace is configured. The kv slice is event-specific.
-		trace := func(event string, kv ...any) {
-			if cfg.Trace == nil {
-				return
-			}
-			m := map[string]any{
-				"event":       event,
-				"request_id":  cfg.RequestID,
-				"user_id":     cfg.AgentUserID,
-				"agent_id":    cfg.AgentID,
-				"tool_use_id": tu.ID,
-				"tool_name":   tu.Name,
-			}
-			for i := 0; i+1 < len(kv); i += 2 {
-				key, ok := kv[i].(string)
-				if !ok {
-					continue
-				}
-				m[key] = kv[i+1]
-			}
-			cfg.Trace.Emit(m)
-		}
-		trace(TraceEventToolUseEntry,
-			"input_preview", truncateForTrace(string(tu.Input), traceInputPreviewLimit),
-			"input_bytes", len(tu.Input),
-			"trigger_hit", inspector.TriggerHits(inspector.ToolUse{ID: tu.ID, Name: tu.Name, Input: tu.Input}),
-		)
-
-		if call, ok := ParseControlToolUseWithBase(tu, cfg.ControlBaseURL); ok {
-			v = call.Verdict
-			// Inline task approval interception. When the user is
-			// mid-flight on a "task" gesture (the original tool hold has
-			// been transitioned to StageAwaitingTaskDefinition) and the
-			// model now emits POST /api/control/tasks, we route the task body
-			// through the inline approval path instead of letting it
-			// proxy through to the dashboard. The model never sees the
-			// real /api/control/tasks handler — its tool_use_result is
-			// replaced with a rendered yes/no prompt; the user's next
-			// "yes" creates the task pre-approved and the
-			// follow-up turn auto-releases the original tool call.
-			if inlineVerdict, inlineHandled := maybeInterceptInlineTaskDefinition(
-				req, cfg, audit, trace, rewriter.Name(), tu, call,
-			); inlineHandled {
-				return inlineVerdict
-			}
-			// Mint a nonce bound to the rewritten control URL's
-			// (host, method, path) — the rewritten curl carries it in
-			// X-Clawvisor-Caller; the daemon's nonce middleware on
-			// /api/control/* one-shot consumes it. Without this, the
-			// rewriter would have to embed the agent's raw cvis_ token
-			// (which the nonce middleware rejects) in the model's
-			// conversation context.
-			if cfg.CallerNonces == nil {
-				audit("block", "caller_nonce_unavailable", "caller nonce cache not configured")
-				return conversation.ToolUseVerdict{
-					Allowed: false,
-					Reason:  "Clawvisor: caller nonce cache not configured; refusing to embed agent token in control tool_use",
-				}
-			}
-			nonce, mintErr := cfg.CallerNonces.Mint(req.Context(), cfg.AgentID, NonceTarget{
-				Host:   v.Host,
-				Method: v.Method,
-				Path:   v.Path,
-			})
-			if mintErr != nil {
-				audit("block", "caller_nonce_mint_failed", mintErr.Error())
-				return conversation.ToolUseVerdict{
-					Allowed: false,
-					Reason:  "Clawvisor: caller nonce mint failed — " + mintErr.Error(),
-				}
-			}
-			rewritten, _, rewriteOK, err := RewriteControlToolUse(tu, cfg.ControlBaseURL, nonce)
-			if !rewriteOK {
-				audit("block", "control_unavailable", "no control rewrite base URL configured")
-				return conversation.ToolUseVerdict{
-					Allowed: false,
-					Reason:  "Clawvisor: control endpoint unavailable",
-				}
-			}
-			if err != nil {
-				audit("block", "control_rewriter_error", err.Error())
-				return conversation.ToolUseVerdict{
-					Allowed: false,
-					Reason:  "Clawvisor: control endpoint rewrite refused — " + err.Error(),
-				}
-			}
-			audit("rewrite", "clawvisor_control", v.Reason)
-			trace(TraceEventControlRewrite,
-				"host", v.Host,
-				"method", v.Method,
-				"path", v.Path,
-				"nonce_prefix", nonce[:min(len(nonce), 14)],
-				"rewrite_bytes", len(rewritten),
-			)
-			return conversation.ToolUseVerdict{
-				Allowed:      true,
-				RewriteInput: rewritten,
-			}
-		} else if controlToolUseMentionsEndpoint(tu, cfg.ControlBaseURL) {
-			reason := "malformed_control_command"
-			if cfg.CallerNonces != nil {
-				nonce, mintErr := cfg.CallerNonces.Mint(req.Context(), cfg.AgentID, NonceTarget{
-					Host:   ControlSyntheticHost,
-					Method: "POST",
-					Path:   "/api/control/failure",
-				})
-				if mintErr != nil {
-					audit("block", "caller_nonce_mint_failed", mintErr.Error())
-					return conversation.ToolUseVerdict{
-						Allowed: false,
-						Reason:  "Clawvisor: caller nonce mint failed — " + mintErr.Error(),
-					}
-				}
-				if rewritten, ok, err := RewriteControlFailureToolUse(tu, cfg.ControlBaseURL, nonce, reason); ok {
-					if err != nil {
-						audit("block", "control_rewriter_error", err.Error())
-						return conversation.ToolUseVerdict{
-							Allowed: false,
-							Reason:  "Clawvisor: control endpoint failure rewrite refused — " + err.Error(),
-						}
-					}
-					audit("rewrite", "clawvisor_control_failure", "malformed control endpoint command")
-					trace(TraceEventControlRewrite,
-						"host", ControlSyntheticHost,
-						"method", "POST",
-						"path", "/api/control/failure",
-						"failure_reason", reason,
-						"nonce_prefix", nonce[:min(len(nonce), 14)],
-						"rewrite_bytes", len(rewritten),
-					)
-					return conversation.ToolUseVerdict{
-						Allowed:      true,
-						RewriteInput: rewritten,
-					}
-				}
-			} else {
-				audit("block", "caller_nonce_unavailable", "caller nonce cache not configured")
-			}
-			audit("block", "control_rewriter_error", "control endpoint command must be a single foreground curl with no pipes, subshells, or extra shell commands")
-			return conversation.ToolUseVerdict{
-				Allowed: false,
-				Reason:  "Clawvisor: control endpoint rewrite refused — use a single foreground curl to the control endpoint, with no pipes, subshells, redirects to output files, or extra shell commands",
-			}
-		}
-
-		v = cfg.Inspector.Inspect(req.Context(), inspector.ToolUse{
-			ID:    tu.ID,
-			Name:  tu.Name,
-			Input: tu.Input,
-		})
-		trace(TraceEventInspectVerdict,
-			"source", string(v.Source),
-			"is_api_call", v.IsAPICall,
-			"ambiguous", v.Ambiguous,
-			"method", v.Method,
-			"host", v.Host,
-			"path", v.Path,
-			"placeholders", v.Placeholders,
-			"reason", v.Reason,
-		)
-
-		// If the only `autovault_…` substrings in this tool_use are too
-		// short to be real vault references — test fixtures, prose
-		// examples, doc snippets — there's no credential to mediate.
-		// Downgrade to trigger-miss so the surrounding tool call (often
-		// an Edit of a test file that mentions the literal) is evaluated
-		// under normal authorization rather than refused as ambiguous.
-		if v.Source != inspector.SourceTriggerMiss && inspector.AllPlaceholdersAreStubs(v.Placeholders) {
-			audit("allow", "stub_placeholder", "placeholders below realistic length floor")
-			v = inspector.Verdict{
-				IsAPICall: false,
-				Source:    inspector.SourceTriggerMiss,
-				Reason:    "placeholders are stub-length (no real vault reference)",
-			}
-		}
-
-		// Inspector says trigger missed (no autovault placeholder). There
-		// is no credential rewrite to perform, but shared authorization
-		// still sees ordinary tool_use calls such as Bash/Read.
-		if v.Source == inspector.SourceTriggerMiss {
-			if cfg.CandidateTasks != nil || cfg.ToolRules != nil || cfg.EgressRules != nil {
-				readOnlyShellCommand := false
-				if toolnames.IsShellToolName(tu.Name) && readOnlyShellCommandsAllowed(tu.Name, cfg.AgentID, cfg.ToolRules) {
-					if cmd := shellCommandFromInput(tu.Input); cmd != "" {
-						readOnlyShellCommand, _ = inspector.IsReadOnlyBashCommand(cmd)
-					}
-				}
-				decisionInput := runtimedecision.AuthorizationInput{
-					ToolUse:                tu,
-					UserID:                 cfg.AgentUserID,
-					AgentID:                cfg.AgentID,
-					Posture:                cfg.Posture,
-					CandidateTasks:         cfg.CandidateTasks,
-					ToolRules:              cfg.ToolRules,
-					EgressRules:            cfg.EgressRules,
-					PreferredTaskID:        cfg.PreferredTaskID,
-					IntentVerifier:         decisionIntentVerifier{inner: cfg.IntentVerifier},
-					SkipIntentVerification: readOnlyShellCommand,
-				}
-				dec, err := runtimedecision.EvaluateAuthorization(req.Context(), decisionInput)
-				if err != nil {
-					audit("block", "decision_error", err.Error())
-					return conversation.ToolUseVerdict{Allowed: false, Reason: "Clawvisor: authorization failed — " + err.Error()}
-				}
-				matchedTaskID = taskIDFromDecision(dec)
-				trace(TraceEventDecision,
-					"path", "trigger_miss",
-					"kind", string(dec.Kind),
-					"source", string(dec.Source),
-					"reason", dec.Reason,
-					"task_id", taskIDFromDecision(dec),
-				)
-				switch dec.Kind {
-				case runtimedecision.VerdictAllow:
-					audit("allow", string(dec.Source), dec.Reason)
-					return conversation.ToolUseVerdict{Allowed: true}
-				case runtimedecision.VerdictDeny:
-					audit("block", string(dec.Source), dec.Reason)
-					return conversation.ToolUseVerdict{Allowed: false, Reason: "Clawvisor: " + dec.Reason}
-				case runtimedecision.VerdictNeedsApproval:
-					// Codex's write_stdin with empty chars is the
-					// harness polling a background shell for output —
-					// equivalent to Claude Code's BashOutput. No
-					// state change, no side effect. Pass through.
-					if dec.Source == runtimedecision.SourceTaskScopeMissing && isShellPollTool(tu.Name, tu.Input) {
-						audit("allow", "shell_poll_pass_through", "background-shell poll ("+tu.Name+")")
-						trace(TraceEventDecision, "path", "trigger_miss", "kind", "allow", "source", "shell_poll_pass_through", "reason", "background-shell poll")
-						return conversation.ToolUseVerdict{Allowed: true}
-					}
-					if dec.Source == runtimedecision.SourceTaskScopeMissing && readOnlyShellCommand {
-						audit("allow", "readonly_shell_pass_through", "read-only shell command")
-						trace(TraceEventDecision, "path", "trigger_miss", "kind", "allow", "source", "readonly_shell_pass_through", "reason", "read-only shell command", "cmd_preview", truncateForTrace(shellCommandFromInput(tu.Input), 200))
-						return conversation.ToolUseVerdict{Allowed: true}
-					}
-					// Hold before rendering so the approval ID can be
-					// embedded in the substitute message footer. The
-					// agent's NEXT turn will carry that marker in
-					// assistant history and let a bare "y"/"n" reply
-					// resolve to this specific hold without the user
-					// having to type the ID.
-					var approvalID string
-					if cfg.PendingApprovals != nil {
-						held, err := cfg.PendingApprovals.Hold(req.Context(), PendingLiteApproval{
-							UserID:         cfg.AgentUserID,
-							AgentID:        cfg.AgentID,
-							Provider:       rewriter.Name(),
-							ConversationID: cfg.ConversationID,
-							ToolUse:        tu,
-							Inspector:      v,
-							Fingerprint:    runtimedecision.Fingerprint(dec, decisionInput),
-							Reason:         dec.Reason,
-						})
-						if err != nil {
-							audit("block", "approval_hold_error", err.Error())
-							return conversation.ToolUseVerdict{
-								Allowed: false,
-								Reason:  "Clawvisor: approval unavailable — " + err.Error(),
-							}
-						}
-						if held.Evicted != nil {
-							audit("block", "approval_evicted", "superseded pending approval "+held.Evicted.ID)
-							// If an inline-task hold was evicted by this
-							// commit, terminate its store.Task so the
-							// dashboard doesn't keep showing a zombie
-							// row that chat can no longer resolve.
-							cleanupEvictedInlineTask(req.Context(), cfg, held.Evicted)
-						}
-						approvalID = held.Pending.ID
-					}
-					audit("block", string(dec.Source), dec.Reason)
-					return conversation.ToolUseVerdict{
-						Allowed:        false,
-						Reason:         "Clawvisor: approval required — " + dec.Reason,
-						SubstituteWith: approvalPrompt(tu, dec.Reason, approvalID),
-					}
-				}
-			}
-			// Record ordinary tool uses even when no credential trigger was
-			// present so lite-proxy activity shows the agent's tool calls.
-			audit("allow", "pass_through", "no credential trigger")
-			return conversation.ToolUseVerdict{Allowed: true}
-		}
-		if v.Ambiguous || !v.IsAPICall {
-			audit("block", "ambiguous", v.Reason)
-			return conversation.ToolUseVerdict{
-				Allowed: false,
-				Reason:  "Clawvisor: ambiguous credentialed call refused — " + v.Reason,
-			}
-		}
-
-		// Authorization boundary: the validator's `Host` is a candidate.
-		// The authoritative source is the placeholder's bound service
-		// host allowlist. Look it up and run BoundaryCheck. Mismatch =
-		// fail closed.
-		boundaryReason, boundaryOK := boundaryCheckVerdict(req, cfg, v)
-		trace(TraceEventBoundaryCheck,
-			"ok", boundaryOK,
-			"reason", boundaryReason,
-			"placeholders", v.Placeholders,
-			"verdict_host", v.Host,
-		)
-		if !boundaryOK {
-			audit("block", "boundary_check_failed", boundaryReason)
-			return conversation.ToolUseVerdict{
-				Allowed: false,
-				Reason:  "Clawvisor: target host outside placeholder bound-service — " + boundaryReason,
-			}
-		}
-
-		decisionHandled := false
-		if cfg.CandidateTasks != nil || cfg.ToolRules != nil || cfg.EgressRules != nil {
-			resolved := ResolvedAction{}
-			if cfg.Catalog != nil {
-				resolved, _ = cfg.Catalog.Resolve(v.Host, v.Method, v.Path)
-			}
-			decisionInput := runtimedecision.AuthorizationInput{
-				ToolUse:         tu,
-				UserID:          cfg.AgentUserID,
-				AgentID:         cfg.AgentID,
-				Posture:         cfg.Posture,
-				Target:          runtimedecision.TargetRequest{Host: v.Host, Method: v.Method, Path: v.Path},
-				Service:         resolved.ServiceID,
-				Action:          resolved.ActionID,
-				CandidateTasks:  cfg.CandidateTasks,
-				ToolRules:       cfg.ToolRules,
-				EgressRules:     cfg.EgressRules,
-				PreferredTaskID: cfg.PreferredTaskID,
-				IntentVerifier:  decisionIntentVerifier{inner: cfg.IntentVerifier},
-			}
-			dec, err := runtimedecision.EvaluateAuthorization(req.Context(), decisionInput)
-			if err != nil {
-				audit("block", "decision_error", err.Error())
-				return conversation.ToolUseVerdict{
-					Allowed: false,
-					Reason:  "Clawvisor: authorization failed — " + err.Error(),
-				}
-			}
-			matchedTaskID = taskIDFromDecision(dec)
-			trace(TraceEventDecision,
-				"path", "credentialed",
-				"kind", string(dec.Kind),
-				"source", string(dec.Source),
-				"reason", dec.Reason,
-				"service", resolved.ServiceID,
-				"action", resolved.ActionID,
-				"task_id", taskIDFromDecision(dec),
-			)
-			switch dec.Kind {
-			case runtimedecision.VerdictAllow:
-				// Continue to credential rewrite below.
-				decisionHandled = true
-			case runtimedecision.VerdictDeny:
-				audit("block", string(dec.Source), dec.Reason)
-				return conversation.ToolUseVerdict{
-					Allowed: false,
-					Reason:  "Clawvisor: " + dec.Reason,
-				}
-			case runtimedecision.VerdictNeedsApproval:
-				// Hold first so the assigned approval ID can be
-				// embedded in the substitute prompt footer; see the
-				// trigger-miss branch above for the same pattern.
-				var approvalID string
-				if cfg.PendingApprovals != nil {
-					held, err := cfg.PendingApprovals.Hold(req.Context(), PendingLiteApproval{
-						UserID:         cfg.AgentUserID,
-						AgentID:        cfg.AgentID,
-						Provider:       rewriter.Name(),
-						ConversationID: cfg.ConversationID,
-						ToolUse:        tu,
-						Inspector:      v,
-						Fingerprint:    runtimedecision.Fingerprint(dec, decisionInput),
-						Reason:         dec.Reason,
-					})
-					if err != nil {
-						audit("block", "approval_hold_error", err.Error())
-						return conversation.ToolUseVerdict{
-							Allowed: false,
-							Reason:  "Clawvisor: approval unavailable — " + err.Error(),
-						}
-					}
-					if held.Evicted != nil {
-						audit("block", "approval_evicted", "superseded pending approval "+held.Evicted.ID)
-						// See above: terminate evicted inline-task rows so
-						// the dashboard doesn't strand them.
-						cleanupEvictedInlineTask(req.Context(), cfg, held.Evicted)
-					}
-					approvalID = held.Pending.ID
-				}
-				audit("block", string(dec.Source), dec.Reason)
-				return conversation.ToolUseVerdict{
-					Allowed:        false,
-					Reason:         "Clawvisor: approval required — " + dec.Reason,
-					SubstituteWith: approvalPrompt(tu, dec.Reason, approvalID),
-				}
-			}
-		}
-
-		// Task-scope authorization: reverse-resolve the (host, method,
-		// path) to (service, action), then check against the agent's
-		// active tasks. Skipping is audited (in case of misconfig) but
-		// not blocking — v0 leaves task-scope as opt-in until product
-		// surfaces (always_ask / approval queue) are wired in #33.
-		if !decisionHandled && cfg.Catalog != nil && cfg.TaskScope != nil {
-			if resolved, ok := cfg.Catalog.Resolve(v.Host, v.Method, v.Path); ok {
-				dec := cfg.TaskScope.Check(req.Context(), cfg.AgentUserID, cfg.AgentID, resolved.ServiceID, resolved.ActionID)
-				if !dec.Allowed {
-					audit("block", "task_scope_denied", dec.Reason)
-					return conversation.ToolUseVerdict{
-						Allowed: false,
-						Reason:  "Clawvisor: no active task scope covers " + resolved.ServiceID + "." + resolved.ActionID + " — " + dec.Reason,
-					}
-				}
-				matchedTaskID = dec.TaskID
-				// Intent verification: when the matched TaskAction's
-				// Verification mode opts in (strict | lenient | empty)
-				// and an IntentVerifier is configured, the LLM compares
-				// the request's params + tool_use shape to the matched
-				// expected_use. Off mode and missing verifier skip silently.
-				if reason, ok := runIntentVerify(req.Context(), cfg, dec, resolved, tu); !ok {
-					audit("block", "intent_verification_failed", reason)
-					return conversation.ToolUseVerdict{
-						Allowed: false,
-						Reason:  "Clawvisor: intent verification refused " + resolved.ServiceID + "." + resolved.ActionID + " — " + reason,
-					}
-				}
-			}
-			// Catalog miss: log via audit reason field but don't block.
-			// The fact that the (host, method, path) didn't resolve to a
-			// known (service, action) is an inspector or catalog gap, not
-			// an attack signal — the BoundaryCheck above already constrained
-			// the host to the placeholder's bound-service allowlist.
-		}
-
-		// Mint a per-tool nonce that stands in for the agent's bearer
-		// token in the rewritten tool_use's X-Clawvisor-Caller header.
-		// The nonce is bound to (agent, host, method, path); the
-		// resolver consumes it one-shot on the matching call. Failure
-		// to mint (cache misconfigured or backend down) fails closed —
-		// we won't embed the raw agent token in the conversation as a
-		// fallback.
-		if cfg.CallerNonces == nil {
-			audit("block", "caller_nonce_unavailable", "caller nonce cache not configured")
-			return conversation.ToolUseVerdict{
-				Allowed: false,
-				Reason:  "Clawvisor: caller nonce cache not configured; refusing to embed agent token in tool_use",
-			}
-		}
-		nonce, mintErr := cfg.CallerNonces.Mint(req.Context(), cfg.AgentID, NonceTarget{
-			Host:   v.Host,
-			Method: v.Method,
-			Path:   v.Path,
-		})
-		if mintErr != nil {
-			audit("block", "caller_nonce_mint_failed", mintErr.Error())
-			return conversation.ToolUseVerdict{
-				Allowed: false,
-				Reason:  "Clawvisor: caller nonce mint failed — " + mintErr.Error(),
-			}
-		}
-		opts := cfg.RewriteOpts
-		opts.CallerToken = nonce
-		rewritten, err := inspector.Rewrite(inspector.ToolUse{
-			ID:    tu.ID,
-			Name:  tu.Name,
-			Input: tu.Input,
-		}, v, opts)
-		if err != nil {
-			audit("block", "rewriter_error", err.Error())
-			return conversation.ToolUseVerdict{
-				Allowed: false,
-				Reason:  "Clawvisor: rewriter refused — " + err.Error(),
-			}
-		}
-		audit("rewrite", "success", v.Reason)
-		trace(TraceEventRewriteApplied,
-			"host", v.Host,
-			"method", v.Method,
-			"path", v.Path,
-			"placeholders", v.Placeholders,
-			"nonce_prefix", nonce[:min(len(nonce), 14)],
-			"rewrite_bytes", len(rewritten),
-		)
-		return conversation.ToolUseVerdict{
-			Allowed:      true,
-			RewriteInput: rewritten,
-		}
-	}
+	innerEval := newToolUseEvaluator(req, cfg, rewriter.Name(), auditSink)
 
 	// Outer eval wraps innerEval and records the kind + decision
 	// context for the coalesce post-pass. Two side channels feed the
@@ -1075,6 +569,556 @@ func rollbackBufferedPendingTasks(ctx context.Context, cfg PostprocessConfig, si
 		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		_ = pendingCreator.ExpireInlineTask(rollbackCtx, h.Pending.PendingTaskID, h.Pending.UserID)
 		cancel()
+	}
+}
+
+func newToolUseEvaluator(req *http.Request, cfg PostprocessConfig, provider conversation.Provider, auditSink *capturedAuditSink) conversation.ToolUseEvaluator {
+	return func(tu conversation.ToolUse) conversation.ToolUseVerdict {
+		var v inspector.Verdict
+		// matchedTaskID is set by branches that resolve a task scope
+		// (EvaluateAuthorization with a matched task, or
+		// TaskScope.Check returning Allowed). audit() reads it into
+		// the buffered row's TaskID so flushed audit rows carry the
+		// matched task — that's what the dashboard's per-task activity
+		// feed filters on (AuditEntry.task_id). Branches that never
+		// matched a task (trigger-miss pass-through, hard denials
+		// before any decision, control-tool inline-task creation where
+		// the task is being created here) leave it empty.
+		var matchedTaskID string
+		audit := func(decision, outcome, reason string) {
+			// Always buffer, even when no AuditEmitter is configured.
+			// The outer eval wrapper reads the last entry for this
+			// call to capture inspector metadata for coalesce
+			// siblings (auto-allow / auto-rewrite calls that don't
+			// create a hold). Without unconditional buffering, a
+			// caller with cfg.Audit=nil would lose target_host/method/path
+			// for those siblings in the coalesced hold's Additional
+			// entries. The flush helpers already check cfg.Audit and
+			// short-circuit, so this costs only a few struct copies
+			// per call in audit-disabled deployments.
+			auditSink.entries = append(auditSink.entries, bufferedAudit{
+				ToolUse:  tu,
+				Verdict:  v,
+				Decision: decision,
+				Outcome:  outcome,
+				Reason:   reason,
+				TaskID:   matchedTaskID,
+			})
+		}
+		// trace emits one JSONL line per decision point when
+		// cfg.Trace is configured. The kv slice is event-specific.
+		trace := func(event string, kv ...any) {
+			if cfg.Trace == nil {
+				return
+			}
+			m := map[string]any{
+				"event":       event,
+				"request_id":  cfg.RequestID,
+				"user_id":     cfg.AgentUserID,
+				"agent_id":    cfg.AgentID,
+				"tool_use_id": tu.ID,
+				"tool_name":   tu.Name,
+			}
+			for i := 0; i+1 < len(kv); i += 2 {
+				key, ok := kv[i].(string)
+				if !ok {
+					continue
+				}
+				m[key] = kv[i+1]
+			}
+			cfg.Trace.Emit(m)
+		}
+		trace(TraceEventToolUseEntry,
+			"input_preview", truncateForTrace(string(tu.Input), traceInputPreviewLimit),
+			"input_bytes", len(tu.Input),
+			"trigger_hit", inspector.TriggerHits(inspector.ToolUse{ID: tu.ID, Name: tu.Name, Input: tu.Input}),
+		)
+
+		if call, ok := ParseControlToolUseWithBase(tu, cfg.ControlBaseURL); ok {
+			v = call.Verdict
+			// Inline task approval interception. When the user is
+			// mid-flight on a "task" gesture (the original tool hold has
+			// been transitioned to StageAwaitingTaskDefinition) and the
+			// model now emits POST /api/control/tasks, we route the task body
+			// through the inline approval path instead of letting it
+			// proxy through to the dashboard. The model never sees the
+			// real /api/control/tasks handler — its tool_use_result is
+			// replaced with a rendered yes/no prompt; the user's next
+			// "yes" creates the task pre-approved and the
+			// follow-up turn auto-releases the original tool call.
+			if inlineVerdict, inlineHandled := maybeInterceptInlineTaskDefinition(
+				req, cfg, audit, trace, provider, tu, call,
+			); inlineHandled {
+				return inlineVerdict
+			}
+			// Mint a nonce bound to the rewritten control URL's
+			// (host, method, path) — the rewritten curl carries it in
+			// X-Clawvisor-Caller; the daemon's nonce middleware on
+			// /api/control/* one-shot consumes it. Without this, the
+			// rewriter would have to embed the agent's raw cvis_ token
+			// (which the nonce middleware rejects) in the model's
+			// conversation context.
+			if cfg.CallerNonces == nil {
+				audit("block", "caller_nonce_unavailable", "caller nonce cache not configured")
+				return conversation.ToolUseVerdict{
+					Allowed: false,
+					Reason:  "Clawvisor: caller nonce cache not configured; refusing to embed agent token in control tool_use",
+				}
+			}
+			nonce, mintErr := cfg.CallerNonces.Mint(req.Context(), cfg.AgentID, NonceTarget{
+				Host:   v.Host,
+				Method: v.Method,
+				Path:   v.Path,
+			})
+			if mintErr != nil {
+				audit("block", "caller_nonce_mint_failed", mintErr.Error())
+				return conversation.ToolUseVerdict{
+					Allowed: false,
+					Reason:  "Clawvisor: caller nonce mint failed — " + mintErr.Error(),
+				}
+			}
+			rewritten, _, rewriteOK, err := RewriteControlToolUse(tu, cfg.ControlBaseURL, nonce)
+			if !rewriteOK {
+				audit("block", "control_unavailable", "no control rewrite base URL configured")
+				return conversation.ToolUseVerdict{
+					Allowed: false,
+					Reason:  "Clawvisor: control endpoint unavailable",
+				}
+			}
+			if err != nil {
+				audit("block", "control_rewriter_error", err.Error())
+				return conversation.ToolUseVerdict{
+					Allowed: false,
+					Reason:  "Clawvisor: control endpoint rewrite refused — " + err.Error(),
+				}
+			}
+			audit("rewrite", "clawvisor_control", v.Reason)
+			trace(TraceEventControlRewrite,
+				"host", v.Host,
+				"method", v.Method,
+				"path", v.Path,
+				"nonce_prefix", nonce[:min(len(nonce), 14)],
+				"rewrite_bytes", len(rewritten),
+			)
+			return conversation.ToolUseVerdict{
+				Allowed:      true,
+				RewriteInput: rewritten,
+			}
+		} else if controlToolUseMentionsEndpoint(tu, cfg.ControlBaseURL) {
+			reason := "malformed_control_command"
+			if cfg.CallerNonces != nil {
+				nonce, mintErr := cfg.CallerNonces.Mint(req.Context(), cfg.AgentID, NonceTarget{
+					Host:   ControlSyntheticHost,
+					Method: "POST",
+					Path:   "/api/control/failure",
+				})
+				if mintErr != nil {
+					audit("block", "caller_nonce_mint_failed", mintErr.Error())
+					return conversation.ToolUseVerdict{
+						Allowed: false,
+						Reason:  "Clawvisor: caller nonce mint failed — " + mintErr.Error(),
+					}
+				}
+				if rewritten, ok, err := RewriteControlFailureToolUse(tu, cfg.ControlBaseURL, nonce, reason); ok {
+					if err != nil {
+						audit("block", "control_rewriter_error", err.Error())
+						return conversation.ToolUseVerdict{
+							Allowed: false,
+							Reason:  "Clawvisor: control endpoint failure rewrite refused — " + err.Error(),
+						}
+					}
+					audit("rewrite", "clawvisor_control_failure", "malformed control endpoint command")
+					trace(TraceEventControlRewrite,
+						"host", ControlSyntheticHost,
+						"method", "POST",
+						"path", "/api/control/failure",
+						"failure_reason", reason,
+						"nonce_prefix", nonce[:min(len(nonce), 14)],
+						"rewrite_bytes", len(rewritten),
+					)
+					return conversation.ToolUseVerdict{
+						Allowed:      true,
+						RewriteInput: rewritten,
+					}
+				}
+			} else {
+				audit("block", "caller_nonce_unavailable", "caller nonce cache not configured")
+			}
+			audit("block", "control_rewriter_error", "control endpoint command must be a single foreground curl with no pipes, subshells, or extra shell commands")
+			return conversation.ToolUseVerdict{
+				Allowed: false,
+				Reason:  "Clawvisor: control endpoint rewrite refused — use a single foreground curl to the control endpoint, with no pipes, subshells, redirects to output files, or extra shell commands",
+			}
+		}
+
+		v = cfg.Inspector.Inspect(req.Context(), inspector.ToolUse{
+			ID:    tu.ID,
+			Name:  tu.Name,
+			Input: tu.Input,
+		})
+		trace(TraceEventInspectVerdict,
+			"source", string(v.Source),
+			"is_api_call", v.IsAPICall,
+			"ambiguous", v.Ambiguous,
+			"method", v.Method,
+			"host", v.Host,
+			"path", v.Path,
+			"placeholders", v.Placeholders,
+			"reason", v.Reason,
+		)
+
+		// If the only `autovault_…` substrings in this tool_use are too
+		// short to be real vault references — test fixtures, prose
+		// examples, doc snippets — there's no credential to mediate.
+		// Downgrade to trigger-miss so the surrounding tool call (often
+		// an Edit of a test file that mentions the literal) is evaluated
+		// under normal authorization rather than refused as ambiguous.
+		if v.Source != inspector.SourceTriggerMiss && inspector.AllPlaceholdersAreStubs(v.Placeholders) {
+			audit("allow", "stub_placeholder", "placeholders below realistic length floor")
+			v = inspector.Verdict{
+				IsAPICall: false,
+				Source:    inspector.SourceTriggerMiss,
+				Reason:    "placeholders are stub-length (no real vault reference)",
+			}
+		}
+
+		// Inspector says trigger missed (no autovault placeholder). There
+		// is no credential rewrite to perform, but shared authorization
+		// still sees ordinary tool_use calls such as Bash/Read.
+		if v.Source == inspector.SourceTriggerMiss {
+			readOnlyShellCommand := false
+			sensitiveShellPath := false
+			if toolnames.IsShellToolName(tu.Name) && readOnlyShellCommandsAllowed(tu.Name, cfg.AgentID, cfg.ToolRules) {
+				if cmd := shellCommandFromInput(tu.Input); cmd != "" {
+					readOnlyShellCommand, _ = inspector.IsReadOnlyBashCommand(cmd)
+					if toolnames.SensitiveFileGuardEnabled(tu.Name, cfg.AgentID, cfg.ToolRules) {
+						// A shell command that references a sensitive path
+						// (SSH key, .env, cloud creds) must NOT ride the
+						// generic trigger-miss pass-through or the
+						// readonly_shell_pass_through bypass. Force
+						// fall-through to task-scope matching and intent
+						// verification.
+						if tok, reason, hit := inspector.CommandReferencesSensitivePath(cmd); hit {
+							sensitiveShellPath = true
+							readOnlyShellCommand = false
+							audit("block", "sensitive_path_in_read_only_shell", "command references sensitive path "+tok+" ("+reason+")")
+						}
+					}
+				}
+			}
+			if cfg.CandidateTasks != nil || cfg.ToolRules != nil || cfg.EgressRules != nil || sensitiveShellPath {
+				decisionInput := runtimedecision.AuthorizationInput{
+					ToolUse:                tu,
+					UserID:                 cfg.AgentUserID,
+					AgentID:                cfg.AgentID,
+					Posture:                cfg.Posture,
+					CandidateTasks:         cfg.CandidateTasks,
+					ToolRules:              cfg.ToolRules,
+					EgressRules:            cfg.EgressRules,
+					PreferredTaskID:        cfg.PreferredTaskID,
+					IntentVerifier:         decisionIntentVerifier{inner: cfg.IntentVerifier},
+					SkipIntentVerification: readOnlyShellCommand,
+				}
+				dec, err := runtimedecision.EvaluateAuthorization(req.Context(), decisionInput)
+				if err != nil {
+					audit("block", "decision_error", err.Error())
+					return conversation.ToolUseVerdict{Allowed: false, Reason: "Clawvisor: authorization failed — " + err.Error()}
+				}
+				matchedTaskID = taskIDFromDecision(dec)
+				trace(TraceEventDecision,
+					"path", "trigger_miss",
+					"kind", string(dec.Kind),
+					"source", string(dec.Source),
+					"reason", dec.Reason,
+					"task_id", taskIDFromDecision(dec),
+				)
+				switch dec.Kind {
+				case runtimedecision.VerdictAllow:
+					audit("allow", string(dec.Source), dec.Reason)
+					return conversation.ToolUseVerdict{Allowed: true}
+				case runtimedecision.VerdictDeny:
+					audit("block", string(dec.Source), dec.Reason)
+					return conversation.ToolUseVerdict{Allowed: false, Reason: "Clawvisor: " + dec.Reason}
+				case runtimedecision.VerdictNeedsApproval:
+					// Codex's write_stdin with empty chars is the
+					// harness polling a background shell for output —
+					// equivalent to Claude Code's BashOutput. No
+					// state change, no side effect. Pass through.
+					if dec.Source == runtimedecision.SourceTaskScopeMissing && isShellPollTool(tu.Name, tu.Input) {
+						audit("allow", "shell_poll_pass_through", "background-shell poll ("+tu.Name+")")
+						trace(TraceEventDecision, "path", "trigger_miss", "kind", "allow", "source", "shell_poll_pass_through", "reason", "background-shell poll")
+						return conversation.ToolUseVerdict{Allowed: true}
+					}
+					if dec.Source == runtimedecision.SourceTaskScopeMissing && readOnlyShellCommand {
+						audit("allow", "readonly_shell_pass_through", "read-only shell command")
+						trace(TraceEventDecision, "path", "trigger_miss", "kind", "allow", "source", "readonly_shell_pass_through", "reason", "read-only shell command", "cmd_preview", truncateForTrace(shellCommandFromInput(tu.Input), 200))
+						return conversation.ToolUseVerdict{Allowed: true}
+					}
+					// Hold before rendering so the approval ID can be
+					// embedded in the substitute message footer. The
+					// agent's NEXT turn will carry that marker in
+					// assistant history and let a bare "y"/"n" reply
+					// resolve to this specific hold without the user
+					// having to type the ID.
+					var approvalID string
+					if cfg.PendingApprovals != nil {
+						held, err := cfg.PendingApprovals.Hold(req.Context(), PendingLiteApproval{
+							UserID:         cfg.AgentUserID,
+							AgentID:        cfg.AgentID,
+							Provider:       provider,
+							ConversationID: cfg.ConversationID,
+							ToolUse:        tu,
+							Inspector:      v,
+							Fingerprint:    runtimedecision.Fingerprint(dec, decisionInput),
+							Reason:         dec.Reason,
+						})
+						if err != nil {
+							audit("block", "approval_hold_error", err.Error())
+							return conversation.ToolUseVerdict{
+								Allowed: false,
+								Reason:  "Clawvisor: approval unavailable — " + err.Error(),
+							}
+						}
+						if held.Evicted != nil {
+							audit("block", "approval_evicted", "superseded pending approval "+held.Evicted.ID)
+							// If an inline-task hold was evicted by this
+							// commit, terminate its store.Task so the
+							// dashboard doesn't keep showing a zombie
+							// row that chat can no longer resolve.
+							cleanupEvictedInlineTask(req.Context(), cfg, held.Evicted)
+						}
+						approvalID = held.Pending.ID
+					}
+					audit("block", string(dec.Source), dec.Reason)
+					return conversation.ToolUseVerdict{
+						Allowed:        false,
+						Reason:         "Clawvisor: approval required — " + dec.Reason,
+						SubstituteWith: approvalPrompt(tu, dec.Reason, approvalID),
+					}
+				}
+			}
+			// Record ordinary tool uses even when no credential trigger was
+			// present so lite-proxy activity shows the agent's tool calls.
+			audit("allow", "pass_through", "no credential trigger")
+			return conversation.ToolUseVerdict{Allowed: true}
+		}
+		if v.Ambiguous || !v.IsAPICall {
+			audit("block", "ambiguous", v.Reason)
+			// ContinueWithToolResult preserves the agent's actual
+			// tool_use in conversation history and feeds the rejection
+			// back as a synthetic tool_result — the canonical Anthropic
+			// shape for "your tool call failed, here's why." The model's
+			// own emitted input is right above the synthetic user turn,
+			// so it can see exactly what shape got rejected. The
+			// SubstituteWith fallback is what gets rendered if the
+			// handler can't perform the continuation call (older
+			// provider, recursion bound reached, upstream outage).
+			reason := "Clawvisor: ambiguous credentialed call refused — " + v.Reason
+			return conversation.ToolUseVerdict{
+				Allowed:                false,
+				Reason:                 reason,
+				ContinueWithToolResult: reason,
+			}
+		}
+
+		// Authorization boundary: the validator's `Host` is a candidate.
+		// The authoritative source is the placeholder's bound service
+		// host allowlist. Look it up and run BoundaryCheck. Mismatch =
+		// fail closed.
+		boundaryReason, boundaryOK := boundaryCheckVerdict(req, cfg, v)
+		trace(TraceEventBoundaryCheck,
+			"ok", boundaryOK,
+			"reason", boundaryReason,
+			"placeholders", v.Placeholders,
+			"verdict_host", v.Host,
+		)
+		if !boundaryOK {
+			audit("block", "boundary_check_failed", boundaryReason)
+			reason := "Clawvisor: target host outside placeholder bound-service — " + boundaryReason
+			return conversation.ToolUseVerdict{
+				Allowed:                false,
+				Reason:                 reason,
+				ContinueWithToolResult: reason,
+			}
+		}
+
+		decisionHandled := false
+		if cfg.CandidateTasks != nil || cfg.ToolRules != nil || cfg.EgressRules != nil {
+			resolved := ResolvedAction{}
+			if cfg.Catalog != nil {
+				resolved, _ = cfg.Catalog.Resolve(v.Host, v.Method, v.Path)
+			}
+			decisionInput := runtimedecision.AuthorizationInput{
+				ToolUse:         tu,
+				UserID:          cfg.AgentUserID,
+				AgentID:         cfg.AgentID,
+				Posture:         cfg.Posture,
+				Target:          runtimedecision.TargetRequest{Host: v.Host, Method: v.Method, Path: v.Path},
+				Service:         resolved.ServiceID,
+				Action:          resolved.ActionID,
+				CandidateTasks:  cfg.CandidateTasks,
+				ToolRules:       cfg.ToolRules,
+				EgressRules:     cfg.EgressRules,
+				PreferredTaskID: cfg.PreferredTaskID,
+				IntentVerifier:  decisionIntentVerifier{inner: cfg.IntentVerifier},
+			}
+			dec, err := runtimedecision.EvaluateAuthorization(req.Context(), decisionInput)
+			if err != nil {
+				audit("block", "decision_error", err.Error())
+				return conversation.ToolUseVerdict{
+					Allowed: false,
+					Reason:  "Clawvisor: authorization failed — " + err.Error(),
+				}
+			}
+			matchedTaskID = taskIDFromDecision(dec)
+			trace(TraceEventDecision,
+				"path", "credentialed",
+				"kind", string(dec.Kind),
+				"source", string(dec.Source),
+				"reason", dec.Reason,
+				"service", resolved.ServiceID,
+				"action", resolved.ActionID,
+				"task_id", taskIDFromDecision(dec),
+			)
+			switch dec.Kind {
+			case runtimedecision.VerdictAllow:
+				// Continue to credential rewrite below.
+				decisionHandled = true
+			case runtimedecision.VerdictDeny:
+				audit("block", string(dec.Source), dec.Reason)
+				return conversation.ToolUseVerdict{
+					Allowed: false,
+					Reason:  "Clawvisor: " + dec.Reason,
+				}
+			case runtimedecision.VerdictNeedsApproval:
+				// Hold first so the assigned approval ID can be
+				// embedded in the substitute prompt footer; see the
+				// trigger-miss branch above for the same pattern.
+				var approvalID string
+				if cfg.PendingApprovals != nil {
+					held, err := cfg.PendingApprovals.Hold(req.Context(), PendingLiteApproval{
+						UserID:         cfg.AgentUserID,
+						AgentID:        cfg.AgentID,
+						Provider:       provider,
+						ConversationID: cfg.ConversationID,
+						ToolUse:        tu,
+						Inspector:      v,
+						Fingerprint:    runtimedecision.Fingerprint(dec, decisionInput),
+						Reason:         dec.Reason,
+					})
+					if err != nil {
+						audit("block", "approval_hold_error", err.Error())
+						return conversation.ToolUseVerdict{
+							Allowed: false,
+							Reason:  "Clawvisor: approval unavailable — " + err.Error(),
+						}
+					}
+					if held.Evicted != nil {
+						audit("block", "approval_evicted", "superseded pending approval "+held.Evicted.ID)
+						// See above: terminate evicted inline-task rows so
+						// the dashboard doesn't strand them.
+						cleanupEvictedInlineTask(req.Context(), cfg, held.Evicted)
+					}
+					approvalID = held.Pending.ID
+				}
+				audit("block", string(dec.Source), dec.Reason)
+				return conversation.ToolUseVerdict{
+					Allowed:        false,
+					Reason:         "Clawvisor: approval required — " + dec.Reason,
+					SubstituteWith: approvalPrompt(tu, dec.Reason, approvalID),
+				}
+			}
+		}
+
+		// Task-scope authorization: reverse-resolve the (host, method,
+		// path) to (service, action), then check against the agent's
+		// active tasks. Skipping is audited (in case of misconfig) but
+		// not blocking — v0 leaves task-scope as opt-in until product
+		// surfaces (always_ask / approval queue) are wired in #33.
+		if !decisionHandled && cfg.Catalog != nil && cfg.TaskScope != nil {
+			if resolved, ok := cfg.Catalog.Resolve(v.Host, v.Method, v.Path); ok {
+				dec := cfg.TaskScope.Check(req.Context(), cfg.AgentUserID, cfg.AgentID, resolved.ServiceID, resolved.ActionID)
+				if !dec.Allowed {
+					audit("block", "task_scope_denied", dec.Reason)
+					return conversation.ToolUseVerdict{
+						Allowed: false,
+						Reason:  "Clawvisor: no active task scope covers " + resolved.ServiceID + "." + resolved.ActionID + " — " + dec.Reason,
+					}
+				}
+				matchedTaskID = dec.TaskID
+				// Intent verification: when the matched TaskAction's
+				// Verification mode opts in (strict | lenient | empty)
+				// and an IntentVerifier is configured, the LLM compares
+				// the request's params + tool_use shape to the matched
+				// expected_use. Off mode and missing verifier skip silently.
+				if reason, ok := runIntentVerify(req.Context(), cfg, dec, resolved, tu); !ok {
+					audit("block", "intent_verification_failed", reason)
+					return conversation.ToolUseVerdict{
+						Allowed: false,
+						Reason:  "Clawvisor: intent verification refused " + resolved.ServiceID + "." + resolved.ActionID + " — " + reason,
+					}
+				}
+			}
+			// Catalog miss: log via audit reason field but don't block.
+			// The fact that the (host, method, path) didn't resolve to a
+			// known (service, action) is an inspector or catalog gap, not
+			// an attack signal — the BoundaryCheck above already constrained
+			// the host to the placeholder's bound-service allowlist.
+		}
+
+		// Mint a per-tool nonce that stands in for the agent's bearer
+		// token in the rewritten tool_use's X-Clawvisor-Caller header.
+		// The nonce is bound to (agent, host, method, path); the
+		// resolver consumes it one-shot on the matching call. Failure
+		// to mint (cache misconfigured or backend down) fails closed —
+		// we won't embed the raw agent token in the conversation as a
+		// fallback.
+		if cfg.CallerNonces == nil {
+			audit("block", "caller_nonce_unavailable", "caller nonce cache not configured")
+			return conversation.ToolUseVerdict{
+				Allowed: false,
+				Reason:  "Clawvisor: caller nonce cache not configured; refusing to embed agent token in tool_use",
+			}
+		}
+		nonce, mintErr := cfg.CallerNonces.Mint(req.Context(), cfg.AgentID, NonceTarget{
+			Host:   v.Host,
+			Method: v.Method,
+			Path:   v.Path,
+		})
+		if mintErr != nil {
+			audit("block", "caller_nonce_mint_failed", mintErr.Error())
+			return conversation.ToolUseVerdict{
+				Allowed: false,
+				Reason:  "Clawvisor: caller nonce mint failed — " + mintErr.Error(),
+			}
+		}
+		opts := cfg.RewriteOpts
+		opts.CallerToken = nonce
+		rewritten, err := inspector.Rewrite(inspector.ToolUse{
+			ID:    tu.ID,
+			Name:  tu.Name,
+			Input: tu.Input,
+		}, v, opts)
+		if err != nil {
+			audit("block", "rewriter_error", err.Error())
+			return conversation.ToolUseVerdict{
+				Allowed: false,
+				Reason:  "Clawvisor: rewriter refused — " + err.Error(),
+			}
+		}
+		audit("rewrite", "success", v.Reason)
+		trace(TraceEventRewriteApplied,
+			"host", v.Host,
+			"method", v.Method,
+			"path", v.Path,
+			"placeholders", v.Placeholders,
+			"nonce_prefix", nonce[:min(len(nonce), 14)],
+			"rewrite_bytes", len(rewritten),
+		)
+		return conversation.ToolUseVerdict{
+			Allowed:      true,
+			RewriteInput: rewritten,
+		}
 	}
 }
 
@@ -1304,7 +1348,7 @@ func taskCreationPromptForHolds(holds []HeldToolUse) string {
 	// prompt — naming yield_time_ms tends to make the model set it
 	// to a small default. The proxy clamps the parameter to a safe
 	// minimum as a belt-and-suspenders fallback.
-	return "Please request a Clawvisor task for this work using the proxy-lite control endpoint. Before creating the task, tell me that I will need to approve it. Use a SINGLE FOREGROUND curl — emit it as one synchronous tool_use and wait for the result. Do not background it, do not split it across shells, do not poll a backgrounded session. POST the task definition to `https://clawvisor.local/control/tasks?surface=inline` so I can approve it without leaving the chat. Include the blocked action and any related tools or commands you expect to need. For normal temporary work, omit `lifetime` or set `\"lifetime\":\"session\"` with `expires_in_seconds`. Use `\"lifetime\":\"standing\"` only when the user explicitly wants persistent permission; standing tasks must not include `expires_in_seconds`.\n\nExample (use this exact shape — one curl, JSON via `--data @-` heredoc, no intermediate file, no trailing `&`, no `nohup`):\n\n```sh\ncurl -sS -X POST 'https://clawvisor.local/control/tasks?surface=inline' \\\n  -H 'Content-Type: application/json' \\\n  --data @- <<'JSON'\n" + string(raw) + "\nJSON\n```"
+	return "Please request a Clawvisor task for this work using the proxy-lite control endpoint. The user will need to approve the task after it is created. Your next assistant message must be exactly one shell tool_use that runs the foreground curl below, then waits for the result. Do not print, describe, or summarize the JSON in chat. Do not answer with a markdown code block. Do not background it, do not split it across shells, do not poll a backgrounded session. POST the task definition to `https://clawvisor.local/control/tasks?surface=inline` so I can approve it without leaving the chat. Include the blocked action and any related tools or commands you expect to need. For normal temporary work, omit `lifetime` or set `\"lifetime\":\"session\"` with `expires_in_seconds`. Use `\"lifetime\":\"standing\"` only when the user explicitly wants persistent permission; standing tasks must not include `expires_in_seconds`.\n\nRun this exact command as one foreground shell tool call (JSON via `--data @-` heredoc, no intermediate file, no trailing `&`, no `nohup`):\n\ncurl -sS -X POST 'https://clawvisor.local/control/tasks?surface=inline' \\\n  -H 'Content-Type: application/json' \\\n  --data @- <<'JSON'\n" + string(raw) + "\nJSON"
 }
 
 // taskToolWhy renders a default `why` for the model when the blocked
@@ -1588,4 +1632,468 @@ func matchByRoute(req *http.Request, registry *conversation.ResponseRegistry) co
 	}
 	provider := parser.Name()
 	return registry.ForProvider(provider)
+}
+
+func matchByRouteStreaming(req *http.Request, registry *conversation.ResponseRegistry) conversation.StreamingResponseRewriter {
+	if registry == nil || req == nil || req.URL == nil {
+		return nil
+	}
+	parsers := conversation.DefaultRegistry()
+	parser := parsers.ParserForRoute(req.URL.Path)
+	if parser == nil {
+		return nil
+	}
+	return registry.ForProviderStreaming(parser.Name())
+}
+
+func PostprocessStream(
+	ctx context.Context,
+	req *http.Request,
+	r io.Reader,
+	w io.Writer,
+	contentType string,
+	cfg PostprocessConfig,
+) (PostprocessResult, error) {
+	if cfg.Inspector == nil {
+		_, err := io.Copy(w, r)
+		return PostprocessResult{SkippedReason: "no inspector configured"}, err
+	}
+
+	registry := cfg.ResponseRegistry
+	if registry == nil {
+		registry = conversation.DefaultResponseRegistry()
+	}
+
+	streamingRewriter := matchByRouteStreaming(req, registry)
+	if streamingRewriter == nil {
+		_, err := io.Copy(w, r)
+		return PostprocessResult{SkippedReason: "no streaming rewriter for route"}, err
+	}
+
+	provider := streamingRewriter.Name()
+	auditAgent := auditAgentForCfg(cfg)
+
+	originalPendingApprovals := cfg.PendingApprovals
+	holdSink := &capturedHoldSink{}
+	if originalPendingApprovals != nil {
+		cfg.PendingApprovals = newHoldCapturingApprovalCache(originalPendingApprovals, holdSink)
+	}
+	auditSink := &capturedAuditSink{}
+	var captures []evalCapture
+
+	innerEval := newToolUseEvaluator(req, cfg, provider, auditSink)
+
+	eval := func(tu conversation.ToolUse) conversation.ToolUseVerdict {
+		holdsBefore, auditsBefore := 0, 0
+		if holdSink != nil {
+			holdsBefore = len(holdSink.holds)
+		}
+		if auditSink != nil {
+			auditsBefore = len(auditSink.entries)
+		}
+		v := innerEval(tu)
+		c := evalCapture{Use: tu, Kind: classifyVerdict(v)}
+		if holdSink != nil && len(holdSink.holds) > holdsBefore {
+			h := holdSink.holds[len(holdSink.holds)-1]
+			c.HoldID = h.Pending.ID
+			c.Stage = h.Pending.Stage
+			c.Inspector = h.Pending.Inspector
+			c.Fingerprint = h.Pending.Fingerprint
+			c.Reason = h.Pending.Reason
+		} else if auditSink != nil && len(auditSink.entries) > auditsBefore {
+			last := auditSink.entries[len(auditSink.entries)-1]
+			c.Inspector = last.Verdict
+			c.Reason = last.Reason
+		}
+		if auditSink != nil && len(auditSink.entries) > auditsBefore {
+			c.TaskID = auditSink.entries[len(auditSink.entries)-1].TaskID
+		}
+		captures = append(captures, c)
+		return v
+	}
+
+	streamResult, err := streamingRewriter.StreamRewrite(ctx, r, w)
+	if err != nil {
+		return PostprocessResult{}, err
+	}
+	if len(streamResult.ToolUses) == 0 {
+		return PostprocessResult{
+			ContentType: contentType,
+		}, nil
+	}
+
+	var decisions []conversation.ToolUseDecisionRecord
+	anyBlocked := false
+	anyRewritten := false
+	rewrittenInput := map[string]json.RawMessage{}
+
+	for _, tu := range streamResult.ToolUses {
+		v := eval(tu)
+		decisions = append(decisions, conversation.ToolUseDecisionRecord{
+			ToolUse:          tu,
+			Verdict:          v,
+			ToolInputPreview: conversation.MakeToolInputPreview(tu.Input),
+		})
+		if !v.Allowed {
+			anyBlocked = true
+		}
+		if v.Allowed && len(v.RewriteInput) > 0 {
+			rewrittenInput[tu.ID] = v.RewriteInput
+			anyRewritten = true
+		}
+	}
+
+	if originalPendingApprovals != nil && shouldCoalesceTurn(captures) {
+		coalesced := coalesceFromCaptures(captures)
+		coalesced.UserID = cfg.AgentUserID
+		coalesced.AgentID = cfg.AgentID
+		coalesced.Provider = provider
+		coalesced.ConversationID = cfg.ConversationID
+		held, holdErr := originalPendingApprovals.Hold(req.Context(), coalesced)
+		if holdErr == nil {
+			if held.Evicted != nil {
+				if cfg.Audit != nil && auditAgent != nil && len(captures) > 0 {
+					first := captures[0]
+					cfg.Audit.LogToolUseInspected(req.Context(), auditAgent, cfg.RequestID, first.Use, first.Inspector, "block", "approval_evicted", "superseded pending approval "+held.Evicted.ID, first.TaskID)
+				}
+				cleanupEvictedInlineTask(req.Context(), cfg, held.Evicted)
+			}
+			emitCoalescedPendingAuditRows(req.Context(), cfg, auditAgent, captures, held.Pending.ID)
+
+			coalescedPrompt := coalescedApprovalPrompt(held.Pending.AllHolds())
+			if err := writeProviderBlockedPrompt(w, provider, streamResult, coalescedPrompt, streamingBlockedPromptIndex(provider, streamResult, captures)); err != nil {
+				return PostprocessResult{}, err
+			}
+
+			return PostprocessResult{
+				ContentType: contentType,
+				Rewritten:   true,
+				Decisions:   decisions,
+			}, nil
+		}
+	}
+
+	if replayErr := replayBufferedHolds(req.Context(), cfg, originalPendingApprovals, holdSink, auditAgent, captures); replayErr != nil {
+		flushBufferedAudit(req.Context(), cfg, auditAgent, auditSink)
+		return PostprocessResult{
+			SkippedReason: "approval hold storage failed: " + replayErr.Error(),
+		}, nil
+	}
+	flushBufferedAudit(req.Context(), cfg, auditAgent, auditSink)
+
+	var continuationResults []conversation.ContinuationToolResult
+	for _, dec := range decisions {
+		if dec.Verdict.ContinueWithToolResult != "" {
+			continuationResults = append(continuationResults, conversation.ContinuationToolResult{
+				ToolUseID: dec.ToolUse.ID,
+				Content:   dec.Verdict.ContinueWithToolResult,
+			})
+		}
+	}
+
+	if len(continuationResults) > 0 {
+		return PostprocessResult{
+			ContentType:             contentType,
+			Rewritten:               true,
+			Decisions:               decisions,
+			ContinuationToolResults: continuationResults,
+			AssistantTurn:           streamResult.AssistantTurn,
+			StreamingProvider:       provider,
+			StreamingResult:         streamResult,
+		}, nil
+	}
+
+	if anyBlocked {
+		subText := conversation.BlockedReasonText(decisions)
+		if strings.TrimSpace(subText) == "" {
+			subText = "Tool use was blocked by the Clawvisor proxy."
+		}
+		if err := writeProviderBlockedPrompt(w, provider, streamResult, subText, streamingBlockedPromptIndex(provider, streamResult, captures)); err != nil {
+			return PostprocessResult{}, err
+		}
+	} else {
+		if err := writeProviderToolUses(w, provider, streamResult, streamResult.ToolUses, rewrittenInput); err != nil {
+			return PostprocessResult{}, err
+		}
+		if err := writeProviderStop(w, provider, streamResult); err != nil {
+			return PostprocessResult{}, err
+		}
+	}
+
+	return PostprocessResult{
+		ContentType: contentType,
+		Rewritten:   anyRewritten || anyBlocked,
+		Decisions:   decisions,
+	}, nil
+}
+
+func streamingBlockedPromptIndex(provider conversation.Provider, result conversation.StreamingRewriteResult, captures []evalCapture) int {
+	if provider == conversation.ProviderAnthropic && result.NextAnthropicContentIndex > 0 {
+		return result.NextAnthropicContentIndex
+	}
+	return len(captures)
+}
+
+func writeProviderBlockedPrompt(w io.Writer, provider conversation.Provider, result conversation.StreamingRewriteResult, text string, contentIndex int) error {
+	switch provider {
+	case conversation.ProviderAnthropic:
+		start := map[string]any{
+			"type":  "content_block_start",
+			"index": contentIndex,
+			"content_block": map[string]any{
+				"type": "text",
+				"text": "",
+			},
+		}
+		if err := writeSSE(w, "content_block_start", start); err != nil {
+			return err
+		}
+		delta := map[string]any{
+			"type":  "content_block_delta",
+			"index": contentIndex,
+			"delta": map[string]any{
+				"type": "text_delta",
+				"text": text,
+			},
+		}
+		if err := writeSSE(w, "content_block_delta", delta); err != nil {
+			return err
+		}
+		stop := map[string]any{
+			"type":  "content_block_stop",
+			"index": contentIndex,
+		}
+		if err := writeSSE(w, "content_block_stop", stop); err != nil {
+			return err
+		}
+		return writeAnthropicStopSSE(w, "end_turn")
+
+	case conversation.ProviderOpenAI:
+		if result.StreamFormat == "openai_responses" {
+			_, err := w.Write(conversation.SynthOpenAIResponsesTextSSE(text))
+			return err
+		}
+		chunk := map[string]any{
+			"id":     firstNonEmpty(result.StreamID, "chatcmpl-clawvisor"),
+			"object": "chat.completion.chunk",
+			"choices": []any{
+				map[string]any{
+					"index": 0,
+					"delta": map[string]any{
+						"role":    "assistant",
+						"content": text,
+					},
+				},
+			},
+		}
+		if err := writeOpenAIData(w, chunk); err != nil {
+			return err
+		}
+		stopChunk := map[string]any{
+			"id":     firstNonEmpty(result.StreamID, "chatcmpl-clawvisor"),
+			"object": "chat.completion.chunk",
+			"choices": []any{
+				map[string]any{
+					"index":         0,
+					"finish_reason": "stop",
+				},
+			},
+		}
+		if err := writeOpenAIData(w, stopChunk); err != nil {
+			return err
+		}
+		_, err := fmt.Fprint(w, "data: [DONE]\n\n")
+		return err
+	}
+	return nil
+}
+
+func writeProviderToolUses(w io.Writer, provider conversation.Provider, result conversation.StreamingRewriteResult, tus []conversation.ToolUse, rewrittenInput map[string]json.RawMessage) error {
+	switch provider {
+	case conversation.ProviderAnthropic:
+		return writeAnthropicToolUsesSSE(w, tus, rewrittenInput)
+	case conversation.ProviderOpenAI:
+		if result.StreamFormat == "openai_responses" {
+			_, err := w.Write(conversation.SynthOpenAIResponsesFunctionCallsSSE(syntheticCallsFromToolUses(tus, rewrittenInput)))
+			return err
+		}
+		return writeOpenAIChatToolUsesSSE(w, result.StreamID, tus, rewrittenInput)
+	}
+	return nil
+}
+
+func writeProviderStop(w io.Writer, provider conversation.Provider, result conversation.StreamingRewriteResult) error {
+	switch provider {
+	case conversation.ProviderAnthropic:
+		return writeAnthropicStopSSE(w, "tool_use")
+	case conversation.ProviderOpenAI:
+		if result.StreamFormat == "openai_responses" {
+			return nil
+		}
+		chunk := map[string]any{
+			"id":     firstNonEmpty(result.StreamID, "chatcmpl-clawvisor"),
+			"object": "chat.completion.chunk",
+			"choices": []any{
+				map[string]any{
+					"index":         0,
+					"finish_reason": "tool_calls",
+				},
+			},
+		}
+		if err := writeOpenAIData(w, chunk); err != nil {
+			return err
+		}
+		_, err := fmt.Fprint(w, "data: [DONE]\n\n")
+		return err
+	}
+	return nil
+}
+
+func writeAnthropicToolUsesSSE(w io.Writer, tus []conversation.ToolUse, rewrittenInput map[string]json.RawMessage) error {
+	for _, tu := range tus {
+		input := tu.Input
+		if rw, ok := rewrittenInput[tu.ID]; ok {
+			input = rw
+		}
+
+		start := map[string]any{
+			"type":  "content_block_start",
+			"index": tu.Index,
+			"content_block": map[string]any{
+				"type":  "tool_use",
+				"id":    tu.ID,
+				"name":  tu.Name,
+				"input": map[string]any{},
+			},
+		}
+		if err := writeSSE(w, "content_block_start", start); err != nil {
+			return err
+		}
+
+		delta := map[string]any{
+			"type":  "content_block_delta",
+			"index": tu.Index,
+			"delta": map[string]any{
+				"type":         "input_json_delta",
+				"partial_json": string(input),
+			},
+		}
+		if err := writeSSE(w, "content_block_delta", delta); err != nil {
+			return err
+		}
+
+		stop := map[string]any{
+			"type":  "content_block_stop",
+			"index": tu.Index,
+		}
+		if err := writeSSE(w, "content_block_stop", stop); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeAnthropicStopSSE(w io.Writer, stopReason string) error {
+	delta := map[string]any{
+		"type": "message_delta",
+		"delta": map[string]any{
+			"stop_reason":   stopReason,
+			"stop_sequence": nil,
+		},
+		"usage": map[string]int{"output_tokens": 0},
+	}
+	if err := writeSSE(w, "message_delta", delta); err != nil {
+		return err
+	}
+	return writeSSE(w, "message_stop", map[string]any{"type": "message_stop"})
+}
+
+func writeOpenAIChatToolUsesSSE(w io.Writer, streamID string, tus []conversation.ToolUse, rewrittenInput map[string]json.RawMessage) error {
+	for _, tu := range tus {
+		args := string(tu.Input)
+		if rw, ok := rewrittenInput[tu.ID]; ok {
+			args = string(rw)
+		}
+		chunk := map[string]any{
+			"id":     firstNonEmpty(streamID, "chatcmpl-clawvisor"),
+			"object": "chat.completion.chunk",
+			"choices": []any{
+				map[string]any{
+					"index": 0,
+					"delta": map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"index": tu.Index,
+								"id":    tu.ID,
+								"type":  "function",
+								"function": map[string]any{
+									"name":      tu.Name,
+									"arguments": args,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		if err := writeOpenAIData(w, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func syntheticCallsFromToolUses(tus []conversation.ToolUse, rewrittenInput map[string]json.RawMessage) []conversation.SyntheticToolCall {
+	calls := make([]conversation.SyntheticToolCall, 0, len(tus))
+	for _, tu := range tus {
+		input := tu.Input
+		if rw, ok := rewrittenInput[tu.ID]; ok {
+			input = rw
+		}
+		var decoded map[string]any
+		if len(input) > 0 {
+			_ = json.Unmarshal(input, &decoded)
+		}
+		if decoded == nil {
+			decoded = map[string]any{}
+		}
+		calls = append(calls, conversation.SyntheticToolCall{
+			ID:    tu.ID,
+			Name:  tu.Name,
+			Input: decoded,
+		})
+	}
+	return calls
+}
+
+func writeSSE(w io.Writer, event string, data any) error {
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	if event != "" {
+		if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
+			return err
+		}
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", string(raw))
+	return err
+}
+
+func writeOpenAIData(w io.Writer, data any) error {
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", string(raw))
+	return err
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }

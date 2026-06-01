@@ -3,8 +3,10 @@ package conversation
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -117,7 +119,7 @@ func (rw AnthropicResponseRewriter) rewriteJSON(body []byte, eval ToolUseEvaluat
 		Role:  resp.Role,
 		Model: resp.Model,
 		Content: []anthropicJSONContent{
-			{Type: "text", Text: blockedReasonText(decisions)},
+			{Type: "text", Text: blockedReasonTextForAssistant(decisions)},
 		},
 		StopReason: "end_turn",
 		Usage:      resp.Usage,
@@ -143,11 +145,15 @@ type sseEvent struct {
 // events stream in. Lifted to package scope so the multi-block SSE
 // re-emitter can accept slices of them.
 type pendingBlock struct {
-	name  string
-	id    string
-	input bytes.Buffer
-	text  bytes.Buffer
-	isTU  bool
+	index     int
+	name      string
+	id        string
+	input     bytes.Buffer
+	text      bytes.Buffer
+	signature string
+	blockType string
+	isTU      bool
+	filtered  bool
 }
 
 func (rw AnthropicResponseRewriter) rewriteSSE(body []byte, eval ToolUseEvaluator) (RewriteResult, error) {
@@ -181,22 +187,25 @@ func (rw AnthropicResponseRewriter) rewriteSSE(body []byte, eval ToolUseEvaluato
 			msgRole = ms.Message.Role
 		case "content_block_start":
 			var cbs struct {
-				Index        int `json:"index"`
+				Type         string `json:"type"`
+				Index        int    `json:"index"`
 				ContentBlock struct {
 					Type  string          `json:"type"`
-					ID    string          `json:"id"`
-					Name  string          `json:"name"`
-					Input json.RawMessage `json:"input"`
-					Text  string          `json:"text"`
+					ID    string          `json:"id,omitempty"`
+					Name  string          `json:"name,omitempty"`
+					Input json.RawMessage `json:"input,omitempty"`
+					Text  string          `json:"text,omitempty"`
 				} `json:"content_block"`
 			}
 			if err := json.Unmarshal([]byte(event.Data), &cbs); err != nil {
 				continue
 			}
 			pb := &pendingBlock{
-				name: cbs.ContentBlock.Name,
-				id:   cbs.ContentBlock.ID,
-				isTU: cbs.ContentBlock.Type == "tool_use",
+				index:     cbs.Index,
+				name:      cbs.ContentBlock.Name,
+				id:        cbs.ContentBlock.ID,
+				isTU:      cbs.ContentBlock.Type == "tool_use",
+				blockType: cbs.ContentBlock.Type,
 			}
 			if pb.isTU && len(cbs.ContentBlock.Input) > 0 && string(cbs.ContentBlock.Input) != "{}" {
 				pb.input.Write(cbs.ContentBlock.Input)
@@ -211,11 +220,14 @@ func (rw AnthropicResponseRewriter) rewriteSSE(body []byte, eval ToolUseEvaluato
 			}
 		case "content_block_delta":
 			var cbd struct {
-				Index int `json:"index"`
+				Type  string `json:"type"`
+				Index int    `json:"index"`
 				Delta struct {
 					Type        string `json:"type"`
-					PartialJSON string `json:"partial_json"`
-					Text        string `json:"text"`
+					PartialJSON string `json:"partial_json,omitempty"`
+					Text        string `json:"text,omitempty"`
+					Thinking    string `json:"thinking,omitempty"`
+					Signature   string `json:"signature,omitempty"`
 				} `json:"delta"`
 			}
 			if err := json.Unmarshal([]byte(event.Data), &cbd); err != nil {
@@ -234,6 +246,10 @@ func (rw AnthropicResponseRewriter) rewriteSSE(body []byte, eval ToolUseEvaluato
 				if !pb.isTU {
 					pb.text.WriteString(cbd.Delta.Text)
 				}
+			case "thinking_delta":
+				pb.text.WriteString(cbd.Delta.Thinking)
+			case "signature_delta":
+				pb.signature += cbd.Delta.Signature
 			}
 		}
 	}
@@ -242,14 +258,14 @@ func (rw AnthropicResponseRewriter) rewriteSSE(body []byte, eval ToolUseEvaluato
 	anyBlocked := false
 	anyRewritten := false
 	rewrittenInput := map[*pendingBlock]json.RawMessage{}
-	for i, pb := range orderedTUs {
+	for _, pb := range orderedTUs {
 		var inputRaw json.RawMessage
 		if pb.input.Len() > 0 {
 			inputRaw = json.RawMessage(pb.input.Bytes())
 		}
 		tu := ToolUse{
 			ID:    pb.id,
-			Index: i,
+			Index: pb.index,
 			Name:  pb.name,
 			Input: inputRaw,
 		}
@@ -308,7 +324,7 @@ func (rw AnthropicResponseRewriter) rewriteSSE(body []byte, eval ToolUseEvaluato
 	}
 
 	return RewriteResult{
-		Body:          synthAnthropicTextSSE(msgID, msgModel, msgRole, blockedReasonText(decisions)),
+		Body:          synthAnthropicTextSSE(msgID, msgModel, msgRole, blockedReasonTextForAssistant(decisions)),
 		Decisions:     decisions,
 		Rewritten:     true,
 		AssistantTurn: turn,
@@ -395,6 +411,51 @@ func buildAnthropicMultiBlockSSE(msgID, model, role string, blocks []*pendingBlo
 				},
 			}); err != nil {
 				return nil, err
+			}
+			if err := emit("content_block_stop", map[string]any{
+				"type":  "content_block_stop",
+				"index": outIndex,
+			}); err != nil {
+				return nil, err
+			}
+			outIndex++
+			continue
+		}
+		if pb.blockType == "thinking" {
+			if err := emit("content_block_start", map[string]any{
+				"type":  "content_block_start",
+				"index": outIndex,
+				"content_block": map[string]any{
+					"type":      "thinking",
+					"thinking":  "",
+					"signature": "",
+				},
+			}); err != nil {
+				return nil, err
+			}
+			if pb.text.Len() > 0 {
+				if err := emit("content_block_delta", map[string]any{
+					"type":  "content_block_delta",
+					"index": outIndex,
+					"delta": map[string]any{
+						"type":     "thinking_delta",
+						"thinking": pb.text.String(),
+					},
+				}); err != nil {
+					return nil, err
+				}
+			}
+			if pb.signature != "" {
+				if err := emit("content_block_delta", map[string]any{
+					"type":  "content_block_delta",
+					"index": outIndex,
+					"delta": map[string]any{
+						"type":      "signature_delta",
+						"signature": pb.signature,
+					},
+				}); err != nil {
+					return nil, err
+				}
 			}
 			if err := emit("content_block_stop", map[string]any{
 				"type":  "content_block_stop",
@@ -766,11 +827,13 @@ func extractAnthropicAssistantContentSSE(body []byte) (json.RawMessage, error) {
 		return nil, fmt.Errorf("conversation: parse anthropic SSE: %w", err)
 	}
 	type pending struct {
-		isTU     bool
-		toolID   string
-		toolName string
-		input    strings.Builder
-		text     strings.Builder
+		isTU      bool
+		blockType string
+		toolID    string
+		toolName  string
+		input     strings.Builder
+		text      strings.Builder
+		signature strings.Builder
 	}
 	blocks := map[int]*pending{}
 	var order []int
@@ -778,22 +841,24 @@ func extractAnthropicAssistantContentSSE(body []byte) (json.RawMessage, error) {
 		switch ev.Event {
 		case "content_block_start":
 			var cbs struct {
-				Index        int `json:"index"`
+				Type         string `json:"type"`
+				Index        int    `json:"index"`
 				ContentBlock struct {
 					Type  string          `json:"type"`
-					ID    string          `json:"id"`
-					Name  string          `json:"name"`
-					Input json.RawMessage `json:"input"`
-					Text  string          `json:"text"`
+					ID    string          `json:"id,omitempty"`
+					Name  string          `json:"name,omitempty"`
+					Input json.RawMessage `json:"input,omitempty"`
+					Text  string          `json:"text,omitempty"`
 				} `json:"content_block"`
 			}
 			if err := json.Unmarshal([]byte(ev.Data), &cbs); err != nil {
 				continue
 			}
 			p := &pending{
-				isTU:     cbs.ContentBlock.Type == "tool_use",
-				toolID:   cbs.ContentBlock.ID,
-				toolName: cbs.ContentBlock.Name,
+				isTU:      cbs.ContentBlock.Type == "tool_use",
+				blockType: cbs.ContentBlock.Type,
+				toolID:    cbs.ContentBlock.ID,
+				toolName:  cbs.ContentBlock.Name,
 			}
 			if p.isTU && len(cbs.ContentBlock.Input) > 0 && string(cbs.ContentBlock.Input) != "{}" {
 				p.input.Write(cbs.ContentBlock.Input)
@@ -805,11 +870,14 @@ func extractAnthropicAssistantContentSSE(body []byte) (json.RawMessage, error) {
 			order = append(order, cbs.Index)
 		case "content_block_delta":
 			var cbd struct {
-				Index int `json:"index"`
+				Type  string `json:"type"`
+				Index int    `json:"index"`
 				Delta struct {
 					Type        string `json:"type"`
-					PartialJSON string `json:"partial_json"`
-					Text        string `json:"text"`
+					PartialJSON string `json:"partial_json,omitempty"`
+					Text        string `json:"text,omitempty"`
+					Thinking    string `json:"thinking,omitempty"`
+					Signature   string `json:"signature,omitempty"`
 				} `json:"delta"`
 			}
 			if err := json.Unmarshal([]byte(ev.Data), &cbd); err != nil {
@@ -828,6 +896,10 @@ func extractAnthropicAssistantContentSSE(body []byte) (json.RawMessage, error) {
 				if !p.isTU {
 					p.text.WriteString(cbd.Delta.Text)
 				}
+			case "thinking_delta":
+				p.text.WriteString(cbd.Delta.Thinking)
+			case "signature_delta":
+				p.signature.WriteString(cbd.Delta.Signature)
 			}
 		}
 	}
@@ -851,6 +923,14 @@ func extractAnthropicAssistantContentSSE(body []byte) (json.RawMessage, error) {
 				"id":    p.toolID,
 				"name":  p.toolName,
 				"input": input,
+			})
+			continue
+		}
+		if p.blockType == "thinking" {
+			out = append(out, map[string]any{
+				"type":      "thinking",
+				"thinking":  p.text.String(),
+				"signature": p.signature.String(),
 			})
 			continue
 		}
@@ -994,4 +1074,341 @@ func synthAnthropicTextSSE(msgID, model, role, text string) []byte {
 		"type": "message_stop",
 	})
 	return b.Bytes()
+}
+
+func (rw AnthropicResponseRewriter) StreamRewrite(ctx context.Context, r io.Reader, w io.Writer) (StreamingRewriteResult, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64<<10), 8<<20)
+
+	var (
+		msgID, msgModel, msgRole string
+		curEvent                 string
+		dataLns                  []string
+	)
+
+	blocks := map[int]*pendingBlock{}
+	var orderedAll []*pendingBlock
+	var orderedTUs []*pendingBlock
+	nextContentIndex := 0
+	nextOutboundIndex := 0
+	firstBufferedToolIndex := -1
+
+	writeSSE := func(event string, data string) error {
+		var err error
+		if event != "" {
+			_, err = fmt.Fprintf(w, "event: %s\n", event)
+			if err != nil {
+				return err
+			}
+		}
+		_, err = fmt.Fprintf(w, "data: %s\n\n", data)
+		return err
+	}
+
+	flushEvent := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(dataLns) == 0 {
+			curEvent = ""
+			return nil
+		}
+		data := strings.Join(dataLns, "\n")
+		event := curEvent
+		curEvent = ""
+		dataLns = dataLns[:0]
+
+		if data == "[DONE]" {
+			return nil
+		}
+
+		switch event {
+		case "message_start":
+			var ms struct {
+				Message struct {
+					ID    string `json:"id"`
+					Role  string `json:"role"`
+					Model string `json:"model"`
+				} `json:"message"`
+			}
+			_ = json.Unmarshal([]byte(data), &ms)
+			msgID = ms.Message.ID
+			msgModel = ms.Message.Model
+			msgRole = ms.Message.Role
+			return writeSSE(event, data)
+
+		case "content_block_start":
+			var cbs struct {
+				Type         string `json:"type"`
+				Index        int    `json:"index"`
+				ContentBlock struct {
+					Type      string          `json:"type"`
+					ID        string          `json:"id,omitempty"`
+					Name      string          `json:"name,omitempty"`
+					Input     json.RawMessage `json:"input,omitempty"`
+					Text      string          `json:"text,omitempty"`
+					Thinking  *string         `json:"thinking,omitempty"`
+					Signature *string         `json:"signature,omitempty"`
+				} `json:"content_block"`
+			}
+			if err := json.Unmarshal([]byte(data), &cbs); err != nil {
+				return writeSSE(event, data)
+			}
+			inboundIndex := cbs.Index
+			if cbs.ContentBlock.Type == "thinking" && isNonClaudeModel(msgModel) {
+				blocks[inboundIndex] = &pendingBlock{
+					index:     -1,
+					blockType: cbs.ContentBlock.Type,
+					filtered:  true,
+				}
+				return nil
+			}
+			isTool := cbs.ContentBlock.Type == "tool_use"
+			outboundIndex := -1
+			if isTool {
+				if firstBufferedToolIndex < 0 {
+					firstBufferedToolIndex = nextOutboundIndex
+				}
+			} else if firstBufferedToolIndex < 0 {
+				outboundIndex = nextOutboundIndex
+				nextOutboundIndex++
+				nextContentIndex = nextOutboundIndex
+				cbs.Index = outboundIndex
+			}
+			rewrittenData, err := json.Marshal(cbs)
+			if err != nil {
+				return err
+			}
+			pb := &pendingBlock{
+				index:     outboundIndex,
+				name:      cbs.ContentBlock.Name,
+				id:        cbs.ContentBlock.ID,
+				isTU:      isTool,
+				blockType: cbs.ContentBlock.Type,
+			}
+			if pb.isTU && len(cbs.ContentBlock.Input) > 0 && string(cbs.ContentBlock.Input) != "{}" {
+				pb.input.Write(cbs.ContentBlock.Input)
+			}
+			if !pb.isTU && cbs.ContentBlock.Text != "" {
+				pb.text.WriteString(cbs.ContentBlock.Text)
+			}
+			if !pb.isTU && cbs.ContentBlock.Thinking != nil {
+				pb.text.WriteString(*cbs.ContentBlock.Thinking)
+			}
+			if !pb.isTU && cbs.ContentBlock.Signature != nil {
+				pb.signature += *cbs.ContentBlock.Signature
+			}
+			blocks[inboundIndex] = pb
+			orderedAll = append(orderedAll, pb)
+			if pb.isTU {
+				orderedTUs = append(orderedTUs, pb)
+				return nil
+			}
+			if pb.index < 0 {
+				return nil
+			}
+			return writeSSE(event, string(rewrittenData))
+
+		case "content_block_delta":
+			var cbd struct {
+				Type  string `json:"type"`
+				Index int    `json:"index"`
+				Delta struct {
+					Type        string `json:"type"`
+					PartialJSON string `json:"partial_json,omitempty"`
+					Text        string `json:"text,omitempty"`
+					Thinking    string `json:"thinking,omitempty"`
+					Signature   string `json:"signature,omitempty"`
+				} `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(data), &cbd); err != nil {
+				return writeSSE(event, data)
+			}
+			pb, ok := blocks[cbd.Index]
+			if !ok {
+				if nextOutboundIndex > 0 {
+					return nil
+				}
+				return writeSSE(event, data)
+			}
+			if pb.filtered {
+				return nil
+			}
+			if pb.isTU {
+				if cbd.Delta.Type == "input_json_delta" {
+					pb.input.WriteString(cbd.Delta.PartialJSON)
+				}
+				return nil
+			}
+			if pb.index < 0 {
+				switch cbd.Delta.Type {
+				case "text_delta":
+					pb.text.WriteString(cbd.Delta.Text)
+				case "thinking_delta":
+					pb.text.WriteString(cbd.Delta.Thinking)
+				case "signature_delta":
+					pb.signature += cbd.Delta.Signature
+				}
+				return nil
+			}
+			cbd.Index = pb.index
+			rewrittenData, err := json.Marshal(cbd)
+			if err != nil {
+				return err
+			}
+			switch cbd.Delta.Type {
+			case "text_delta":
+				pb.text.WriteString(cbd.Delta.Text)
+			case "thinking_delta":
+				pb.text.WriteString(cbd.Delta.Thinking)
+			case "signature_delta":
+				pb.signature += cbd.Delta.Signature
+			}
+			return writeSSE(event, string(rewrittenData))
+
+		case "content_block_stop":
+			var cbs struct {
+				Type  string `json:"type"`
+				Index int    `json:"index"`
+			}
+			if err := json.Unmarshal([]byte(data), &cbs); err != nil {
+				return writeSSE(event, data)
+			}
+			pb, ok := blocks[cbs.Index]
+			if !ok {
+				if nextOutboundIndex > 0 {
+					return nil
+				}
+				return writeSSE(event, data)
+			}
+			if pb.filtered {
+				return nil
+			}
+			if pb.index < 0 {
+				return nil
+			}
+			cbs.Index = pb.index
+			rewrittenData, err := json.Marshal(cbs)
+			if err != nil {
+				return err
+			}
+			if pb.isTU {
+				return nil
+			}
+			return writeSSE(event, string(rewrittenData))
+
+		case "message_delta", "message_stop":
+			if len(orderedTUs) == 0 {
+				return writeSSE(event, data)
+			}
+			return nil
+		}
+		return nil
+	}
+
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return StreamingRewriteResult{}, err
+		}
+		line := scanner.Text()
+		trimmed := strings.TrimRight(line, "\r")
+		if trimmed == "" {
+			if err := flushEvent(); err != nil {
+				return StreamingRewriteResult{}, err
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, ":") {
+			_, _ = fmt.Fprintln(w, line)
+			continue
+		}
+		if strings.HasPrefix(trimmed, "event:") {
+			curEvent = strings.TrimSpace(strings.TrimPrefix(trimmed, "event:"))
+			continue
+		}
+		if strings.HasPrefix(trimmed, "data:") {
+			dataLns = append(dataLns, strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return StreamingRewriteResult{}, err
+	}
+	if err := flushEvent(); err != nil {
+		return StreamingRewriteResult{}, err
+	}
+
+	var tus []ToolUse
+	var frags []assistantFragment
+	if firstBufferedToolIndex < 0 {
+		firstBufferedToolIndex = nextOutboundIndex
+	}
+	for _, pb := range orderedTUs {
+		if pb.index < 0 {
+			pb.index = firstBufferedToolIndex + len(tus)
+		}
+		var inputRaw json.RawMessage
+		if pb.input.Len() > 0 {
+			inputRaw = json.RawMessage(pb.input.Bytes())
+		}
+		tus = append(tus, ToolUse{
+			ID:    pb.id,
+			Index: pb.index,
+			Name:  pb.name,
+			Input: inputRaw,
+		})
+	}
+
+	for _, pb := range orderedAll {
+		if pb.filtered {
+			continue
+		}
+		if pb.isTU {
+			var inputRaw json.RawMessage
+			if pb.input.Len() > 0 {
+				inputRaw = json.RawMessage(pb.input.Bytes())
+			}
+			frags = append(frags, assistantFragment{
+				IsTool:   true,
+				ToolName: pb.name,
+				ToolArgs: inputRaw,
+			})
+			continue
+		}
+		if pb.text.Len() > 0 {
+			frags = append(frags, assistantFragment{Text: pb.text.String()})
+		}
+	}
+	turn := &Turn{
+		Role:    RoleAssistant,
+		Content: formatAssistantContent(frags),
+	}
+
+	return StreamingRewriteResult{
+		ToolUses:                  tus,
+		AssistantTurn:             turn,
+		StreamID:                  msgID,
+		Model:                     msgModel,
+		Role:                      msgRole,
+		StreamFormat:              "anthropic_messages",
+		NextAnthropicContentIndex: firstNonToolIndex(nextContentIndex, firstBufferedToolIndex, len(orderedTUs) > 0),
+	}, nil
+}
+
+func firstNonToolIndex(nextContentIndex, firstBufferedToolIndex int, hasBufferedTools bool) int {
+	if hasBufferedTools {
+		return firstBufferedToolIndex
+	}
+	return nextContentIndex
+}
+
+func isNonClaudeModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return false
+	}
+	name := model
+	if slash := strings.LastIndex(name, "/"); slash >= 0 {
+		name = name[slash+1:]
+	}
+	return !strings.HasPrefix(name, "claude-")
 }

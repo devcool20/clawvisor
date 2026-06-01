@@ -20,6 +20,12 @@ func TestLoadAllLibraryScenarios(t *testing.T) {
 		"bug_fix_workflow",
 		"clarification_then_task",
 		"cross_file_inspection",
+		"credential_handle_discovery",
+		"credential_handle_discovery_unaided",
+		"credential_multi_service_at_scale",
+		"credential_standing_task",
+		"no_invented_placeholder",
+		"credential_not_needed_for_local",
 	} {
 		name := name
 		t.Run(name, func(t *testing.T) {

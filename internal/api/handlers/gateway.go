@@ -255,9 +255,9 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// Dedup: if this (request_id, user, task) already has a canonical row,
 		// return its outcome without re-processing. FindDedupCandidate encodes
-		// the precedence directly — pre-task canonicals (task_id IS NULL) win
-		// over task-scoped canonicals for the same request_id, oldest-first
-		// within a tier — so a sibling task that landed its own canonical
+		// the precedence directly: exact task-scoped canonicals win over
+		// pre-task fallback, oldest-first within a tier, so a sibling task
+		// that landed its own canonical
 		// under symmetric scope doesn't shadow our retry's pre-task or
 		// same-task winner. Using the request_id-only getter here would
 		// silently return that sibling's "latest canonical" instead.
@@ -1325,10 +1325,9 @@ func (h *GatewayHandler) HandleGet(w http.ResponseWriter, r *http.Request) {
 
 // lookupAuditByRequestID returns the canonical audit entry for (request_id,
 // user_id), narrowing to the caller's task scope when taskID != "". The
-// task-scoped getter inverts FindDedupCandidate's precedence (exact-task
-// first, pre-task fallback) so a polling agent who knows its task_id always
-// gets the row that actually fired for that task — not a sibling task's
-// later canonical for the same request_id.
+// task-scoped getter shares FindDedupCandidate's task-tier precedence
+// (exact-task first, pre-task fallback), but returns the newest row within
+// that tier for status polling.
 func (h *GatewayHandler) lookupAuditByRequestID(ctx context.Context, requestID, userID, taskID string) (*store.AuditEntry, error) {
 	if taskID == "" {
 		return h.store.GetAuditEntryByRequestID(ctx, requestID, userID)

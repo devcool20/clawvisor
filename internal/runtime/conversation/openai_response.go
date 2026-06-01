@@ -1,9 +1,12 @@
 package conversation
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -179,10 +182,10 @@ func (rw OpenAIResponseRewriter) rewriteResponsesJSON(body []byte, eval ToolUseE
 			Status: "completed",
 			Content: []openAIResponseContent{{
 				Type: "output_text",
-				Text: blockedReasonText(decisions),
+				Text: blockedReasonTextForAssistant(decisions),
 			}},
 		}},
-		OutputText: blockedReasonText(decisions),
+		OutputText: blockedReasonTextForAssistant(decisions),
 	}
 	rewritten, err := json.Marshal(out)
 	if err != nil {
@@ -415,7 +418,7 @@ func (rw OpenAIResponseRewriter) rewriteResponsesSSE(body []byte, eval ToolUseEv
 		return RewriteResult{Body: body, Decisions: decisions, AssistantTurn: turn}, nil
 	}
 	return RewriteResult{
-		Body:          synthOpenAIResponsesTextSSE(blockedReasonText(decisions)),
+		Body:          synthOpenAIResponsesTextSSE(blockedReasonTextForAssistant(decisions)),
 		Decisions:     decisions,
 		Rewritten:     true,
 		AssistantTurn: turn,
@@ -685,7 +688,7 @@ func (rw OpenAIResponseRewriter) rewriteChatCompletionsJSON(body []byte, eval To
 			Index: 0,
 			Message: openAIChatMessage{
 				Role:    "assistant",
-				Content: blockedReasonText(decisions),
+				Content: blockedReasonTextForAssistant(decisions),
 			},
 			FinishReason: "stop",
 		}},
@@ -822,7 +825,7 @@ func (rw OpenAIResponseRewriter) rewriteChatCompletionsSSE(body []byte, eval Too
 		return RewriteResult{Body: body, Decisions: decisions, AssistantTurn: turn}, nil
 	}
 	return RewriteResult{
-		Body:          synthOpenAIChatTextSSE(blockedReasonText(decisions)),
+		Body:          synthOpenAIChatTextSSE(blockedReasonTextForAssistant(decisions)),
 		Decisions:     decisions,
 		Rewritten:     true,
 		AssistantTurn: turn,
@@ -1413,6 +1416,21 @@ func rawOpenAICustomToolInput(input string) json.RawMessage {
 	return raw
 }
 
+func rawOpenAICustomToolInputFromAny(input any) json.RawMessage {
+	switch v := input.(type) {
+	case nil:
+		return nil
+	case string:
+		return rawOpenAICustomToolInput(v)
+	default:
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return nil
+		}
+		return raw
+	}
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {
@@ -1420,4 +1438,508 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func (rw OpenAIResponseRewriter) StreamRewrite(ctx context.Context, r io.Reader, w io.Writer) (StreamingRewriteResult, error) {
+	br := bufio.NewReader(r)
+	prefix, isResponses, err := sniffOpenAIStreamFormat(br)
+	if err != nil {
+		return StreamingRewriteResult{}, err
+	}
+	stream := io.MultiReader(bytes.NewReader(prefix), br)
+
+	if isResponses {
+		return rw.streamRewriteResponses(ctx, stream, w)
+	}
+	return rw.streamRewriteChatCompletions(ctx, stream, w)
+}
+
+func sniffOpenAIStreamFormat(br *bufio.Reader) ([]byte, bool, error) {
+	var prefix bytes.Buffer
+	for prefix.Len() < 64<<10 {
+		line, err := br.ReadString('\n')
+		if line != "" {
+			prefix.WriteString(line)
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "event:") {
+				event := strings.TrimSpace(strings.TrimPrefix(trimmed, "event:"))
+				if strings.HasPrefix(event, "response.") {
+					return prefix.Bytes(), true, nil
+				}
+			}
+			if strings.HasPrefix(trimmed, "data:") {
+				data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+				if data != "[DONE]" && (strings.Contains(data, `"type":"response.`) || strings.Contains(data, `"type": "response.`) || strings.Contains(data, `"object":"response"`) || strings.Contains(data, `"object": "response"`)) {
+					return prefix.Bytes(), true, nil
+				}
+				return prefix.Bytes(), false, nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return prefix.Bytes(), bytes.Contains(prefix.Bytes(), []byte("response.")), nil
+			}
+			return prefix.Bytes(), false, err
+		}
+	}
+	return prefix.Bytes(), bytes.Contains(prefix.Bytes(), []byte("response.")), nil
+}
+
+func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Context, r io.Reader, w io.Writer) (StreamingRewriteResult, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64<<10), 8<<20)
+
+	type pendingCall struct {
+		id   string
+		name string
+		args strings.Builder
+	}
+	pending := map[int]*pendingCall{}
+	var streamID string
+	var text strings.Builder
+	var frags []assistantFragment
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if trimmed == "data: [DONE]" {
+			if len(pending) == 0 {
+				_, _ = fmt.Fprintln(w, line)
+			}
+			continue
+		}
+		if !strings.HasPrefix(trimmed, "data:") {
+			_, _ = fmt.Fprintln(w, line)
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+		var event struct {
+			ID      string             `json:"id"`
+			Choices []openAIChatChoice `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			_, _ = fmt.Fprintln(w, line)
+			continue
+		}
+		if event.ID != "" && streamID == "" {
+			streamID = event.ID
+		}
+
+		hasToolCalls := false
+		var contentOnlyChoices []map[string]any
+		for _, choice := range event.Choices {
+			if len(choice.Delta.ToolCalls) > 0 {
+				hasToolCalls = true
+				for _, tc := range choice.Delta.ToolCalls {
+					pc := pending[tc.Index]
+					if pc == nil {
+						pc = &pendingCall{}
+						pending[tc.Index] = pc
+					}
+					if tc.ID != "" {
+						pc.id = tc.ID
+					}
+					if tc.Function.Name != "" {
+						pc.name = tc.Function.Name
+					}
+					if tc.Function.Arguments != "" {
+						pc.args.WriteString(tc.Function.Arguments)
+					}
+				}
+			}
+			if choice.Delta.Content != nil || flattenOpenAIContentFromAny(choice.Delta.Content) != "" {
+				if txt := flattenOpenAIContentFromAny(choice.Delta.Content); txt != "" {
+					text.WriteString(txt)
+					contentOnlyChoices = append(contentOnlyChoices, map[string]any{
+						"index": choice.Index,
+						"delta": map[string]any{
+							"content": choice.Delta.Content,
+						},
+						"finish_reason": nil,
+					})
+				}
+			}
+			if choice.FinishReason == "tool_calls" {
+				continue
+			}
+		}
+
+		if hasToolCalls {
+			if len(contentOnlyChoices) > 0 {
+				chunk := map[string]any{
+					"id":      event.ID,
+					"object":  "chat.completion.chunk",
+					"choices": contentOnlyChoices,
+				}
+				encoded, err := json.Marshal(chunk)
+				if err != nil {
+					return StreamingRewriteResult{}, err
+				}
+				if _, err := fmt.Fprintf(w, "data: %s\n\n", encoded); err != nil {
+					return StreamingRewriteResult{}, err
+				}
+			}
+			continue
+		}
+
+		isToolCallFinish := false
+		for _, choice := range event.Choices {
+			if choice.FinishReason == "tool_calls" {
+				isToolCallFinish = true
+			}
+		}
+		if isToolCallFinish {
+			continue
+		}
+
+		_, _ = fmt.Fprintln(w, line)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return StreamingRewriteResult{}, err
+	}
+
+	if text.Len() > 0 {
+		frags = append(frags, assistantFragment{Text: text.String()})
+	}
+
+	toolCallIndexes := make([]int, 0, len(pending))
+	for toolCallIndex := range pending {
+		toolCallIndexes = append(toolCallIndexes, toolCallIndex)
+	}
+	sort.Ints(toolCallIndexes)
+
+	var tus []ToolUse
+	for _, toolCallIndex := range toolCallIndexes {
+		pc := pending[toolCallIndex]
+		tus = append(tus, ToolUse{
+			ID:    pc.id,
+			Index: toolCallIndex,
+			Name:  pc.name,
+			Input: rawIfJSONOpenAI(pc.args.String()),
+		})
+		frags = append(frags, assistantFragment{
+			IsTool:   true,
+			ToolName: pc.name,
+			ToolArgs: rawIfJSONOpenAI(pc.args.String()),
+		})
+	}
+
+	turn := &Turn{
+		Role:    RoleAssistant,
+		Content: formatAssistantContent(frags),
+	}
+
+	return StreamingRewriteResult{
+		ToolUses:      tus,
+		AssistantTurn: turn,
+		StreamID:      streamID,
+		StreamFormat:  "openai_chat",
+	}, nil
+}
+
+func (rw OpenAIResponseRewriter) streamRewriteResponses(ctx context.Context, r io.Reader, w io.Writer) (StreamingRewriteResult, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64<<10), 8<<20)
+
+	type pendingCall struct {
+		itemID      string
+		callID      string
+		name        string
+		outputIndex int
+		arguments   strings.Builder
+	}
+	pending := map[string]*pendingCall{}
+	textByIndex := map[int]*strings.Builder{}
+	var orderedItems []orderedResponsesItem
+	var lastEvent string
+	var dataLns []string
+	withheldTool := false
+	streamID := "resp_clawvisor_rewrite"
+
+	flushEvent := func() error {
+		if len(dataLns) == 0 {
+			lastEvent = ""
+			return nil
+		}
+		data := strings.Join(dataLns, "\n")
+		event := lastEvent
+		lastEvent = ""
+		dataLns = dataLns[:0]
+
+		if data == "[DONE]" {
+			return nil
+		}
+
+		switch event {
+		case "response.created":
+			var raw struct {
+				Response struct {
+					ID string `json:"id"`
+				} `json:"response"`
+			}
+			if err := json.Unmarshal([]byte(data), &raw); err == nil && raw.Response.ID != "" {
+				streamID = raw.Response.ID
+			}
+			return writeSSE(w, event, data)
+
+		case "response.output_item.added":
+			var raw struct {
+				OutputIndex int                      `json:"output_index"`
+				Item        openAIResponseOutputItem `json:"item"`
+			}
+			if err := json.Unmarshal([]byte(data), &raw); err != nil {
+				return writeSSE(w, event, data)
+			}
+			switch raw.Item.Type {
+			case "message":
+				if _, ok := textByIndex[raw.OutputIndex]; !ok {
+					textByIndex[raw.OutputIndex] = &strings.Builder{}
+				}
+				return writeSSE(w, event, data)
+			case "function_call":
+				withheldTool = true
+				pc := &pendingCall{
+					itemID:      raw.Item.ID,
+					callID:      firstNonEmpty(raw.Item.CallID, raw.Item.ID),
+					name:        raw.Item.Name,
+					outputIndex: raw.OutputIndex,
+				}
+				if args := stringifyOpenAIArguments(raw.Item.Arguments); args != "" {
+					pc.arguments.WriteString(args)
+				}
+				pending[raw.Item.ID] = pc
+				return nil
+			case "custom_tool_call":
+				withheldTool = true
+				return nil
+			}
+			return writeSSE(w, event, data)
+
+		case "response.function_call_arguments.delta":
+			var raw struct {
+				ItemID string `json:"item_id"`
+				Delta  string `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(data), &raw); err != nil {
+				return writeSSE(w, event, data)
+			}
+			if pc := pending[raw.ItemID]; pc != nil {
+				pc.arguments.WriteString(raw.Delta)
+			}
+			return nil
+
+		case "response.function_call_arguments.done":
+			var raw struct {
+				ItemID    string `json:"item_id"`
+				Arguments string `json:"arguments"`
+			}
+			if err := json.Unmarshal([]byte(data), &raw); err != nil {
+				return writeSSE(w, event, data)
+			}
+			if pc := pending[raw.ItemID]; pc != nil && raw.Arguments != "" {
+				pc.arguments.Reset()
+				pc.arguments.WriteString(raw.Arguments)
+			}
+			return nil
+
+		case "response.output_text.delta":
+			var raw struct {
+				OutputIndex int    `json:"output_index"`
+				Delta       string `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(data), &raw); err != nil {
+				return writeSSE(w, event, data)
+			}
+			b := textByIndex[raw.OutputIndex]
+			if b == nil {
+				b = &strings.Builder{}
+				textByIndex[raw.OutputIndex] = b
+			}
+			b.WriteString(raw.Delta)
+			return writeSSE(w, event, data)
+
+		case "response.output_item.done":
+			var raw struct {
+				OutputIndex int                      `json:"output_index"`
+				Item        openAIResponseOutputItem `json:"item"`
+			}
+			if err := json.Unmarshal([]byte(data), &raw); err != nil {
+				return writeSSE(w, event, data)
+			}
+			var rawItem struct {
+				Item json.RawMessage `json:"item"`
+			}
+			_ = json.Unmarshal([]byte(data), &rawItem)
+
+			switch raw.Item.Type {
+			case "message":
+				txt := ""
+				if b := textByIndex[raw.OutputIndex]; b != nil {
+					txt = b.String()
+					delete(textByIndex, raw.OutputIndex)
+				}
+				orderedItems = append(orderedItems, orderedResponsesItem{
+					isText:      true,
+					outputIndex: raw.OutputIndex,
+					text:        txt,
+				})
+				return writeSSE(w, event, data)
+			case "function_call":
+				pc := pending[raw.Item.ID]
+				if pc == nil {
+					return nil
+				}
+				if args := stringifyOpenAIArguments(raw.Item.Arguments); args != "" {
+					pc.arguments.Reset()
+					pc.arguments.WriteString(args)
+				}
+				orderedItems = append(orderedItems, orderedResponsesItem{
+					outputIndex: pc.outputIndex,
+					itemID:      pc.itemID,
+					callID:      pc.callID,
+					name:        pc.name,
+					arguments:   pc.arguments.String(),
+				})
+				return nil
+			case "custom_tool_call":
+				withheldTool = true
+				tu, ok := toolUseFromOpenAICustomToolCall(raw.Item, 0)
+				if !ok {
+					return writeSSE(w, event, data)
+				}
+				orderedItems = append(orderedItems, orderedResponsesItem{
+					isCustomToolCall: true,
+					outputIndex:      raw.OutputIndex,
+					itemID:           raw.Item.ID,
+					callID:           raw.Item.CallID,
+					name:             tu.Name,
+					customInput:      customToolInputForReemit(raw.Item.Input, raw.Item.Arguments),
+				})
+				return nil
+			default:
+				if len(rawItem.Item) > 0 {
+					orderedItems = append(orderedItems, orderedResponsesItem{
+						isPassThrough:  true,
+						outputIndex:    raw.OutputIndex,
+						passThroughRaw: append(json.RawMessage(nil), rawItem.Item...),
+					})
+				}
+				return writeSSE(w, event, data)
+			}
+
+		case "response.completed":
+			if !withheldTool {
+				return writeSSE(w, event, data)
+			}
+			return nil
+		}
+		return writeSSE(w, event, data)
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimRight(line, "\r")
+		if trimmed == "" {
+			if err := flushEvent(); err != nil {
+				return StreamingRewriteResult{}, err
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, ":") {
+			_, _ = fmt.Fprintln(w, line)
+			continue
+		}
+		if strings.HasPrefix(trimmed, "event:") {
+			lastEvent = strings.TrimSpace(strings.TrimPrefix(trimmed, "event:"))
+			continue
+		}
+		if strings.HasPrefix(trimmed, "data:") {
+			dataLns = append(dataLns, strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return StreamingRewriteResult{}, err
+	}
+	if err := flushEvent(); err != nil {
+		return StreamingRewriteResult{}, err
+	}
+
+	var tus []ToolUse
+	var frags []assistantFragment
+	index := 0
+	nextOutputIndex := 0
+	for _, item := range orderedItems {
+		if item.outputIndex >= nextOutputIndex {
+			nextOutputIndex = item.outputIndex + 1
+		}
+		if item.isText {
+			frags = append(frags, assistantFragment{Text: item.text})
+			continue
+		}
+		if item.isPassThrough {
+			continue
+		}
+		if item.isCustomToolCall {
+			inputRaw := rawOpenAICustomToolInputFromAny(item.customInput)
+			tus = append(tus, ToolUse{
+				ID:    firstNonEmpty(item.callID, item.itemID),
+				Index: index,
+				Name:  item.name,
+				Input: inputRaw,
+			})
+			index++
+			frags = append(frags, assistantFragment{
+				IsTool:   true,
+				ToolName: item.name,
+				ToolArgs: inputRaw,
+			})
+			continue
+		}
+		pc := pending[item.itemID]
+		args := item.arguments
+		if pc != nil && pc.arguments.Len() > 0 {
+			args = pc.arguments.String()
+		}
+		tus = append(tus, ToolUse{
+			ID:    item.callID,
+			Index: index,
+			Name:  item.name,
+			Input: rawIfJSONOpenAI(args),
+		})
+		index++
+		frags = append(frags, assistantFragment{
+			IsTool:   true,
+			ToolName: item.name,
+			ToolArgs: rawIfJSONOpenAI(args),
+		})
+	}
+
+	turn := &Turn{
+		Role:    RoleAssistant,
+		Content: formatAssistantContent(frags),
+	}
+
+	return StreamingRewriteResult{
+		ToolUses:              tus,
+		AssistantTurn:         turn,
+		StreamID:              streamID,
+		StreamFormat:          "openai_responses",
+		NextOpenAIOutputIndex: nextOutputIndex,
+	}, nil
+}
+
+func writeSSE(w io.Writer, event string, data string) error {
+	var err error
+	if event != "" {
+		_, err = fmt.Fprintf(w, "event: %s\n", event)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", data)
+	return err
 }
