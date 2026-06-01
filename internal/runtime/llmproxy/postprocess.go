@@ -562,13 +562,27 @@ func rollbackBufferedPendingTasks(ctx context.Context, cfg PostprocessConfig, si
 	if !ok || pendingCreator == nil {
 		return
 	}
+	// Inline-task interception currently creates at most one pending task per
+	// turn; this bounded sequential rollback is fine for that invariant.
+	// Parallelize if a future flow can buffer multiple pending inline tasks.
 	for _, h := range sink.holds {
 		if h.Pending.PendingTaskID == "" || h.Pending.UserID == "" {
 			continue
 		}
 		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		_ = pendingCreator.ExpireInlineTask(rollbackCtx, h.Pending.PendingTaskID, h.Pending.UserID)
+		err := pendingCreator.ExpireInlineTask(rollbackCtx, h.Pending.PendingTaskID, h.Pending.UserID)
 		cancel()
+		if err != nil && cfg.Trace != nil {
+			cfg.Trace.Emit(map[string]any{
+				"event":       "inline_task.rollback_expire_failed",
+				"request_id":  cfg.RequestID,
+				"user_id":     h.Pending.UserID,
+				"agent_id":    h.Pending.AgentID,
+				"approval_id": h.Pending.ID,
+				"task_id":     h.Pending.PendingTaskID,
+				"err":         err.Error(),
+			})
+		}
 	}
 }
 

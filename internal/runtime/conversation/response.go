@@ -112,11 +112,15 @@ type ResponseRegistry struct {
 	rewriters []ResponseRewriter
 }
 
+func NewResponseRegistry(rewriters ...ResponseRewriter) *ResponseRegistry {
+	return &ResponseRegistry{rewriters: rewriters}
+}
+
 func DefaultResponseRegistry() *ResponseRegistry {
-	return &ResponseRegistry{rewriters: []ResponseRewriter{
+	return NewResponseRegistry(
 		&AnthropicResponseRewriter{},
 		&OpenAIResponseRewriter{},
-	}}
+	)
 }
 
 func (r *ResponseRegistry) ForProviderStreaming(p Provider) StreamingResponseRewriter {

@@ -160,3 +160,33 @@ func TestRollbackBufferedPendingTasks_ExpiresOnlyInlineTaskHolds(t *testing.T) {
 		t.Fatalf("rollback should expire operational orphans, not deny them as user action")
 	}
 }
+
+func TestRollbackBufferedPendingTasks_TracesExpireFailure(t *testing.T) {
+	ctx := context.Background()
+	creator := &capturingInlineCreator{expireFail: true}
+	sink := &capturedHoldSink{
+		holds: []capturedHold{{
+			Pending: PendingLiteApproval{
+				ID:            "cv-inline-rollback",
+				UserID:        "u",
+				AgentID:       "a",
+				PendingTaskID: "task-rollback",
+			},
+		}},
+	}
+	var buf bytes.Buffer
+
+	rollbackBufferedPendingTasks(ctx, PostprocessConfig{
+		InlineTaskCreator: creator,
+		RequestID:         "req-rollback-trace",
+		Trace:             NewTraceLogger(&buf),
+	}, sink)
+
+	out := buf.String()
+	if !strings.Contains(out, "inline_task.rollback_expire_failed") {
+		t.Fatalf("trace missing rollback-expire failure event: %s", out)
+	}
+	if !strings.Contains(out, "task-rollback") {
+		t.Fatalf("trace missing task id: %s", out)
+	}
+}

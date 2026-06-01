@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/clawvisor/clawvisor/internal/api/middleware"
+	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/inspector"
 	runtimetasks "github.com/clawvisor/clawvisor/internal/runtime/tasks"
@@ -279,6 +281,53 @@ func TestPostprocess_ReplayFailureExpiresPendingInlineTask(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("expected pending inline task row to be created before replay failure")
+	}
+	if got.Status != "expired" {
+		t.Fatalf("task status=%q, want expired rollback state", got.Status)
+	}
+	if got.ApprovalSource != "inline_chat" {
+		t.Fatalf("approval_source=%q, want inline_chat", got.ApprovalSource)
+	}
+}
+
+func TestPostprocess_RewriterFailureExpiresPendingInlineTask(t *testing.T) {
+	h, st, _, agent := newInlineTasksHandlerForTest(t)
+	ctx := context.Background()
+
+	taskBody := `{"purpose":"Rollback user's rewriter failure task","intent_verification_mode":"strict","expires_in_seconds":600,"expected_tools":[{"tool_name":"Bash","why":"Create files"}]}`
+	req := httptest.NewRequest("POST", "/api/v1/messages?beta=true", nil)
+	result := llmproxy.Postprocess(req, anthropicInlineTaskPostBody(t, taskBody), "application/json", llmproxy.PostprocessConfig{
+		Inspector:         inspector.NewInspector(inspector.DefaultParser{}, inspector.AmbiguousValidator{}),
+		RewriteOpts:       inspector.DefaultRewriteOpts("http://localhost:25297"),
+		AgentUserID:       agent.UserID,
+		AgentID:           agent.ID,
+		AgentName:         agent.Name,
+		ControlBaseURL:    "http://localhost:25297",
+		PendingApprovals:  llmproxy.NewMemoryPendingApprovalCache(time.Minute),
+		InlineTaskCreator: h,
+		ResponseRegistry:  conversation.NewResponseRegistry(evalThenErrorRewriter{}),
+	})
+
+	if result.Body != nil {
+		t.Fatalf("Postprocess should fail closed after rewriter failure; got %d body bytes", len(result.Body))
+	}
+	if !strings.Contains(result.SkippedReason, "rewriter error") {
+		t.Fatalf("SkippedReason=%q, want rewriter error", result.SkippedReason)
+	}
+
+	tasks, _, err := st.ListTasks(ctx, agent.UserID, store.TaskFilter{})
+	if err != nil {
+		t.Fatalf("ListTasks: %v", err)
+	}
+	var got *store.Task
+	for _, task := range tasks {
+		if task.Purpose == "Rollback user's rewriter failure task" {
+			got = task
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("expected pending inline task row to be created before rewriter failure")
 	}
 	if got.Status != "expired" {
 		t.Fatalf("task status=%q, want expired rollback state", got.Status)
@@ -626,4 +675,36 @@ func (c *failingInlineTaskHoldCache) Resolve(context.Context, llmproxy.ResolveRe
 
 func (c *failingInlineTaskHoldCache) Drop(context.Context, llmproxy.ResolveRequest) error {
 	return nil
+}
+
+type evalThenErrorRewriter struct{}
+
+func (evalThenErrorRewriter) Name() conversation.Provider { return conversation.ProviderAnthropic }
+
+func (evalThenErrorRewriter) MatchesResponse(*http.Request, *http.Response) bool { return true }
+
+func (evalThenErrorRewriter) Rewrite(body []byte, _ string, eval conversation.ToolUseEvaluator) (conversation.RewriteResult, error) {
+	var resp struct {
+		Content []struct {
+			Type  string          `json:"type"`
+			ID    string          `json:"id"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return conversation.RewriteResult{}, err
+	}
+	for idx, block := range resp.Content {
+		if block.Type != "tool_use" {
+			continue
+		}
+		eval(conversation.ToolUse{
+			ID:    block.ID,
+			Index: idx,
+			Name:  block.Name,
+			Input: block.Input,
+		})
+	}
+	return conversation.RewriteResult{}, errors.New("simulated rewriter failure after eval")
 }
