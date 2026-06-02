@@ -328,6 +328,7 @@ func rewriteApprovedHeldToolUse(ctx context.Context, req ReleaseRequest, held He
 			ToolRules:         req.ToolRules,
 			EgressRules:       req.EgressRules,
 			IntentVerifier:    decisionIntentVerifier{inner: req.IntentVerifier},
+			PreferredTaskID:   held.Fingerprint.TaskID,
 			AllowMissingScope: true,
 		}
 		dec, err := runtimedecision.EvaluateAuthorization(ctx, decisionInput)
@@ -362,17 +363,18 @@ func rewriteApprovedHeldToolUse(ctx context.Context, req ReleaseRequest, held He
 		resolved, _ = req.Catalog.Resolve(verdict.Host, verdict.Method, verdict.Path)
 	}
 	decisionInput := runtimedecision.AuthorizationInput{
-		ToolUse:        held.ToolUse,
-		UserID:         req.Agent.UserID,
-		AgentID:        req.Agent.ID,
-		Posture:        req.Posture,
-		Target:         runtimedecision.TargetRequest{Host: verdict.Host, Method: verdict.Method, Path: verdict.Path},
-		Service:        resolved.ServiceID,
-		Action:         resolved.ActionID,
-		CandidateTasks: req.CandidateTasks,
-		ToolRules:      req.ToolRules,
-		EgressRules:    req.EgressRules,
-		IntentVerifier: decisionIntentVerifier{inner: req.IntentVerifier},
+		ToolUse:         held.ToolUse,
+		UserID:          req.Agent.UserID,
+		AgentID:         req.Agent.ID,
+		Posture:         req.Posture,
+		Target:          runtimedecision.TargetRequest{Host: verdict.Host, Method: verdict.Method, Path: verdict.Path},
+		Service:         resolved.ServiceID,
+		Action:          resolved.ActionID,
+		CandidateTasks:  req.CandidateTasks,
+		ToolRules:       req.ToolRules,
+		EgressRules:     req.EgressRules,
+		IntentVerifier:  decisionIntentVerifier{inner: req.IntentVerifier},
+		PreferredTaskID: held.Fingerprint.TaskID,
 	}
 	dec, err := runtimedecision.EvaluateAuthorization(ctx, decisionInput)
 	if err != nil {
