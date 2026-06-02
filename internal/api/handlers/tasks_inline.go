@@ -99,10 +99,14 @@ func (h *TasksHandler) createInlineApprovedTask(ctx context.Context, agent *stor
 
 	lifetime := req.Lifetime
 	if lifetime == "" {
-		lifetime = "session"
+		// Inline (proxy-mediated) task creation defaults to sliding so
+		// long-running agent workflows don't dead-end on a fixed
+		// expiry. Direct /api/tasks callers still default to session;
+		// see tasks.go.
+		lifetime = "sliding"
 	}
-	if lifetime != "session" && lifetime != "standing" {
-		return nil, fmt.Errorf("invalid lifetime %q (want session or standing)", req.Lifetime)
+	if lifetime != "session" && lifetime != "standing" && lifetime != "sliding" {
+		return nil, fmt.Errorf("invalid lifetime %q (want session, sliding, or standing)", req.Lifetime)
 	}
 
 	if lifetime == "standing" && req.ExpiresInSeconds > 0 {
@@ -415,10 +419,12 @@ func (h *TasksHandler) CreatePendingInlineTask(ctx context.Context, agent *store
 
 	lifetime := req.Lifetime
 	if lifetime == "" {
-		lifetime = "session"
+		// Match createInlineApprovedTask: the proxy-mediated path
+		// defaults to sliding.
+		lifetime = "sliding"
 	}
-	if lifetime != "session" && lifetime != "standing" {
-		return "", fmt.Errorf("invalid lifetime %q (want session or standing)", req.Lifetime)
+	if lifetime != "session" && lifetime != "standing" && lifetime != "sliding" {
+		return "", fmt.Errorf("invalid lifetime %q (want session, sliding, or standing)", req.Lifetime)
 	}
 
 	if lifetime == "standing" && req.ExpiresInSeconds > 0 {

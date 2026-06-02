@@ -183,6 +183,10 @@ type Store interface {
 	UpdateTaskApprovedFrom(ctx context.Context, id, fromStatus string, expiresAt time.Time, authorizedActions []TaskAction) (bool, error)
 	UpdateTaskAuthorizedActions(ctx context.Context, id string, actions []TaskAction) error
 	UpdateTaskActions(ctx context.Context, id string, actions []TaskAction, expiresAt time.Time) error
+	// UpdateTaskExpiresAt sets expires_at unconditionally. Callers are
+	// responsible for choosing the new value (e.g., the sliding-lifetime
+	// path in llmproxy uses max(current, now+slide) before calling).
+	UpdateTaskExpiresAt(ctx context.Context, id string, expiresAt time.Time) error
 	IncrementTaskRequestCount(ctx context.Context, id string) error
 	SetTaskPendingExpansion(ctx context.Context, id string, action *TaskAction, reason string) error
 	ListExpiredTasks(ctx context.Context) ([]*Task, error)
@@ -782,7 +786,7 @@ type Task struct {
 	AgentID                string          `json:"agent_id"`
 	Purpose                string          `json:"purpose"`
 	Status                 string          `json:"status"`   // pending_approval | active | completed | expired | denied | cancelled | pending_scope_expansion | revoked
-	Lifetime               string          `json:"lifetime"` // session | standing
+	Lifetime               string          `json:"lifetime"` // session | sliding | standing
 	AuthorizedActions      []TaskAction    `json:"authorized_actions"`
 	PlannedCalls           []PlannedCall   `json:"planned_calls,omitempty"`
 	ExpectedTools          json.RawMessage `json:"expected_tools,omitempty"`
