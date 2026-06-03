@@ -179,6 +179,8 @@ func (h *AgentsHandler) UpdateRuntimeSettings(w http.ResponseWriter, r *http.Req
 		InjectStoredBearer               bool    `json:"inject_stored_bearer"`
 		LiteProxySecretDetectionDisabled *bool   `json:"lite_proxy_secret_detection_disabled"`
 		ConversationAutoApproveThreshold *string `json:"conversation_auto_approve_threshold"`
+		MaxCostMicros                    *int64  `json:"max_cost_micros"`
+		MaxTokens                        *int64  `json:"max_tokens"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -220,6 +222,8 @@ func (h *AgentsHandler) UpdateRuntimeSettings(w http.ResponseWriter, r *http.Req
 	if body.LiteProxySecretDetectionDisabled != nil {
 		settings.LiteProxySecretDetectionDisabled = *body.LiteProxySecretDetectionDisabled
 	}
+	settings.MaxCostMicros = body.MaxCostMicros
+	settings.MaxTokens = body.MaxTokens
 	if err := h.st.UpsertAgentRuntimeSettings(r.Context(), settings); err != nil {
 		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "could not save agent runtime settings")
 		return
