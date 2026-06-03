@@ -206,6 +206,28 @@ func TestEvaluateBudget_CachedOverride(t *testing.T) {
 	if res.Blocked || res.Warning {
 		t.Fatalf("expected override to allow request, got: %+v", res)
 	}
+
+	// 5. Test agent-level override unblocks task-scoped request falling back to agent budget
+	expiresAt := time.Now().Add(1 * time.Hour)
+	task := &store.Task{
+		ID:        "task-123",
+		UserID:    agent.UserID,
+		AgentID:   agent.ID,
+		Status:    "active",
+		CreatedAt: time.Now(),
+		ExpiresAt: &expiresAt,
+	}
+	if err := st.CreateTask(ctx, task); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	res, err = EvaluateBudget(ctx, st, approvals, overrides, agent, "task-123", conversation.ProviderAnthropic, "conv-1")
+	if err != nil {
+		t.Fatalf("EvaluateBudget with task fallback: %v", err)
+	}
+	if res.Blocked || res.Warning {
+		t.Fatalf("expected agent override to unblock task fallback request, got: %+v", res)
+	}
 }
 
 func TestRewriteBudgetApprovalReply_ResolvesHold(t *testing.T) {
@@ -303,20 +325,78 @@ func TestRateLimitTracker_ThrottleDelay(t *testing.T) {
 	header.Set("anthropic-ratelimit-tokens-remaining", "900")
 	header.Set("anthropic-ratelimit-tokens-reset", "60")
 
-	tracker.Update("agent-1", "claude-3-5-sonnet", header)
-	delay := tracker.ThrottleDelay("agent-1", "claude-3-5-sonnet")
+	tracker.Update("agent-1", "anthropic", "claude-3-5-sonnet", header)
+	delay := tracker.ThrottleDelay("agent-1", "anthropic", "claude-3-5-sonnet")
 	if delay != 0 {
 		t.Fatalf("expected no delay under normal rate limits, got %v", delay)
 	}
 
 	// Update with critical requests remaining (under 10%)
 	header.Set("anthropic-ratelimit-requests-remaining", "5")
-	tracker.Update("agent-1", "claude-3-5-sonnet", header)
-	delay = tracker.ThrottleDelay("agent-1", "claude-3-5-sonnet")
+	tracker.Update("agent-1", "anthropic", "claude-3-5-sonnet", header)
+	delay = tracker.ThrottleDelay("agent-1", "anthropic", "claude-3-5-sonnet")
 	if delay == 0 {
 		t.Fatalf("expected throttling delay, got 0")
 	}
 	if delay > 5*time.Second {
 		t.Errorf("expected delay capped at 5s, got %v", delay)
+	}
+}
+
+func TestEvaluateBudget_TaskRules(t *testing.T) {
+	st, agent := newBudgetTestStore(t)
+	ctx := context.Background()
+
+	approvals := NewMemoryPendingApprovalCache(10 * time.Minute)
+	overrides := NewBudgetOverrideCache()
+
+	// 1. Create a task with a budget
+	expiresAt := time.Now().Add(1 * time.Hour)
+	limitCost := int64(1000) // $0.001
+	limitTokens := int64(100)
+	task := &store.Task{
+		ID:            "task-budget",
+		UserID:        agent.UserID,
+		AgentID:       agent.ID,
+		Status:        "active",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     &expiresAt,
+		MaxCostMicros: &limitCost,
+		MaxTokens:     &limitTokens,
+	}
+	if err := st.CreateTask(ctx, task); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	// 2. Under budget check (Spend is 0)
+	res, err := EvaluateBudget(ctx, st, approvals, overrides, agent, "task-budget", conversation.ProviderAnthropic, "conv-1")
+	if err != nil {
+		t.Fatalf("EvaluateBudget: %v", err)
+	}
+	if res.Blocked || res.Refused || res.Warning {
+		t.Fatalf("expected clean result, got: %+v", res)
+	}
+
+	// 3. Spend is 90% (900 micros) -> Warning triggers!
+	recordMockCost(ctx, t, st, agent, "task-budget", 900, 90, "audit-task-warning", "req-task-warning")
+	res, err = EvaluateBudget(ctx, st, approvals, overrides, agent, "task-budget", conversation.ProviderAnthropic, "conv-1")
+	if err != nil {
+		t.Fatalf("EvaluateBudget: %v", err)
+	}
+	if !res.Blocked || !res.Warning || res.Refused {
+		t.Fatalf("expected warning block, got: %+v", res)
+	}
+	if !strings.Contains(res.Message, "budget is at 90%") {
+		t.Errorf("expected budget message, got: %q", res.Message)
+	}
+
+	// 4. Spent 1500 micros -> Hard refusal!
+	recordMockCost(ctx, t, st, agent, "task-budget", 600, 60, "audit-task-exceeded", "req-task-exceeded")
+	res, err = EvaluateBudget(ctx, st, approvals, overrides, agent, "task-budget", conversation.ProviderAnthropic, "conv-1")
+	if err != nil {
+		t.Fatalf("EvaluateBudget: %v", err)
+	}
+	if !res.Blocked || !res.Refused || res.Warning {
+		t.Fatalf("expected hard refusal, got: %+v", res)
 	}
 }

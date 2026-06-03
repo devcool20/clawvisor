@@ -68,7 +68,7 @@ func NewRateLimitTracker() *RateLimitTracker {
 	}
 }
 
-func (t *RateLimitTracker) Update(agentID, model string, header http.Header) {
+func (t *RateLimitTracker) Update(agentID, provider, model string, header http.Header) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -92,7 +92,7 @@ func (t *RateLimitTracker) Update(agentID, model string, header http.Header) {
 	}
 
 	if reqLimit > 0 || tokLimit > 0 {
-		key := agentID + ":" + pricing.Normalize(model)
+		key := agentID + ":" + provider + ":" + pricing.Normalize(model)
 		t.states[key] = RateLimitState{
 			RequestsLimit:     reqLimit,
 			RequestsRemaining: reqRem,
@@ -105,11 +105,11 @@ func (t *RateLimitTracker) Update(agentID, model string, header http.Header) {
 	}
 }
 
-func (t *RateLimitTracker) ThrottleDelay(agentID, model string) time.Duration {
+func (t *RateLimitTracker) ThrottleDelay(agentID, provider, model string) time.Duration {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	key := agentID + ":" + pricing.Normalize(model)
+	key := agentID + ":" + provider + ":" + pricing.Normalize(model)
 	state, ok := t.states[key]
 	if !ok || time.Since(state.LastUpdated) > 10*time.Minute {
 		return 0
@@ -148,27 +148,43 @@ type EvaluateBudgetResult struct {
 func EvaluateBudget(ctx context.Context, db store.Store, approvals PendingApprovalCache, overrides *BudgetOverrideCache, agent *store.Agent, taskID string, provider conversation.Provider, conversationID string) (EvaluateBudgetResult, error) {
 	var limitCost, limitTokens *int64
 	var currentCost, currentTokens int64
+	enforcingTaskBudget := false
 
 	if taskID != "" {
 		task, err := db.GetTask(ctx, taskID)
+		if err != nil && err != store.ErrNotFound {
+			return EvaluateBudgetResult{}, err
+		}
 		if err == nil && task != nil {
 			limitCost = task.MaxCostMicros
 			limitTokens = task.MaxTokens
-			summary, err := db.GetTaskCost(ctx, agent.UserID, taskID)
-			if err == nil && summary != nil {
-				currentCost = summary.CostMicros
-				currentTokens = summary.InputTokens + summary.OutputTokens
+			if limitCost != nil || limitTokens != nil {
+				enforcingTaskBudget = true
+				summary, err := db.GetTaskCost(ctx, agent.UserID, taskID)
+				if err != nil {
+					return EvaluateBudgetResult{}, err
+				}
+				if summary != nil {
+					currentCost = summary.CostMicros
+					currentTokens = summary.InputTokens + summary.OutputTokens
+				}
 			}
 		}
 	}
 
-	if limitCost == nil && limitTokens == nil {
+	if !enforcingTaskBudget {
 		settings, err := db.GetAgentRuntimeSettings(ctx, agent.ID)
+		if err != nil && err != store.ErrNotFound {
+			return EvaluateBudgetResult{}, err
+		}
 		if err == nil && settings != nil {
 			limitCost = settings.MaxCostMicros
 			limitTokens = settings.MaxTokens
 			summary, err := db.GetAgentCost(ctx, agent.UserID, agent.ID)
-			if err == nil && summary != nil {
+			if err != nil {
+				return EvaluateBudgetResult{}, err
+			}
+			if summary != nil {
 				currentCost = summary.CostMicros
 				currentTokens = summary.InputTokens + summary.OutputTokens
 			}
@@ -179,8 +195,10 @@ func EvaluateBudget(ctx context.Context, db store.Store, approvals PendingApprov
 		return EvaluateBudgetResult{}, nil
 	}
 
-	overrideID := fmt.Sprintf("task:%s", taskID)
-	if taskID == "" {
+	var overrideID string
+	if enforcingTaskBudget {
+		overrideID = fmt.Sprintf("task:%s", taskID)
+	} else {
 		overrideID = fmt.Sprintf("agent:%s", agent.ID)
 	}
 

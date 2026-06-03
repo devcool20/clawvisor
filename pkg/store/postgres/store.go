@@ -825,14 +825,55 @@ func (s *Store) RecordLLMRequestCost(ctx context.Context, c *store.LLMRequestCos
 	return err
 }
 
-// GetTaskCost rolls up llm_request_cost rows for one task. See the
-// sqlite copy for the contract.
-func (s *Store) GetTaskCost(ctx context.Context, userID, taskID string) (*store.TaskCostSummary, error) {
-	out := &store.TaskCostSummary{
-		TaskID:        taskID,
+type costAccumulator struct {
+	RequestCount     int
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	CostMicros       int64
+	UnknownModels    []string
+	ByModel          []store.TaskCostByModelEntry
+}
+
+func scanAndAccumulateCost(rows pgx.Rows) (*costAccumulator, error) {
+	acc := &costAccumulator{
 		ByModel:       []store.TaskCostByModelEntry{},
 		UnknownModels: []string{},
 	}
+	unknownModels := map[string]struct{}{}
+	for rows.Next() {
+		var e store.TaskCostByModelEntry
+		var unknownRows int64
+		if err := rows.Scan(&e.Model, &e.RequestCount, &e.InputTokens, &e.OutputTokens,
+			&e.CacheReadTokens, &e.CacheWriteTokens, &e.CostMicros, &unknownRows); err != nil {
+			return nil, err
+		}
+		e.Known = unknownRows == 0
+		if !e.Known {
+			unknownModels[e.Model] = struct{}{}
+		}
+		acc.ByModel = append(acc.ByModel, e)
+		acc.RequestCount += e.RequestCount
+		acc.InputTokens += e.InputTokens
+		acc.OutputTokens += e.OutputTokens
+		acc.CacheReadTokens += e.CacheReadTokens
+		acc.CacheWriteTokens += e.CacheWriteTokens
+		acc.CostMicros += e.CostMicros
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for m := range unknownModels {
+		acc.UnknownModels = append(acc.UnknownModels, m)
+	}
+	sort.Strings(acc.UnknownModels)
+	return acc, nil
+}
+
+// GetTaskCost rolls up llm_request_cost rows for one task. See the
+// sqlite copy for the contract.
+func (s *Store) GetTaskCost(ctx context.Context, userID, taskID string) (*store.TaskCostSummary, error) {
 	// Postgres' SUM(bigint) widens to NUMERIC; pgx can't scan that
 	// into int64. Cast each SUM back to bigint so the column type
 	// matches the destination. Token columns are INTEGER → SUM is
@@ -861,42 +902,26 @@ func (s *Store) GetTaskCost(ctx context.Context, userID, taskID string) (*store.
 		return nil, err
 	}
 	defer rows.Close()
-	unknownModels := map[string]struct{}{}
-	for rows.Next() {
-		var e store.TaskCostByModelEntry
-		var unknownRows int64
-		if err := rows.Scan(&e.Model, &e.RequestCount, &e.InputTokens, &e.OutputTokens,
-			&e.CacheReadTokens, &e.CacheWriteTokens, &e.CostMicros, &unknownRows); err != nil {
-			return nil, err
-		}
-		e.Known = unknownRows == 0
-		if !e.Known {
-			unknownModels[e.Model] = struct{}{}
-		}
-		out.ByModel = append(out.ByModel, e)
-		out.RequestCount += e.RequestCount
-		out.InputTokens += e.InputTokens
-		out.OutputTokens += e.OutputTokens
-		out.CacheReadTokens += e.CacheReadTokens
-		out.CacheWriteTokens += e.CacheWriteTokens
-		out.CostMicros += e.CostMicros
-	}
-	if err := rows.Err(); err != nil {
+
+	acc, err := scanAndAccumulateCost(rows)
+	if err != nil {
 		return nil, err
 	}
-	for m := range unknownModels {
-		out.UnknownModels = append(out.UnknownModels, m)
-	}
-	sort.Strings(out.UnknownModels)
-	return out, nil
+
+	return &store.TaskCostSummary{
+		TaskID:           taskID,
+		RequestCount:     acc.RequestCount,
+		InputTokens:      acc.InputTokens,
+		OutputTokens:     acc.OutputTokens,
+		CacheReadTokens:  acc.CacheReadTokens,
+		CacheWriteTokens: acc.CacheWriteTokens,
+		CostMicros:       acc.CostMicros,
+		UnknownModels:    acc.UnknownModels,
+		ByModel:          acc.ByModel,
+	}, nil
 }
 
 func (s *Store) GetAgentCost(ctx context.Context, userID, agentID string) (*store.AgentCostSummary, error) {
-	out := &store.AgentCostSummary{
-		AgentID:       agentID,
-		ByModel:       []store.TaskCostByModelEntry{},
-		UnknownModels: []string{},
-	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT model,
 		       COUNT(*)::integer AS n,
@@ -914,34 +939,23 @@ func (s *Store) GetAgentCost(ctx context.Context, userID, agentID string) (*stor
 		return nil, err
 	}
 	defer rows.Close()
-	unknownModels := map[string]struct{}{}
-	for rows.Next() {
-		var e store.TaskCostByModelEntry
-		var unknownRows int64
-		if err := rows.Scan(&e.Model, &e.RequestCount, &e.InputTokens, &e.OutputTokens,
-			&e.CacheReadTokens, &e.CacheWriteTokens, &e.CostMicros, &unknownRows); err != nil {
-			return nil, err
-		}
-		e.Known = unknownRows == 0
-		if !e.Known {
-			unknownModels[e.Model] = struct{}{}
-		}
-		out.ByModel = append(out.ByModel, e)
-		out.RequestCount += e.RequestCount
-		out.InputTokens += e.InputTokens
-		out.OutputTokens += e.OutputTokens
-		out.CacheReadTokens += e.CacheReadTokens
-		out.CacheWriteTokens += e.CacheWriteTokens
-		out.CostMicros += e.CostMicros
-	}
-	if err := rows.Err(); err != nil {
+
+	acc, err := scanAndAccumulateCost(rows)
+	if err != nil {
 		return nil, err
 	}
-	for m := range unknownModels {
-		out.UnknownModels = append(out.UnknownModels, m)
-	}
-	sort.Strings(out.UnknownModels)
-	return out, nil
+
+	return &store.AgentCostSummary{
+		AgentID:          agentID,
+		RequestCount:     acc.RequestCount,
+		InputTokens:      acc.InputTokens,
+		OutputTokens:     acc.OutputTokens,
+		CacheReadTokens:  acc.CacheReadTokens,
+		CacheWriteTokens: acc.CacheWriteTokens,
+		CostMicros:       acc.CostMicros,
+		UnknownModels:    acc.UnknownModels,
+		ByModel:          acc.ByModel,
+	}, nil
 }
 
 func (s *Store) UpdateAuditOutcome(ctx context.Context, id, outcome, errMsg string, durationMS int) error {

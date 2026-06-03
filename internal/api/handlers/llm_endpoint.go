@@ -749,7 +749,7 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 
 	// Rate limit throttle
 	if h.RateLimits != nil {
-		if delay := h.RateLimits.ThrottleDelay(agent.ID, reqSummary.Model); delay > 0 {
+		if delay := h.RateLimits.ThrottleDelay(agent.ID, string(provider), reqSummary.Model); delay > 0 {
 			h.Logger.InfoContext(r.Context(), "rate limit throttling active, sleeping thread", "delay_ms", delay.Milliseconds())
 			select {
 			case <-r.Context().Done():
@@ -796,7 +796,7 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	if h.RateLimits != nil {
-		h.RateLimits.Update(agent.ID, reqSummary.Model, resp.Header)
+		h.RateLimits.Update(agent.ID, string(provider), reqSummary.Model, resp.Header)
 	}
 	upstreamHeadersMs := time.Since(forwardStart).Milliseconds()
 	auditStatus = resp.StatusCode
