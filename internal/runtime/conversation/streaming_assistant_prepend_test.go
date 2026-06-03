@@ -411,3 +411,82 @@ func numAsInt(v any) int {
 	}
 	return -1
 }
+
+func TestStreamingFirstTurnNoticeWriter_Anthropic_ThinkingBlockIndexCollision(t *testing.T) {
+	upstream := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_x","role":"assistant","model":"claude-sonnet-4"}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"thinking text"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	var buf bytes.Buffer
+	w := NewStreamingFirstTurnNoticeWriter(&buf, StreamShapeAnthropicMessages, "[Clawvisor] notice")
+	writeInChunks(t, w, upstream, 17)
+	if c, ok := w.(io.Closer); ok {
+		_ = c.Close()
+	}
+
+	got := buf.String()
+	events, err := parseSSEEvents([]byte(got))
+	if err != nil {
+		t.Fatalf("parseSSEEvents: %v", err)
+	}
+
+	var noticeIndex, thinkingIndex, textIndex int
+	noticeIndex, thinkingIndex, textIndex = -1, -1, -1
+
+	for _, ev := range events {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(ev.Data), &obj); err != nil {
+			continue
+		}
+		if ev.Event == "content_block_start" {
+			cb, _ := obj["content_block"].(map[string]any)
+			idx := numAsInt(obj["index"])
+			if cb != nil {
+				switch cb["type"] {
+				case "text":
+					if noticeIndex == -1 {
+						noticeIndex = idx
+					} else {
+						textIndex = idx
+					}
+				case "thinking":
+					thinkingIndex = idx
+				}
+			}
+		}
+	}
+
+	t.Logf("Indices: notice=%d, thinking=%d, text=%d", noticeIndex, thinkingIndex, textIndex)
+	
+	// We expect the bug to shift thinking to index 1 and text to index 2, instead of keeping thinking at 0
+	if thinkingIndex != 0 {
+		t.Errorf("EXPECTED BUG: thinking block got shifted to index %d instead of remaining at 0", thinkingIndex)
+	}
+}
+

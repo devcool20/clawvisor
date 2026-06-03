@@ -250,10 +250,31 @@ func (s *streamingPrependWriter) flushAnthropic(event, data string) {
 	switch event {
 	case "message_start":
 		s.passThrough(event, data)
+
+	case "content_block_start":
 		if !s.noticeInjected {
+			var cbs struct {
+				Index        int `json:"index"`
+				ContentBlock struct {
+					Type string `json:"type"`
+				} `json:"content_block"`
+			}
+			err := json.Unmarshal([]byte(data), &cbs)
+			if err == nil && cbs.ContentBlock.Type == "thinking" {
+				// Keep thinking block at index 0, do not inject notice yet.
+				s.passThrough(event, data)
+				return
+			}
+
+			// We need to inject the notice block at the current index.
+			idx := 0
+			if err == nil {
+				idx = cbs.Index
+			}
+
 			s.emitJSON("content_block_start", map[string]any{
 				"type":  "content_block_start",
-				"index": 0,
+				"index": idx,
 				"content_block": map[string]any{
 					"type": "text",
 					"text": "",
@@ -261,16 +282,34 @@ func (s *streamingPrependWriter) flushAnthropic(event, data string) {
 			})
 			s.emitJSON("content_block_delta", map[string]any{
 				"type":  "content_block_delta",
-				"index": 0,
+				"index": idx,
 				"delta": map[string]any{"type": "text_delta", "text": s.text},
 			})
 			s.emitJSON("content_block_stop", map[string]any{
 				"type":  "content_block_stop",
-				"index": 0,
+				"index": idx,
 			})
 			s.noticeInjected = true
+
+			// Shift the current block by 1 and emit.
+			shifted, ok := shiftAnthropicEventIndex(event, data, 1)
+			if !ok {
+				s.passThrough(event, data)
+				return
+			}
+			s.emitEvent(event, string(shifted))
+			return
 		}
-	case "content_block_start", "content_block_delta", "content_block_stop":
+
+		// Notice is already injected. Shift the current block by 1.
+		shifted, ok := shiftAnthropicEventIndex(event, data, 1)
+		if !ok {
+			s.passThrough(event, data)
+			return
+		}
+		s.emitEvent(event, string(shifted))
+
+	case "content_block_delta", "content_block_stop":
 		if !s.noticeInjected {
 			s.passThrough(event, data)
 			return
@@ -281,6 +320,7 @@ func (s *streamingPrependWriter) flushAnthropic(event, data string) {
 			return
 		}
 		s.emitEvent(event, string(shifted))
+
 	default:
 		s.passThrough(event, data)
 	}
