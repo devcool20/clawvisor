@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -175,22 +176,74 @@ func (a *GmailAdapter) listMessages(ctx context.Context, client *http.Client, pa
 	labels := newLabelResolver(ctx, client)
 	items := make([]msgListItem, 0, len(listResp.Messages))
 	unread := 0
-	for _, m := range listResp.Messages {
-		meta, err := fetchMessageMeta(ctx, client, m.ID)
-		if err != nil {
+
+	type fetchResult struct {
+		index int
+		meta  msgMeta
+		err   error
+	}
+
+	numMessages := len(listResp.Messages)
+	results := make([]fetchResult, numMessages)
+
+	concurrency := 15
+	if concurrency > numMessages {
+		concurrency = numMessages
+	}
+
+	if concurrency > 0 {
+		type task struct {
+			index int
+			id    string
+		}
+		tasksChan := make(chan task, numMessages)
+		resultsChan := make(chan fetchResult, numMessages)
+
+		var wg sync.WaitGroup
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for t := range tasksChan {
+					if ctx.Err() != nil {
+						resultsChan <- fetchResult{index: t.index, err: ctx.Err()}
+						continue
+					}
+					meta, err := fetchMessageMeta(ctx, client, t.id)
+					resultsChan <- fetchResult{index: t.index, meta: meta, err: err}
+				}
+			}()
+		}
+
+		for i, m := range listResp.Messages {
+			tasksChan <- task{index: i, id: m.ID}
+		}
+		close(tasksChan)
+
+		wg.Wait()
+		close(resultsChan)
+
+		for res := range resultsChan {
+			results[res.index] = res
+		}
+	}
+
+	for i, m := range listResp.Messages {
+		res := results[i]
+		if res.err != nil {
 			continue
 		}
 		item := msgListItem{
 			ID:       m.ID,
-			From:     format.SanitizeHeader(meta.from, format.MaxFieldLen),
-			Subject:  format.SanitizeText(meta.subject, format.MaxFieldLen),
-			Snippet:  format.SanitizeText(meta.snippet, format.MaxSnippetLen),
-			Date:     meta.date,
-			IsUnread: meta.isUnread,
-			Labels:   labels.resolve(meta.labelIDs),
+			From:     format.SanitizeHeader(res.meta.from, format.MaxFieldLen),
+			Subject:  format.SanitizeText(res.meta.subject, format.MaxFieldLen),
+			Snippet:  format.SanitizeText(res.meta.snippet, format.MaxSnippetLen),
+			Date:     res.meta.date,
+			IsUnread: res.meta.isUnread,
+			Labels:   labels.resolve(res.meta.labelIDs),
 		}
 		items = append(items, item)
-		if meta.isUnread {
+		if res.meta.isUnread {
 			unread++
 		}
 	}

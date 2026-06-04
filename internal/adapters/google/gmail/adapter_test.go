@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -630,3 +631,105 @@ func TestSendMessage_WithInReplyTo_ResolvesThreadAndQuotesPreviousMessage(t *tes
 		t.Errorf("missing gmail quote HTML in MIME: %s", msg)
 	}
 }
+
+func TestListMessages_Concurrency(t *testing.T) {
+	client := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			t.Logf("Mock received request: %s %s", req.Method, req.URL.String())
+			var body string
+			switch {
+			case req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/messages") && !strings.Contains(req.URL.Path, "/msg-"):
+				body = `{
+					"messages": [
+						{"id": "msg-1"},
+						{"id": "msg-2"},
+						{"id": "msg-3"},
+						{"id": "msg-4"},
+						{"id": "msg-5"}
+					],
+					"resultSizeEstimate": 5
+				}`
+			case req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/messages/msg-"):
+				// Extract msg ID from URL path (e.g. "/messages/msg-1")
+				parts := strings.Split(req.URL.Path, "/")
+				msgID := parts[len(parts)-1]
+				body = fmt.Sprintf(`{
+					"snippet": "Snippet for %s",
+					"labelIds": ["INBOX", "UNREAD"],
+					"payload": {
+						"headers": [
+							{"name": "From", "value": "sender-%s@example.com"},
+							{"name": "Subject", "value": "Subject %s"},
+							{"name": "Date", "value": "Date-%s"}
+						]
+					}
+				}`, msgID, msgID, msgID, msgID)
+			default:
+				t.Logf("Unexpected request in mock: %s %s", req.Method, req.URL.String())
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Body:       io.NopCloser(strings.NewReader("not found")),
+				}, nil
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		}),
+	}
+
+	adapter := &GmailAdapter{}
+	res, err := adapter.listMessages(context.Background(), client, map[string]any{
+		"max_results": 5,
+	})
+	if err != nil {
+		t.Fatalf("listMessages error: %v", err)
+	}
+	if res == nil {
+		t.Fatal("listMessages returned nil result")
+	}
+
+	data, ok := res.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map[string]any for Data, got %T", res.Data)
+	}
+	messagesRaw, ok := data["messages"]
+	if !ok {
+		t.Fatalf("result data missing messages field: %v", res.Data)
+	}
+	messages, ok := messagesRaw.([]msgListItem)
+	if !ok {
+		t.Fatalf("expected []msgListItem, got %T", messagesRaw)
+	}
+
+	t.Logf("Fetched messages count: %d. res.Data: %+v", len(messages), res.Data)
+	if len(messages) != 5 {
+		t.Errorf("len(messages) = %d, want 5", len(messages))
+	}
+
+	// Verify exact order and metadata extraction
+	for i, msg := range messages {
+		expectedID := fmt.Sprintf("msg-%d", i+1)
+		if msg.ID != expectedID {
+			t.Errorf("messages[%d].ID = %q, want %q", i, msg.ID, expectedID)
+		}
+		expectedFrom := fmt.Sprintf("sender-msg-%d@example.com", i+1)
+		if msg.From != expectedFrom {
+			t.Errorf("messages[%d].From = %q, want %q", i, msg.From, expectedFrom)
+		}
+		expectedSubject := fmt.Sprintf("Subject msg-%d", i+1)
+		if msg.Subject != expectedSubject {
+			t.Errorf("messages[%d].Subject = %q, want %q", i, msg.Subject, expectedSubject)
+		}
+		expectedSnippet := fmt.Sprintf("Snippet for msg-%d", i+1)
+		if msg.Snippet != expectedSnippet {
+			t.Errorf("messages[%d].Snippet = %q, want %q", i, msg.Snippet, expectedSnippet)
+		}
+		if !msg.IsUnread {
+			t.Errorf("messages[%d].IsUnread = false, want true", i)
+		}
+	}
+}
+
