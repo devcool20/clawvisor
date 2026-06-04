@@ -633,22 +633,21 @@ func TestSendMessage_WithInReplyTo_ResolvesThreadAndQuotesPreviousMessage(t *tes
 }
 
 func TestListMessages_Concurrency(t *testing.T) {
+	const totalMsgs = 200
+
 	client := &http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			t.Logf("Mock received request: %s %s", req.Method, req.URL.String())
 			var body string
 			switch {
 			case req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/messages") && !strings.Contains(req.URL.Path, "/msg-"):
-				body = `{
-					"messages": [
-						{"id": "msg-1"},
-						{"id": "msg-2"},
-						{"id": "msg-3"},
-						{"id": "msg-4"},
-						{"id": "msg-5"}
-					],
-					"resultSizeEstimate": 5
-				}`
+				var msgsList []string
+				for i := 1; i <= totalMsgs; i++ {
+					msgsList = append(msgsList, fmt.Sprintf(`{"id": "msg-%d"}`, i))
+				}
+				body = fmt.Sprintf(`{
+					"messages": [%s],
+					"resultSizeEstimate": %d
+				}`, strings.Join(msgsList, ","), totalMsgs)
 			case req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/messages/msg-"):
 				// Extract msg ID from URL path (e.g. "/messages/msg-1")
 				parts := strings.Split(req.URL.Path, "/")
@@ -682,7 +681,7 @@ func TestListMessages_Concurrency(t *testing.T) {
 
 	adapter := &GmailAdapter{}
 	res, err := adapter.listMessages(context.Background(), client, map[string]any{
-		"max_results": 5,
+		"max_results": totalMsgs,
 	})
 	if err != nil {
 		t.Fatalf("listMessages error: %v", err)
@@ -704,9 +703,9 @@ func TestListMessages_Concurrency(t *testing.T) {
 		t.Fatalf("expected []msgListItem, got %T", messagesRaw)
 	}
 
-	t.Logf("Fetched messages count: %d. res.Data: %+v", len(messages), res.Data)
-	if len(messages) != 5 {
-		t.Errorf("len(messages) = %d, want 5", len(messages))
+	t.Logf("Fetched messages count: %d", len(messages))
+	if len(messages) != totalMsgs {
+		t.Errorf("len(messages) = %d, want %d", len(messages), totalMsgs)
 	}
 
 	// Verify exact order and metadata extraction
