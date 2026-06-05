@@ -725,7 +725,7 @@ func (h *ProxyResolverHandler) swapHeaderPlaceholders(r *http.Request, agent *st
 		if err != nil {
 			return "", err
 		}
-		h.enqueueTouch(placeholder)
+		h.enqueueTouch(r.Context(), placeholder)
 		return extracted, nil
 	}
 
@@ -1022,16 +1022,20 @@ func (h *ProxyResolverHandler) Close() {
 	})
 }
 
-func (h *ProxyResolverHandler) enqueueTouch(placeholder string) {
+func (h *ProxyResolverHandler) enqueueTouch(ctx context.Context, placeholder string) {
 	if h.touchQueue == nil {
 		return
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			h.Logger.Warn("ProxyResolverHandler: failed to enqueue placeholder touch (channel closed)")
+			h.Logger.WarnContext(ctx, "ProxyResolverHandler: failed to enqueue placeholder touch (channel closed)")
 		}
 	}()
-	h.touchQueue <- placeholder
+	select {
+	case h.touchQueue <- placeholder:
+	case <-ctx.Done():
+		h.Logger.WarnContext(ctx, "ProxyResolverHandler: context cancelled or timed out before placeholder touch could be enqueued; dropping touch event", "placeholder", placeholder, "err", ctx.Err())
+	}
 }
 
 type pendingTouch struct {

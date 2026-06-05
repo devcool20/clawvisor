@@ -66,17 +66,21 @@ func (e *AuditEmitter) Close() {
 	}
 }
 
-func (e *AuditEmitter) enqueue(fn func()) {
+func (e *AuditEmitter) enqueue(ctx context.Context, fn func()) {
 	if e.queue == nil {
 		fn()
 		return
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			e.Logger.Warn("AuditEmitter: failed to enqueue audit event (channel closed)")
+			e.Logger.WarnContext(ctx, "AuditEmitter: failed to enqueue audit event (channel closed)")
 		}
 	}()
-	e.queue <- fn
+	select {
+	case e.queue <- fn:
+	case <-ctx.Done():
+		e.Logger.WarnContext(ctx, "AuditEmitter: context cancelled or timed out before audit event could be enqueued; dropping audit write", "err", ctx.Err())
+	}
 }
 
 func (e *AuditEmitter) worker() {
@@ -662,7 +666,7 @@ func (e *AuditEmitter) LogResolverSwap(ctx context.Context, agent *store.Agent, 
 		Reason:     nilIfEmpty(reason),
 		DurationMS: int(duration.Milliseconds()),
 	}
-	e.enqueue(func() {
+	e.enqueue(ctx, func() {
 		if err := e.Store.LogAudit(context.Background(), entry); err != nil && !errors.Is(err, store.ErrConflict) {
 			e.Logger.WarnContext(context.Background(), "lite-proxy: resolver swap audit failed",
 				"agent_id", agent.ID, "target_host", targetHost, "err", err.Error())
@@ -792,7 +796,7 @@ func (e *AuditEmitter) LogScriptSessionUse(ctx context.Context, agent *store.Age
 		Reason:     nilIfEmpty(reason),
 		DurationMS: int(duration.Milliseconds()),
 	}
-	e.enqueue(func() {
+	e.enqueue(ctx, func() {
 		if err := e.Store.LogAudit(context.Background(), entry); err != nil && !errors.Is(err, store.ErrConflict) {
 			e.Logger.WarnContext(context.Background(), "lite-proxy: script-session use audit failed",
 				"agent_id", agent.ID, "session_id", sess.ID, "err", err.Error())
