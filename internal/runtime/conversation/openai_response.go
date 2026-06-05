@@ -1838,10 +1838,14 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 	}
 	pending := map[int]*pendingCall{}
 	var streamID string
+	var msgModel string
 	var text strings.Builder
 	var frags []assistantFragment
 
 	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return StreamingRewriteResult{StreamID: streamID, Model: msgModel, StreamFormat: "openai_chat"}, err
+		}
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
@@ -1860,6 +1864,7 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 		payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 		var event struct {
 			ID      string             `json:"id"`
+			Model   string             `json:"model"`
 			Choices []openAIChatChoice `json:"choices"`
 		}
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
@@ -1868,6 +1873,9 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 		}
 		if event.ID != "" && streamID == "" {
 			streamID = event.ID
+		}
+		if event.Model != "" && msgModel == "" {
+			msgModel = event.Model
 		}
 
 		hasToolCalls := false
@@ -1898,31 +1906,24 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 					contentOnlyChoices = append(contentOnlyChoices, map[string]any{
 						"index": choice.Index,
 						"delta": map[string]any{
-							"content": choice.Delta.Content,
+							"content": txt,
 						},
-						"finish_reason": nil,
+						"finish_reason": choice.FinishReason,
 					})
 				}
-			}
-			if choice.FinishReason == "tool_calls" {
-				continue
 			}
 		}
 
 		if hasToolCalls {
 			if len(contentOnlyChoices) > 0 {
-				chunk := map[string]any{
+				reemitPayload := map[string]any{
 					"id":      event.ID,
 					"object":  "chat.completion.chunk",
+					"model":   event.Model,
 					"choices": contentOnlyChoices,
 				}
-				encoded, err := json.Marshal(chunk)
-				if err != nil {
-					return StreamingRewriteResult{}, err
-				}
-				if _, err := fmt.Fprintf(w, "data: %s\n\n", encoded); err != nil {
-					return StreamingRewriteResult{}, err
-				}
+				raw, _ := json.Marshal(reemitPayload)
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", string(raw))
 			}
 			continue
 		}
@@ -1941,7 +1942,7 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 	}
 
 	if err := scanner.Err(); err != nil {
-		return StreamingRewriteResult{}, err
+		return StreamingRewriteResult{StreamID: streamID, Model: msgModel, StreamFormat: "openai_chat"}, err
 	}
 
 	if text.Len() > 0 {
@@ -1979,6 +1980,7 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 		ToolUses:      tus,
 		AssistantTurn: turn,
 		StreamID:      streamID,
+		Model:         msgModel,
 		StreamFormat:  "openai_chat",
 	}, nil
 }
@@ -2183,11 +2185,14 @@ func (rw OpenAIResponseRewriter) streamRewriteResponses(ctx context.Context, r i
 	}
 
 	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return StreamingRewriteResult{StreamID: streamID, StreamFormat: "openai_responses"}, err
+		}
 		line := scanner.Text()
 		trimmed := strings.TrimRight(line, "\r")
 		if trimmed == "" {
 			if err := flushEvent(); err != nil {
-				return StreamingRewriteResult{}, err
+				return StreamingRewriteResult{StreamID: streamID, StreamFormat: "openai_responses"}, err
 			}
 			continue
 		}
@@ -2204,10 +2209,10 @@ func (rw OpenAIResponseRewriter) streamRewriteResponses(ctx context.Context, r i
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return StreamingRewriteResult{}, err
+		return StreamingRewriteResult{StreamID: streamID, StreamFormat: "openai_responses"}, err
 	}
 	if err := flushEvent(); err != nil {
-		return StreamingRewriteResult{}, err
+		return StreamingRewriteResult{StreamID: streamID, StreamFormat: "openai_responses"}, err
 	}
 
 	var tus []ToolUse
