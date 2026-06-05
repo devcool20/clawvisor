@@ -1367,7 +1367,9 @@ func (rw AnthropicResponseRewriter) StreamRewrite(ctx context.Context, r io.Read
 			continue
 		}
 		if strings.HasPrefix(trimmed, ":") {
-			_, _ = fmt.Fprintln(w, line)
+			if _, err := fmt.Fprintln(w, line); err != nil {
+				return StreamingRewriteResult{StreamID: msgID, Model: msgModel, Role: msgRole, StreamFormat: "anthropic_messages"}, err
+			}
 			continue
 		}
 		if strings.HasPrefix(trimmed, "event:") {

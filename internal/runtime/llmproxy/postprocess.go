@@ -2718,8 +2718,13 @@ func WriteStreamError(
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 
 	default:
-		// Fallback comment for unrecognized shapes
-		_, _ = fmt.Fprintf(w, ": %s\n\n", errMsg)
+		// Fallback comment for unrecognized shapes — ensure newlines are
+		// prefixed with ":" so they cannot inject SSE frames.
+		lines := strings.Split(strings.ReplaceAll(errMsg, "\r", ""), "\n")
+		for _, line := range lines {
+			_, _ = fmt.Fprintf(w, ": %s\n", line)
+		}
+		_, _ = fmt.Fprint(w, "\n")
 	}
 }
 

@@ -1975,11 +1975,12 @@ func TestWriteStreamError_Unknown(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/unknown", nil)
 	res := conversation.StreamingRewriteResult{}
 
-	WriteStreamError(&buf, req, conversation.Provider("unknown"), res, "test error message")
+	WriteStreamError(&buf, req, conversation.Provider("unknown"), res, "test\nerror\nmessage")
 	got := buf.String()
 
-	if !strings.Contains(got, ": test error message") {
-		t.Errorf("expected fallback comment with error message, got %q", got)
+	want := ": test\n: error\n: message\n\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 

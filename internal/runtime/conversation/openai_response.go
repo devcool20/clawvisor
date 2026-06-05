@@ -1853,12 +1853,16 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 		}
 		if trimmed == "data: [DONE]" {
 			if len(pending) == 0 {
-				_, _ = fmt.Fprintln(w, line)
+				if _, err := fmt.Fprintln(w, line); err != nil {
+					return StreamingRewriteResult{StreamID: streamID, Model: msgModel, StreamFormat: "openai_chat"}, err
+				}
 			}
 			continue
 		}
 		if !strings.HasPrefix(trimmed, "data:") {
-			_, _ = fmt.Fprintln(w, line)
+			if _, err := fmt.Fprintln(w, line); err != nil {
+				return StreamingRewriteResult{StreamID: streamID, Model: msgModel, StreamFormat: "openai_chat"}, err
+			}
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
@@ -1868,7 +1872,9 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 			Choices []openAIChatChoice `json:"choices"`
 		}
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
-			_, _ = fmt.Fprintln(w, line)
+			if _, err := fmt.Fprintln(w, line); err != nil {
+				return StreamingRewriteResult{StreamID: streamID, Model: msgModel, StreamFormat: "openai_chat"}, err
+			}
 			continue
 		}
 		if event.ID != "" && streamID == "" {
@@ -1923,7 +1929,9 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 					"choices": contentOnlyChoices,
 				}
 				raw, _ := json.Marshal(reemitPayload)
-				_, _ = fmt.Fprintf(w, "data: %s\n\n", string(raw))
+				if _, err := fmt.Fprintf(w, "data: %s\n\n", string(raw)); err != nil {
+					return StreamingRewriteResult{StreamID: streamID, Model: msgModel, StreamFormat: "openai_chat"}, err
+				}
 			}
 			continue
 		}
@@ -1938,7 +1946,9 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 			continue
 		}
 
-		_, _ = fmt.Fprintln(w, line)
+		if _, err := fmt.Fprintln(w, line); err != nil {
+			return StreamingRewriteResult{StreamID: streamID, Model: msgModel, StreamFormat: "openai_chat"}, err
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -2197,7 +2207,9 @@ func (rw OpenAIResponseRewriter) streamRewriteResponses(ctx context.Context, r i
 			continue
 		}
 		if strings.HasPrefix(trimmed, ":") {
-			_, _ = fmt.Fprintln(w, line)
+			if _, err := fmt.Fprintln(w, line); err != nil {
+				return StreamingRewriteResult{StreamID: streamID, StreamFormat: "openai_responses"}, err
+			}
 			continue
 		}
 		if strings.HasPrefix(trimmed, "event:") {

@@ -163,11 +163,13 @@ data: {"type":"content_block_start","index":0,"content_block":{"type":"text","te
 		// Abruptly close the connection using hijacking
 		hj, ok := w.(http.Hijacker)
 		if !ok {
-			t.Fatal("webserver doesn't support hijacking")
+			t.Error("webserver doesn't support hijacking")
+			return
 		}
 		conn, _, err := hj.Hijack()
 		if err != nil {
-			t.Fatalf("hijack failed: %v", err)
+			t.Errorf("hijack failed: %v", err)
+			return
 		}
 		_ = conn.Close() // Close connection abruptly
 	}))
