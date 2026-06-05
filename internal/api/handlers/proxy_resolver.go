@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/clawvisor/clawvisor/internal/api/middleware"
@@ -60,6 +61,8 @@ type ProxyResolverHandler struct {
 	// development environments.
 	AllowPrivateNetworks bool
 
+	touchedMutex sync.Mutex
+	touchedMap   map[string]time.Time
 }
 
 // NewProxyResolverHandler builds the handler with sensible defaults. The
@@ -77,6 +80,7 @@ func NewProxyResolverHandler(st store.Store, v vault.Vault, logger *slog.Logger)
 		Vault:           v,
 		Logger:          logger,
 		MaxRequestBytes: 34 << 20,
+		touchedMap:      make(map[string]time.Time),
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = 30 * time.Second
@@ -719,6 +723,19 @@ func (h *ProxyResolverHandler) swapHeaderPlaceholders(r *http.Request, agent *st
 			return "", err
 		}
 		go func(id string) {
+			h.touchedMutex.Lock()
+			if h.touchedMap == nil {
+				h.touchedMap = make(map[string]time.Time)
+			}
+			lastTouch, ok := h.touchedMap[id]
+			now := time.Now().UTC()
+			if ok && now.Sub(lastTouch) < 5*time.Second {
+				h.touchedMutex.Unlock()
+				return
+			}
+			h.touchedMap[id] = now
+			h.touchedMutex.Unlock()
+
 			// Fire-and-forget: detach cancellation but cap so a stuck DB
 			// can't leak goroutines forever. Recover from panics so an
 			// unexpected store impl bug doesn't crash the process.
