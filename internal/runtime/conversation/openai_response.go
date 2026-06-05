@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 type OpenAIResponseRewriter struct{}
@@ -828,7 +829,9 @@ func (rw OpenAIResponseRewriter) rewriteChatCompletionsSSE(body []byte, eval Too
 	}
 	type toolCallState struct {
 		allowed        bool
+		useRunes       bool
 		arguments      string
+		argumentsRunes []rune
 		origTotalLen   int
 		origReadLen    int
 		writtenArgsLen int
@@ -985,9 +988,18 @@ func (rw OpenAIResponseRewriter) rewriteChatCompletionsSSE(body []byte, eval Too
 						}
 						choiceBlockedPrompts.WriteString(txt)
 					}
+					origStr := pc.args.String()
+					useRunes := utf8.ValidString(origStr)
+					var origTotalLen int
+					if useRunes {
+						origTotalLen = len([]rune(origStr))
+					} else {
+						origTotalLen = len(origStr)
+					}
 					toolStates[toolCallIndex] = &toolCallState{
 						allowed:      false,
-						origTotalLen: pc.args.Len(),
+						useRunes:     useRunes,
+						origTotalLen: origTotalLen,
 					}
 				} else {
 					if len(verdict.RewriteInput) > 0 {
@@ -1002,10 +1014,22 @@ func (rw OpenAIResponseRewriter) rewriteChatCompletionsSSE(body []byte, eval Too
 						name:      pc.name,
 						arguments: finalArgs,
 					})
-					toolStates[toolCallIndex] = &toolCallState{
-						allowed:      true,
-						arguments:    finalArgs,
-						origTotalLen: pc.args.Len(),
+					origStr := pc.args.String()
+					useRunes := utf8.ValidString(origStr) && utf8.ValidString(finalArgs)
+					if useRunes {
+						toolStates[toolCallIndex] = &toolCallState{
+							allowed:        true,
+							useRunes:       true,
+							argumentsRunes: []rune(finalArgs),
+							origTotalLen:   len([]rune(origStr)),
+						}
+					} else {
+						toolStates[toolCallIndex] = &toolCallState{
+							allowed:      true,
+							useRunes:     false,
+							arguments:    finalArgs,
+							origTotalLen: len(origStr),
+						}
 					}
 				}
 				frags = append(frags, assistantFragment{IsTool: true, ToolName: pc.name, ToolArgs: fragArgs})
@@ -1095,31 +1119,56 @@ func (rw OpenAIResponseRewriter) rewriteChatCompletionsSSE(body []byte, eval Too
 									// Blocked: skip/omit from the stream
 									continue
 								}
-								// Allowed: rewrite arguments delta proportionally
+								// Allowed: rewrite arguments delta proportionally (rune-based if UTF-8, byte-based fallback to avoid corruption of raw binary bytes)
 								tcFunc, _ := tc["function"].(map[string]any)
 								if tcFunc != nil {
 									if origArgsDelta, ok := tcFunc["arguments"].(string); ok {
-										tState.origReadLen += len(origArgsDelta)
-										var newDelta string
-										if tState.origTotalLen == 0 {
-											newDelta = tState.arguments
-											tState.writtenArgsLen = len(tState.arguments)
-										} else if tState.origReadLen >= tState.origTotalLen {
-											newDelta = tState.arguments[tState.writtenArgsLen:]
-											tState.writtenArgsLen = len(tState.arguments)
+										if tState.useRunes {
+											origArgsRunes := []rune(origArgsDelta)
+											tState.origReadLen += len(origArgsRunes)
+											var newDeltaRunes []rune
+											if tState.origTotalLen == 0 {
+												newDeltaRunes = tState.argumentsRunes
+												tState.writtenArgsLen = len(tState.argumentsRunes)
+											} else if tState.origReadLen >= tState.origTotalLen {
+												newDeltaRunes = tState.argumentsRunes[tState.writtenArgsLen:]
+												tState.writtenArgsLen = len(tState.argumentsRunes)
+											} else {
+												ratio := float64(len(origArgsRunes)) / float64(tState.origTotalLen)
+												chunkSize := int(ratio * float64(len(tState.argumentsRunes)))
+												if chunkSize < 1 && len(origArgsRunes) > 0 {
+													chunkSize = 1
+												}
+												if tState.writtenArgsLen+chunkSize > len(tState.argumentsRunes) {
+													chunkSize = len(tState.argumentsRunes) - tState.writtenArgsLen
+												}
+												newDeltaRunes = tState.argumentsRunes[tState.writtenArgsLen : tState.writtenArgsLen+chunkSize]
+												tState.writtenArgsLen += chunkSize
+											}
+											tcFunc["arguments"] = string(newDeltaRunes)
 										} else {
-											ratio := float64(len(origArgsDelta)) / float64(tState.origTotalLen)
-											chunkSize := int(ratio * float64(len(tState.arguments)))
-											if chunkSize < 1 && len(origArgsDelta) > 0 {
-												chunkSize = 1
+											tState.origReadLen += len(origArgsDelta)
+											var newDelta string
+											if tState.origTotalLen == 0 {
+												newDelta = tState.arguments
+												tState.writtenArgsLen = len(tState.arguments)
+											} else if tState.origReadLen >= tState.origTotalLen {
+												newDelta = tState.arguments[tState.writtenArgsLen:]
+												tState.writtenArgsLen = len(tState.arguments)
+											} else {
+												ratio := float64(len(origArgsDelta)) / float64(tState.origTotalLen)
+												chunkSize := int(ratio * float64(len(tState.arguments)))
+												if chunkSize < 1 && len(origArgsDelta) > 0 {
+													chunkSize = 1
+												}
+												if tState.writtenArgsLen+chunkSize > len(tState.arguments) {
+													chunkSize = len(tState.arguments) - tState.writtenArgsLen
+												}
+												newDelta = tState.arguments[tState.writtenArgsLen : tState.writtenArgsLen+chunkSize]
+												tState.writtenArgsLen += chunkSize
 											}
-											if tState.writtenArgsLen+chunkSize > len(tState.arguments) {
-												chunkSize = len(tState.arguments) - tState.writtenArgsLen
-											}
-											newDelta = tState.arguments[tState.writtenArgsLen : tState.writtenArgsLen+chunkSize]
-											tState.writtenArgsLen += chunkSize
+											tcFunc["arguments"] = rawJSONString(newDelta)
 										}
-										tcFunc["arguments"] = newDelta
 									}
 								}
 							}
@@ -2235,4 +2284,34 @@ func writeSSE(w io.Writer, event string, data string) error {
 	}
 	_, err = fmt.Fprintf(w, "data: %s\n\n", data)
 	return err
+}
+
+type rawJSONString string
+
+func (r rawJSONString) MarshalJSON() ([]byte, error) {
+	res := make([]byte, 0, len(r)+2)
+	res = append(res, '"')
+	for i := 0; i < len(r); i++ {
+		c := r[i]
+		switch c {
+		case '"':
+			res = append(res, '\\', '"')
+		case '\\':
+			res = append(res, '\\', '\\')
+		case '\n':
+			res = append(res, '\\', 'n')
+		case '\r':
+			res = append(res, '\\', 'r')
+		case '\t':
+			res = append(res, '\\', 't')
+		default:
+			if c < 0x20 {
+				res = append(res, []byte(fmt.Sprintf("\\u%04x", c))...)
+			} else {
+				res = append(res, c)
+			}
+		}
+	}
+	res = append(res, '"')
+	return res, nil
 }

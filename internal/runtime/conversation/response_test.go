@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestSyntheticApprovalToolUseResponseOpenAIChatLiteProxyRoute(t *testing.T) {
@@ -1742,5 +1743,140 @@ func TestOpenAIResponseRewriterIncrementalArgumentsChatSSE(t *testing.T) {
 	}
 	if argumentDeltas[1] != `:"https://safe.test"}` {
 		t.Errorf("expected delta 1 to be %q, got %q", `:"https://safe.test"}`, argumentDeltas[1])
+	}
+}
+
+func TestOpenAIResponseRewriterUTF8ProportionalStreamingChatSSE(t *testing.T) {
+	t.Parallel()
+
+	req, _ := http.NewRequest(http.MethodPost, "https://api.openai.com/v1/chat/completions", nil)
+	rewriter := DefaultResponseRegistry().Match(req, &http.Response{})
+	if rewriter == nil {
+		t.Fatal("expected OpenAI response rewriter")
+	}
+
+	// Original arguments: {"command":"こんにちは"}
+	// "こんにちは" is 5 hiragana characters (each 3 bytes in UTF-8).
+	// We split it across three chunks in the original stream.
+	body := []byte(strings.Join([]string{
+		`data: {"id":"chatcmpl_utf8","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl_utf8","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":""}}]},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl_utf8","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"こん"}}]},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl_utf8","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"にちは\"}"}}]},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl_utf8","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n"))
+
+	// We rewrite the arguments to include emojis: {"command":"こんにちは😊👋"}
+	// Emojis: 😊 (4 bytes), 👋 (4 bytes)
+	result, err := rewriter.Rewrite(body, "text/event-stream", func(tu ToolUse) ToolUseVerdict {
+		if tu.Name == "Bash" {
+			return ToolUseVerdict{
+				Allowed:      true,
+				RewriteInput: []byte(`{"command":"こんにちは😊👋"}`),
+			}
+		}
+		return ToolUseVerdict{Allowed: true}
+	})
+	if err != nil {
+		t.Fatalf("Rewrite: %v", err)
+	}
+	if !result.Rewritten {
+		t.Fatal("expected rewritten response")
+	}
+
+	events := parseTestSSEEvents(t, string(result.Body))
+	var argumentDeltas []string
+
+	for _, ev := range events {
+		var payload struct {
+			Choices []struct {
+				Index int `json:"index"`
+				Delta struct {
+					ToolCalls []struct {
+						Function struct {
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(ev.Data), &payload); err != nil {
+			continue
+		}
+		for _, c := range payload.Choices {
+			for _, tc := range c.Delta.ToolCalls {
+				if tc.Function.Arguments != "" {
+					argumentDeltas = append(argumentDeltas, tc.Function.Arguments)
+				}
+			}
+		}
+	}
+
+	// Verify that the argument deltas are valid UTF-8 strings (runes were not split)
+	for i, delta := range argumentDeltas {
+		if !utf8.ValidString(delta) {
+			t.Errorf("delta %d is not a valid UTF-8 string: %q", i, delta)
+		}
+	}
+
+	joined := strings.Join(argumentDeltas, "")
+	if joined != `{"command":"こんにちは😊👋"}` {
+		t.Errorf("expected joined arguments %q, got %q", `{"command":"こんにちは😊👋"}`, joined)
+	}
+}
+
+func TestOpenAIResponseRewriterInvalidUTF8BinaryStreamingChatSSE(t *testing.T) {
+	t.Parallel()
+
+	req, _ := http.NewRequest(http.MethodPost, "https://api.openai.com/v1/chat/completions", nil)
+	rewriter := DefaultResponseRegistry().Match(req, &http.Response{})
+	if rewriter == nil {
+		t.Fatal("expected OpenAI response rewriter")
+	}
+
+	body := []byte(strings.Join([]string{
+		`data: {"id":"chatcmpl_bin","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl_bin","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":""}}]},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl_bin","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":"}}]},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl_bin","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"foo\"}"}}]},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl_bin","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n"))
+
+	binaryInput := `{"cmd":"` + "\x80\x81\x82" + `"}`
+	result, err := rewriter.Rewrite(body, "text/event-stream", func(tu ToolUse) ToolUseVerdict {
+		if tu.Name == "Bash" {
+			return ToolUseVerdict{
+				Allowed:      true,
+				RewriteInput: []byte(binaryInput),
+			}
+		}
+		return ToolUseVerdict{Allowed: true}
+	})
+	if err != nil {
+		t.Fatalf("Rewrite: %v", err)
+	}
+	if !result.Rewritten {
+		t.Fatal("expected rewritten response")
+	}
+
+	if !bytes.Contains(result.Body, []byte("\x80\x81\x82")) {
+		t.Fatalf("expected replayed SSE body to contain exact binary bytes, got: %q", result.Body)
+	}
+	if bytes.Contains(result.Body, []byte("\uFFFD")) {
+		t.Fatalf("detected Unicode replacement character (silently corrupted bytes) in output: %q", result.Body)
 	}
 }
