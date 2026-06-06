@@ -995,10 +995,17 @@ func newToolUseEvaluator(req *http.Request, cfg PostprocessConfig, provider conv
 			return conversation.ToolUseVerdict{Allowed: true}
 		}
 		if !v.IsAPICall {
-			// Since !v.Ambiguous is handled in the authorization block above,
-			// if we reach here, it must be ambiguous.
-			audit("block", "ambiguous", v.Reason)
-			reason := "Clawvisor: ambiguous credentialed call refused — " + v.Reason
+			if v.Ambiguous {
+				audit("block", "ambiguous", v.Reason)
+				reason := "Clawvisor: ambiguous credentialed call refused — " + v.Reason
+				return conversation.ToolUseVerdict{
+					Allowed:                false,
+					Reason:                 reason,
+					ContinueWithToolResult: reason,
+				}
+			}
+			audit("block", "non_api_credentialed", v.Reason)
+			reason := "Clawvisor: non-API tool calls carrying credentials are not permitted — " + v.Reason
 			return conversation.ToolUseVerdict{
 				Allowed:                false,
 				Reason:                 reason,

@@ -2068,8 +2068,9 @@ func TestPostprocess_EnforcesRulesOnConfidentNonAPICalls(t *testing.T) {
 
 func TestPostprocess_BlocksValidatorOriginNonAPICalls(t *testing.T) {
 	t.Parallel()
-	// Use a custom tool name so DefaultParser doesn't recognize it.
-	body := anthropicJSONWithNamedToolUse("CustomTool", `{"arg":"autovault_stripe_mock_token_for_unit_tests"}`)
+	// Use a custom tool name so DefaultParser doesn't recognize it, and a realistic
+	// placeholder token to ensure it isn't classified as a stub (trigger-miss).
+	body := anthropicJSONWithNamedToolUse("CustomTool", `{"arg":"autovault_stripe_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}`)
 	req := httptest.NewRequest("POST", "/v1/messages", nil)
 
 	// The validator returns IsAPICall=false, Ambiguous=false.
@@ -2098,10 +2099,11 @@ func TestPostprocess_BlocksValidatorOriginNonAPICalls(t *testing.T) {
 	if got.Decisions[0].Verdict.Allowed {
 		t.Fatalf("validator non-API tool call should be blocked, got decision: %+v", got.Decisions[0])
 	}
-	if !strings.Contains(string(got.Body), "ambiguous credentialed call refused") {
-		t.Fatalf("expected ambiguous block error message, got body: %s", got.Body)
+	if !strings.Contains(string(got.Body), "non-API tool calls carrying credentials are not permitted") {
+		t.Fatalf("expected non-API block error message, got body: %s", got.Body)
 	}
 }
+
 
 
 
