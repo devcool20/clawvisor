@@ -1,0 +1,96 @@
+package policies
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
+	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/pipeline"
+	"github.com/clawvisor/clawvisor/pkg/store"
+)
+
+// TaskApprovalReply rewrites a user reply of "task" into the
+// inline-task-definition flow. When the user replies "task" to a
+// pending approval that supports inline task definition, the policy
+// resolves the hold, starts the task-definition conversation, and
+// rewrites the body so the LLM sees the task-definition prompt
+// instead of a bare "task" string.
+//
+// This is a stateful policy: it takes both the pending-approval
+// cache and the agent identity. The policy is constructed per
+// request — the handler already has the resolved *store.Agent before
+// any preprocess step runs.
+type TaskApprovalReply struct {
+	cache    any
+	agent    *store.Agent
+	rewriter TaskApprovalReplyRewriter
+}
+
+type TaskApprovalReplyRequest struct {
+	HTTPRequest     *http.Request
+	Provider        conversation.Provider
+	Body            []byte
+	Agent           *store.Agent
+	ConversationID  string
+	PendingApproval any
+}
+
+type TaskApprovalReplyResult struct {
+	Body      []byte
+	Rewritten bool
+}
+
+type TaskApprovalReplyRewriter func(ctx context.Context, req TaskApprovalReplyRequest) (TaskApprovalReplyResult, error)
+
+// NewTaskApprovalReply constructs the policy. agent and cache must
+// be non-nil for the policy to act; nil values produce Skip rather
+// than panicking.
+func NewTaskApprovalReply(cache any, agent *store.Agent, rewriter TaskApprovalReplyRewriter) *TaskApprovalReply {
+	return &TaskApprovalReply{cache: cache, agent: agent, rewriter: rewriter}
+}
+
+// Name returns the audit-friendly policy identifier.
+func (TaskApprovalReply) Name() string { return "task_approval_reply" }
+
+// Preprocess attempts to rewrite a "task" reply into the inline-task-
+// definition flow. Returns OutcomeAllow with no mutation when the
+// reply isn't a task verb; OutcomeAllow with the body replaced when
+// the rewrite fires; OutcomeDeny on a malformed reply.
+func (p *TaskApprovalReply) Preprocess(ctx context.Context, req pipeline.ReadOnlyRequest, mut pipeline.RequestMutator) (pipeline.RequestVerdict, error) {
+	if isNilInterface(p.cache) || p.agent == nil || p.rewriter == nil {
+		return pipeline.RequestVerdict{Outcome: pipeline.OutcomeSkip}, nil
+	}
+
+	rewrite, err := p.rewriter(ctx, TaskApprovalReplyRequest{
+		HTTPRequest:     req.HTTPRequest(),
+		Provider:        req.Provider(),
+		Body:            req.RawBody(),
+		Agent:           p.agent,
+		ConversationID:  req.ConversationID(),
+		PendingApproval: p.cache,
+	})
+	if err != nil {
+		return pipeline.RequestVerdict{
+			Outcome: pipeline.OutcomeDeny,
+			Reason:  ModelSafeInternalReason("task approval reply rewrite"),
+			AuditParams: map[string]any{
+				"deny_outcome":              "malformed_request",
+				"task_approval_reply_error": err.Error(),
+			},
+		}, nil
+	}
+	if !rewrite.Rewritten {
+		return pipeline.RequestVerdict{Outcome: pipeline.OutcomeAllow}, nil
+	}
+	if err := mut.ReplaceBody(rewrite.Body); err != nil {
+		return pipeline.RequestVerdict{}, err
+	}
+	return pipeline.RequestVerdict{
+		Outcome: pipeline.OutcomeAllow,
+		AuditParams: map[string]any{
+			"approval_task_rewritten": true,
+		},
+	}, nil
+}
+
+var _ pipeline.RequestPolicy = (*TaskApprovalReply)(nil)

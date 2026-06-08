@@ -208,16 +208,16 @@ func (p PendingLiteApproval) AllHolds() []HeldToolUse {
 }
 
 // IsCoalesced reports whether the hold covers more than one tool_use.
-// Single-tool holds (Additional empty) keep today's 3-option (yes/no/task)
+// Single-tool holds (Additional empty) keep the 3-option (yes/no/task)
 // prompt; coalesced holds are strictly binary.
 func (p PendingLiteApproval) IsCoalesced() bool {
 	return len(p.Additional) > 0
 }
 
 type ResolveRequest struct {
-	UserID     string
-	AgentID    string
-	Provider   conversation.Provider
+	UserID   string
+	AgentID  string
+	Provider conversation.Provider
 	// ConversationID scopes the lookup to the requesting conversation's
 	// bucket so bare/no-ID resolves and Drops can't cross conversation
 	// boundaries. Empty matches the pre-conversation-scoping bucket so
@@ -286,7 +286,7 @@ func (c *MemoryPendingApprovalCache) Hold(_ context.Context, pending PendingLite
 	}
 	now := c.now().UTC()
 	if pending.ID == "" {
-		id, err := newLiteApprovalID()
+		id, err := NewLiteApprovalID()
 		if err != nil {
 			return HoldResult{}, err
 		}
@@ -431,6 +431,26 @@ func resolveRequestKey(req ResolveRequest) pendingApprovalKey {
 // (user, agent, provider) tuple in insertion order. Test-only — used
 // by coalescence tests to assert how many holds were created and what
 // they contain without poking the private storage map.
+// SetMaxForTest overrides the per-key capacity to force eviction in
+// coalescence/eviction tests. Test-only — the cache normally derives
+// max from NewMemoryPendingApprovalCacheWithMax.
+func (c *MemoryPendingApprovalCache) SetMaxForTest(max int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.max = max
+}
+
+// SnapshotHoldsForTest is the test-only entry point for inspecting
+// the cache's per-key hold buffer. Exported so the postproc package's
+// coalescence tests can assert hold counts + contents without poking
+// the private storage map.
+func (c *MemoryPendingApprovalCache) SnapshotHoldsForTest(userID, agentID string, provider conversation.Provider) []PendingLiteApproval {
+	return c.snapshotHoldsForTest(userID, agentID, provider)
+}
+
 func (c *MemoryPendingApprovalCache) snapshotHoldsForTest(userID, agentID string, provider conversation.Provider) []PendingLiteApproval {
 	if c == nil {
 		return nil
@@ -463,7 +483,10 @@ func (c *MemoryPendingApprovalCache) pruneExpiredLocked(key pendingApprovalKey, 
 	return kept
 }
 
-func newLiteApprovalID() (string, error) {
+// NewLiteApprovalID mints a per-hold ID for the inline-approval flow.
+// Used by the postproc package's coalesce machinery to mint IDs ahead
+// of replay to the underlying cache.
+func NewLiteApprovalID() (string, error) {
 	var b [16]byte
 	if _, err := liteApprovalRandRead(b[:]); err != nil {
 		return "", fmt.Errorf("generate approval id: %w", err)

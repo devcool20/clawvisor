@@ -20,6 +20,8 @@ import (
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/inspector"
+	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/policies"
+	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/postproc"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/pricing"
 	"github.com/clawvisor/clawvisor/internal/taskrisk"
 	runtimedecision "github.com/clawvisor/clawvisor/pkg/runtime/decision"
@@ -217,6 +219,13 @@ func (h *LLMEndpointHandler) Responses(w http.ResponseWriter, r *http.Request) {
 	h.serve(w, r)
 }
 
+func liteProxyResponsePolicyAvailable(provider conversation.Provider, registry *conversation.ResponseRegistry) bool {
+	if registry == nil {
+		return false
+	}
+	return registry.ForProvider(provider) != nil && registry.ForProviderStreaming(provider) != nil
+}
+
 func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	requestID := r.Header.Get("X-Request-Id")
@@ -307,6 +316,16 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 	if src := llmproxy.CallerAuthSource(r.Context()); src != "" {
 		auditParams["caller_auth_source"] = src
 	}
+
+	if h.Inspector != nil && !liteProxyResponsePolicyAvailable(provider, conversation.DefaultResponseRegistry()) {
+		auditStatus = http.StatusNotImplemented
+		auditDecide = "deny"
+		auditOutcome = "response_policy_unavailable"
+		auditReason = "no response policy registered for provider " + string(provider)
+		h.writeLiteProxyError(w, r, agent, provider, nil, requestID, http.StatusNotImplemented, "RESPONSE_POLICY_UNAVAILABLE",
+			"this provider is not available through Clawvisor's inspected lite-proxy yet.")
+		return
+	}
 	if llmproxy.PassthroughUpstreamAuth(r.Context()) {
 		auditParams["upstream_auth_passthrough_requested"] = true
 		auditParams["upstream_auth_passthrough_bearer_present"] = llmproxy.HasPassthroughBearer(r)
@@ -352,20 +371,41 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 
 	// Validate that the body parses for the selected provider. Surfaces
 	// schema errors as a 400 before we burn an upstream call.
-	if provider == conversation.ProviderAnthropic {
-		sanitizedBody, sanitized, sanitizeErr := llmproxy.SanitizeAnthropicRequest(body)
-		if sanitizeErr != nil {
+	//
+	// First migrated call site through internal/runtime/llmproxy/pipeline:
+	// runs the anthropic_sanitize policy via Pipeline.RunPre. Other
+	// migrated policies (inbound_sanitize, control_notice, etc.) still
+	// run inline below; full consolidation arrives once all preprocess
+	// policies migrate.
+	{
+		pipeReq := &pipelineReadOnlyRequest{
+			provider: provider,
+			httpReq:  r,
+			body:     body,
+			userID:   agent.UserID,
+			agentID:  agent.ID,
+		}
+		result, err := runSinglePolicy(r.Context(), pipeReq, policies.NewAnthropicSanitize())
+		if err != nil {
+			auditStatus = http.StatusInternalServerError
+			auditDecide = "deny"
+			auditOutcome = "pipeline_error"
+			auditReason = err.Error()
+			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusInternalServerError, "PIPELINE_ERROR", "internal pipeline error. Please retry; details are in the Clawvisor audit log.")
+			return
+		}
+		for k, v := range result.AuditParams {
+			auditParams[k] = v
+		}
+		if result.DenyReason != "" {
 			auditStatus = http.StatusBadRequest
 			auditDecide = "deny"
 			auditOutcome = "malformed_request"
-			auditReason = sanitizeErr.Error()
-			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't parse this request: "+sanitizeErr.Error()+". This usually means a client bug; please retry.")
+			auditReason = result.DenyReason
+			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't parse this request: "+strings.TrimRight(result.DenyReason, ". ")+". This usually means a client bug; please retry.")
 			return
 		}
-		if sanitized {
-			body = sanitizedBody
-			auditParams["anthropic_empty_text_sanitized"] = true
-		}
+		body = result.FinalBody
 	}
 	if _, err := parser.ParseRequest(body); err != nil {
 		auditStatus = http.StatusBadRequest
@@ -391,21 +431,47 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 	if liteProxySecretDetectionDisabled {
 		auditParams["lite_proxy_secret_detection_disabled"] = true
 	} else {
-		if decisionBody, decision, extraSuppressed, handled := h.maybeHandleLiteSecretDecision(w, r, agent, provider, requestID, body, auditParams, &auditStatus, &auditDecide, &auditOutcome, &auditReason); handled {
-			if len(decisionBody) == 0 {
-				return
+		// Twelfth migrated call site: SecretDecision via the
+		// tryHandleLiteSecretDecision helper. The helper performs the
+		// same work the policies.NewSecretDecision policy would dispatch
+		// to; using it directly here avoids policy-resolver indirection
+		// for a path that's strictly request-side (no
+		// orchestrator-level coalescing or audit aggregation needed).
+		//
+		// The SecretDecision policy in policies/ remains available for
+		// callers who want to compose it through Pipeline.RunPre (e.g.,
+		// when the audit aggregation matters); production today uses
+		// the helper-direct path for clarity.
+		attempt := h.tryHandleLiteSecretDecision(r, agent, provider, requestID, body)
+		if attempt.Handled {
+			if attempt.DecisionID != "" {
+				auditParams["secret_decision_id"] = attempt.DecisionID
+				auditParams["secret_findings"] = attempt.FindingsCount
 			}
-			body = decisionBody
-			if _, err := parser.ParseRequest(body); err != nil {
-				auditStatus = http.StatusBadRequest
+			if attempt.IsError {
+				auditStatus = attempt.AuditStatusOverride
 				auditDecide = "deny"
-				auditOutcome = "malformed_request"
-				auditReason = err.Error()
-				h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't parse this request: "+err.Error()+". This usually means a client bug; please retry.")
+				auditOutcome = attempt.ErrorOutcome
+				auditReason = attempt.ErrorReason
+				h.writeLiteProxyError(w, r, agent, provider, body, requestID, attempt.AuditStatusOverride, attempt.ErrorCode, attempt.ErrorMessage)
 				return
 			}
-			auditParams["secret_decision"] = string(decision)
-			decisionExtraSuppressed = extraSuppressed
+			if len(attempt.ModifiedBody) > 0 {
+				body = attempt.ModifiedBody
+				if _, err := parser.ParseRequest(body); err != nil {
+					auditStatus = http.StatusBadRequest
+					auditDecide = "deny"
+					auditOutcome = "malformed_request"
+					auditReason = err.Error()
+					h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't parse this request: "+err.Error()+". This usually means a client bug; please retry.")
+					return
+				}
+				if attempt.Action == llmproxy.SecretDecisionAllowOnce {
+					auditStatus = 0
+				}
+				auditParams["secret_decision"] = string(attempt.Action)
+				decisionExtraSuppressed = attempt.Suppressed
+			}
 		}
 	}
 	if processed, held := h.preprocessLiteSecretBody(w, r, agent, provider, requestID, body, decisionExtraSuppressed, liteProxySecretDetectionDisabled, auditParams, &auditStatus, &auditDecide, &auditOutcome, &auditReason); held {
@@ -418,20 +484,30 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 	// this, models pattern-match from their own history and start
 	// emitting `cv-nonce-…` / proxy headers / rewritten URLs verbatim
 	// on subsequent turns, bypassing the rewrite path entirely.
-	if sanitized, sanitizeErr := llmproxy.SanitizeInboundHistory(llmproxy.SanitizeInboundRequest{
-		Provider:        provider,
-		Body:            body,
-		ResolverBaseURL: h.ResolverBaseURL,
-		ControlBaseURL:  h.ControlBaseURL,
-	}); sanitizeErr != nil {
-		// Sanitization is best-effort; a failure here means the
-		// model sees the un-sanitized history but the request still
-		// works. Log and continue.
-		h.Logger.WarnContext(r.Context(), "lite-proxy inbound sanitize failed",
-			"agent_id", agent.ID, "err", sanitizeErr.Error())
-	} else if sanitized.Modified {
-		body = sanitized.Body
-		auditParams["inbound_history_sanitized"] = true
+	//
+	// Second migrated call site through pipeline.
+	{
+		pipeReq := &pipelineReadOnlyRequest{
+			provider: provider,
+			httpReq:  r,
+			body:     body,
+			userID:   agent.UserID,
+			agentID:  agent.ID,
+		}
+		result, err := runSinglePolicy(r.Context(), pipeReq, policies.NewInboundSanitize(h.ResolverBaseURL, h.ControlBaseURL))
+		if err != nil {
+			// inbound_sanitize uses best-effort semantics today —
+			// a pipeline failure here was a hard failure (panic on
+			// PanicMutator method). Log and continue with the
+			// un-sanitized body so the request still works.
+			h.Logger.WarnContext(r.Context(), "lite-proxy inbound sanitize pipeline failed",
+				"agent_id", agent.ID, "err", err.Error())
+		} else {
+			body = result.FinalBody
+			for k, v := range result.AuditParams {
+				auditParams[k] = v
+			}
+		}
 	}
 	// Extract per-conversation identifier from the inbound body once. It
 	// scopes pending approvals + task checkout to a single conversation
@@ -444,31 +520,64 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 	if conversationID != "" {
 		auditParams["conversation_id"] = conversationID
 	}
-	if taskRewrite, taskErr := llmproxy.RewriteTaskApprovalReply(r.Context(), llmproxy.TaskReplyRewriteRequest{
-		HTTPRequest:     r,
-		Provider:        provider,
-		Body:            body,
-		Agent:           agent,
-		ConversationID:  conversationID,
-		PendingApproval: h.PendingApprovals,
-	}); taskErr != nil {
-		auditStatus = http.StatusBadRequest
-		auditDecide = "deny"
-		auditOutcome = "malformed_request"
-		auditReason = taskErr.Error()
-		h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't process the task-approval reply: "+taskErr.Error()+". Please retry.")
-		return
-	} else if taskRewrite.Rewritten {
-		body = taskRewrite.Body
-		if _, err := parser.ParseRequest(body); err != nil {
+	// Sixth migrated call site through pipeline: task_approval_reply.
+	{
+		pipeReq := &pipelineReadOnlyRequest{
+			provider:       provider,
+			httpReq:        r,
+			body:           body,
+			userID:         agent.UserID,
+			agentID:        agent.ID,
+			conversationID: conversationID,
+		}
+		result, err := runSinglePolicy(r.Context(), pipeReq, policies.NewTaskApprovalReply(h.PendingApprovals, agent, func(ctx context.Context, req policies.TaskApprovalReplyRequest) (policies.TaskApprovalReplyResult, error) {
+			pending, ok := req.PendingApproval.(llmproxy.PendingApprovalCache)
+			if !ok || pending == nil {
+				return policies.TaskApprovalReplyResult{}, fmt.Errorf("task approval reply pending cache not configured")
+			}
+			rewrite, err := llmproxy.RewriteTaskApprovalReply(ctx, llmproxy.TaskReplyRewriteRequest{
+				HTTPRequest:     req.HTTPRequest,
+				Provider:        req.Provider,
+				Body:            req.Body,
+				Agent:           req.Agent,
+				ConversationID:  req.ConversationID,
+				PendingApproval: pending,
+			})
+			if err != nil {
+				return policies.TaskApprovalReplyResult{}, err
+			}
+			return policies.TaskApprovalReplyResult{Body: rewrite.Body, Rewritten: rewrite.Rewritten}, nil
+		}))
+		if err != nil {
+			auditStatus = http.StatusInternalServerError
+			auditDecide = "deny"
+			auditOutcome = "pipeline_error"
+			auditReason = err.Error()
+			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusInternalServerError, "PIPELINE_ERROR", "internal pipeline error. Please retry; details are in the Clawvisor audit log.")
+			return
+		}
+		for k, v := range result.AuditParams {
+			auditParams[k] = v
+		}
+		if result.DenyReason != "" {
 			auditStatus = http.StatusBadRequest
 			auditDecide = "deny"
 			auditOutcome = "malformed_request"
-			auditReason = err.Error()
-			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't parse this request: "+err.Error()+". This usually means a client bug; please retry.")
+			auditReason = result.DenyReason
+			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't process the task-approval reply: "+strings.TrimRight(result.DenyReason, ". ")+". Please retry.")
 			return
 		}
-		auditParams["approval_task_rewritten"] = true
+		if result.BodyReplaced {
+			body = result.FinalBody
+			if _, err := parser.ParseRequest(body); err != nil {
+				auditStatus = http.StatusBadRequest
+				auditDecide = "deny"
+				auditOutcome = "malformed_request"
+				auditReason = err.Error()
+				h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't parse this request: "+err.Error()+". This usually means a client bug; please retry.")
+				return
+			}
+		}
 	}
 
 	// Inline task approval: when the user's "approve"/"deny" reply
@@ -477,46 +586,78 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 	// than a synthesized cat-heredoc tool_use that confuses the model
 	// into re-POSTing /api/control/tasks).
 	inlineApprovalConsumed := false
-	if inlineRewrite, inlineErr := llmproxy.RewriteInlineTaskApprovalReply(r.Context(), llmproxy.InlineApprovalRewriteRequest{
-		HTTPRequest:     r,
-		Provider:        provider,
-		Body:            body,
-		Agent:           agent,
-		ConversationID:  conversationID,
-		PendingApproval: h.PendingApprovals,
-		Creator:         h.InlineTaskCreator,
-		Audit:           h.AuditEmitter,
-		RequestID:       requestID,
-		Outcomes:        h.InlineApprovalOutcomes,
-		Checkouts:       h.TaskCheckouts,
-	}); inlineErr != nil {
-		auditStatus = http.StatusBadRequest
-		auditDecide = "deny"
-		auditOutcome = "malformed_request"
-		auditReason = inlineErr.Error()
-		h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't process the inline-approval reply: "+inlineErr.Error()+". Please retry.")
-		return
-	} else if inlineRewrite.Rewritten {
-		body = inlineRewrite.Body
-		if _, err := parser.ParseRequest(body); err != nil {
+	// Seventh migrated call site through pipeline: inline_task_intercept.
+	{
+		pipeReq := &pipelineReadOnlyRequest{
+			provider:       provider,
+			httpReq:        r,
+			body:           body,
+			userID:         agent.UserID,
+			agentID:        agent.ID,
+			conversationID: conversationID,
+		}
+		result, err := runSinglePolicy(r.Context(), pipeReq, policies.NewInlineTaskIntercept(
+			h.PendingApprovals, agent, requestID, func(ctx context.Context, req policies.InlineTaskApprovalRequest) (policies.InlineTaskApprovalResult, error) {
+				pending, ok := req.PendingApproval.(llmproxy.PendingApprovalCache)
+				if !ok || pending == nil {
+					return policies.InlineTaskApprovalResult{}, fmt.Errorf("inline task approval pending cache not configured")
+				}
+				rewrite, err := llmproxy.RewriteInlineTaskApprovalReply(ctx, llmproxy.InlineApprovalRewriteRequest{
+					HTTPRequest:     req.HTTPRequest,
+					Provider:        req.Provider,
+					Body:            req.Body,
+					Agent:           req.Agent,
+					ConversationID:  req.ConversationID,
+					PendingApproval: pending,
+					Creator:         h.InlineTaskCreator,
+					Audit:           h.AuditEmitter,
+					RequestID:       req.RequestID,
+					Outcomes:        h.InlineApprovalOutcomes,
+					Checkouts:       h.TaskCheckouts,
+				})
+				if err != nil {
+					return policies.InlineTaskApprovalResult{}, err
+				}
+				return policies.InlineTaskApprovalResult{
+					Body:       rewrite.Body,
+					Rewritten:  rewrite.Rewritten,
+					Outcome:    rewrite.Outcome,
+					Reason:     rewrite.Reason,
+					TaskID:     rewrite.TaskID,
+					CheckedOut: rewrite.CheckedOut,
+				}, nil
+			},
+		))
+		if err != nil {
+			auditStatus = http.StatusInternalServerError
+			auditDecide = "deny"
+			auditOutcome = "pipeline_error"
+			auditReason = err.Error()
+			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusInternalServerError, "PIPELINE_ERROR", "internal pipeline error. Please retry; details are in the Clawvisor audit log.")
+			return
+		}
+		for k, v := range result.AuditParams {
+			auditParams[k] = v
+		}
+		if result.DenyReason != "" {
 			auditStatus = http.StatusBadRequest
 			auditDecide = "deny"
 			auditOutcome = "malformed_request"
-			auditReason = err.Error()
-			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't parse this request: "+err.Error()+". This usually means a client bug; please retry.")
+			auditReason = result.DenyReason
+			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't process the inline-approval reply: "+strings.TrimRight(result.DenyReason, ". ")+". Please retry.")
 			return
 		}
-		inlineApprovalConsumed = true
-		auditParams["inline_task_approval_rewritten"] = true
-		auditParams["inline_task_outcome"] = inlineRewrite.Outcome
-		if inlineRewrite.TaskID != "" {
-			auditParams["inline_task_id"] = inlineRewrite.TaskID
-		}
-		if inlineRewrite.CheckedOut {
-			auditParams["inline_task_checked_out"] = true
-		}
-		if inlineRewrite.Reason != "" {
-			auditParams["inline_task_reason"] = inlineRewrite.Reason
+		if result.BodyReplaced {
+			body = result.FinalBody
+			if _, err := parser.ParseRequest(body); err != nil {
+				auditStatus = http.StatusBadRequest
+				auditDecide = "deny"
+				auditOutcome = "malformed_request"
+				auditReason = err.Error()
+				h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't parse this request: "+err.Error()+". This usually means a client bug; please retry.")
+				return
+			}
+			inlineApprovalConsumed = true
 		}
 	}
 
@@ -526,37 +667,87 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 	// the context is lost and the model duplicates work
 	// (re-POSTs /api/control/tasks, re-emits tool_use). Walk conversation
 	// history and re-inject the persistent context on every request.
-	if augBody, augmented, augErr := llmproxy.AugmentApprovedInlineTasksInHistory(body, provider, h.InlineApprovalOutcomes, agent.UserID, agent.ID); augErr != nil {
-		h.Logger.WarnContext(r.Context(), "lite-proxy inline task augmentation failed",
-			"request_id", requestID, "agent_id", agent.ID, "err", augErr.Error())
-	} else if augmented {
-		body = augBody
-		auditParams["inline_task_history_augmented"] = true
+	//
+	// Fourth migrated call site through pipeline.
+	{
+		pipeReq := &pipelineReadOnlyRequest{
+			provider:       provider,
+			httpReq:        r,
+			body:           body,
+			userID:         agent.UserID,
+			agentID:        agent.ID,
+			conversationID: conversationID,
+		}
+		result, err := runSinglePolicy(r.Context(), pipeReq, policies.NewInlineTaskAugment(func(ctx context.Context, req policies.InlineTaskHistoryAugmentRequest) (policies.InlineTaskHistoryAugmentResult, error) {
+			if h.InlineApprovalOutcomes == nil {
+				return policies.InlineTaskHistoryAugmentResult{Body: req.Body}, nil
+			}
+			body, modified, err := llmproxy.AugmentApprovedInlineTasksInHistory(req.Body, req.Provider, h.InlineApprovalOutcomes, req.UserID, req.AgentID)
+			if err != nil {
+				return policies.InlineTaskHistoryAugmentResult{}, err
+			}
+			return policies.InlineTaskHistoryAugmentResult{Body: body, Modified: modified}, nil
+		}))
+		if err != nil {
+			h.Logger.WarnContext(r.Context(), "lite-proxy inline task augmentation pipeline failed",
+				"request_id", requestID, "agent_id", agent.ID, "err", err.Error())
+			auditParams["inline_task_history_augment_error"] = liteProxyAuditErrorDetail(err)
+		} else {
+			body = result.FinalBody
+			for k, v := range result.AuditParams {
+				auditParams[k] = v
+			}
+		}
 	}
 	reqSummary := liteProxyRequestDebugSummary(provider, body)
 	h.ensureDefaultToolRules(r.Context(), agent, reqSummary.AvailableTools)
-	if h.ControlBaseURL != "" && shouldInjectLiteControlNotice(r.URL.Path, reqSummary) {
-		// Notice injection is best-effort UX; a store error here should
-		// not fail-close the request because no authorization decision
-		// is being made. Authorization-relevant call sites below check
-		// the error and refuse.
-		_, noticeToolRules, _, noticeLoadErr := h.loadLiteProxyDecisionInputs(r.Context(), agent)
-		if noticeLoadErr != nil {
-			h.Logger.WarnContext(r.Context(), "lite-proxy notice injection skipped: decision-input load failed",
-				"agent_id", agent.ID, "err", noticeLoadErr.Error())
-			noticeToolRules = nil
+	// Fifth migrated call site through pipeline: control_notice. The
+	// policy's gating mirrors shouldInjectLiteControlNotice (URL path
+	// + tools[] declared); the AvailableToolsFn and ToolRulesLoader
+	// callbacks delegate to existing handler helpers so the policy
+	// stays Store-decoupled.
+	{
+		availableToolsFn := func(p conversation.Provider, b []byte) []string {
+			return liteProxyRequestDebugSummary(p, b).AvailableTools
 		}
-		injectedBody, injected, injectErr := llmproxy.InjectControlNoticeWithPolicy(provider, body, h.ControlBaseURL, reqSummary.AvailableTools, noticeToolRules)
-		if injectErr != nil {
+		toolRulesLoader := func(ctx context.Context, _, _ string) []*store.RuntimePolicyRule {
+			_, rules, _, loadErr := h.loadLiteProxyDecisionInputs(ctx, agent)
+			if loadErr != nil {
+				h.Logger.WarnContext(ctx, "lite-proxy notice injection skipped: decision-input load failed",
+					"agent_id", agent.ID, "err", loadErr.Error())
+				return nil
+			}
+			return rules
+		}
+		pipeReq := &pipelineReadOnlyRequest{
+			provider: provider,
+			httpReq:  r,
+			body:     body,
+			userID:   agent.UserID,
+			agentID:  agent.ID,
+		}
+		result, err := runSinglePolicy(r.Context(), pipeReq, policies.NewControlNotice(h.ControlBaseURL, availableToolsFn, toolRulesLoader))
+		if err != nil {
+			auditStatus = http.StatusInternalServerError
+			auditDecide = "deny"
+			auditOutcome = "pipeline_error"
+			auditReason = err.Error()
+			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusInternalServerError, "PIPELINE_ERROR", "internal pipeline error. Please retry; details are in the Clawvisor audit log.")
+			return
+		}
+		for k, v := range result.AuditParams {
+			auditParams[k] = v
+		}
+		if result.DenyReason != "" {
 			auditStatus = http.StatusBadRequest
 			auditDecide = "deny"
 			auditOutcome = "malformed_request"
-			auditReason = injectErr.Error()
-			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't inject the control notice: "+injectErr.Error()+". Please retry.")
+			auditReason = result.DenyReason
+			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadRequest, "MALFORMED_REQUEST", "couldn't inject the control notice: "+strings.TrimRight(result.DenyReason, ". ")+". Please retry.")
 			return
 		}
-		if injected {
-			body = injectedBody
+		if string(result.FinalBody) != string(body) {
+			body = result.FinalBody
 			if _, err := parser.ParseRequest(body); err != nil {
 				auditStatus = http.StatusBadRequest
 				auditDecide = "deny"
@@ -566,7 +757,6 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			reqSummary = liteProxyRequestDebugSummary(provider, body)
-			auditParams["control_notice_injected"] = true
 		}
 	}
 	auditParams["model"] = reqSummary.Model
@@ -596,7 +786,103 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 	// the same turn). A single user "approve" must only resolve one
 	// hold.
 	if !inlineApprovalConsumed {
-		if handled := h.maybeHandleLiteApprovalRelease(w, r, agent, provider, requestID, conversationID, body, &auditStatus, &auditDecide, &auditOutcome, &auditReason); handled {
+		// Eighth migrated call site through pipeline:
+		// ApprovalRelease wraps the tryApprovalRelease helper extracted
+		// from the legacy maybeHandleLiteApprovalRelease method.
+		// ShortCircuit fires when a release is handled; the handler
+		// writes the synthesized response and returns.
+		pipeReq := &pipelineReadOnlyRequest{
+			provider:       provider,
+			httpReq:        r,
+			body:           body,
+			userID:         agent.UserID,
+			agentID:        agent.ID,
+			conversationID: conversationID,
+		}
+		resolver := func(ctx context.Context) policies.ApprovalReleaseResult {
+			release := h.tryApprovalRelease(r, agent, provider, requestID, conversationID, body)
+			return policies.ApprovalReleaseResult{
+				Handled:     release.Handled,
+				HTTPStatus:  release.HTTPStatus,
+				Body:        release.Body,
+				ContentType: release.ContentType,
+				Decision:    release.Decision,
+				Outcome:     release.Outcome,
+				Reason:      release.Reason,
+			}
+		}
+		preResult, err := runSinglePolicy(r.Context(), pipeReq, policies.NewApprovalRelease(resolver))
+		if err != nil {
+			auditStatus = http.StatusInternalServerError
+			auditDecide = "deny"
+			auditOutcome = "pipeline_error"
+			auditReason = err.Error()
+			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusInternalServerError, "PIPELINE_ERROR", "internal pipeline error. Please retry; details are in the Clawvisor audit log.")
+			return
+		}
+		for k, v := range preResult.AuditParams {
+			auditParams[k] = v
+		}
+		if sc := preResult.ShortCircuit; sc != nil {
+			// Translate the synthesized response into the handler's
+			// response-write protocol. Mirrors what the legacy
+			// maybeHandleLiteApprovalRelease method did inline.
+			auditStatus = sc.StatusCode
+			auditDecide, _ = preResult.AuditParams["approval_release_decision"].(string)
+			auditOutcome, _ = preResult.AuditParams["approval_release_outcome"].(string)
+			auditReason, _ = preResult.AuditParams["approval_release_reason"].(string)
+			// The decision-input-load-failed sentinel translates to the
+			// DECISION_INPUT_UNAVAILABLE error response shape.
+			if auditOutcome == "decision_input_load_failed" {
+				h.Logger.WarnContext(r.Context(), "lite-proxy approval-release decision-input load failed; failing closed",
+					"request_id", requestID, "agent_id", agent.ID, "err", auditReason)
+				h.writeLiteProxyError(w, r, agent, provider, body, requestID, sc.StatusCode, "DECISION_INPUT_UNAVAILABLE",
+					"couldn't load authorization data right now. Please retry in a moment.")
+				return
+			}
+			h.Logger.DebugContext(r.Context(), "lite-proxy approval release handled (via pipeline)",
+				"request_id", requestID,
+				"agent_id", agent.ID,
+				"provider", string(provider),
+				"http_status", sc.StatusCode,
+				"decision", auditDecide,
+				"outcome", auditOutcome,
+				"reason", auditReason,
+			)
+			if len(sc.Body) == 0 {
+				msg := auditReason
+				if strings.TrimSpace(msg) == "" {
+					msg = "couldn't resolve that approval reply. Please retry; details are in the Clawvisor audit log."
+				}
+				h.writeLiteProxyError(w, r, agent, provider, body, requestID, sc.StatusCode, "APPROVAL_RELEASE_ERROR",
+					msg)
+				return
+			}
+			for k, v := range sc.Headers {
+				w.Header().Set(k, v)
+			}
+			w.Header().Set("Cache-Control", "no-cache")
+			if h.RawIOLogger != nil {
+				bodyStr, bodyEnc := llmproxy.EncodeBody(sc.Body)
+				h.RawIOLogger.Emit(llmproxy.RawIOEvent{
+					Phase:        "harness_response",
+					RequestID:    requestID,
+					UserID:       agent.UserID,
+					AgentID:      agent.ID,
+					Provider:     string(provider),
+					Method:       r.Method,
+					Path:         r.URL.RequestURI(),
+					Status:       sc.StatusCode,
+					ContentType:  sc.Headers["Content-Type"],
+					Headers:      llmproxy.SafeHeaderSnapshot(w.Header()),
+					Body:         bodyStr,
+					BodyEncoding: bodyEnc,
+					BodyBytes:    len(sc.Body),
+					Marker:       "synth_release_" + auditOutcome,
+				})
+			}
+			w.WriteHeader(sc.StatusCode)
+			_, _ = io.Copy(w, bytes.NewReader(sc.Body))
 			return
 		}
 	}
@@ -647,16 +933,29 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	auditParams["first_turn"] = firstTurn
 	auditParams["conversation_id_source"] = liteProxyConversationIDSource(provider, r, conversationID, mintedConversationID)
-	if stripped, stripErr := llmproxy.StripSyntheticApprovalHistory(llmproxy.SyntheticApprovalHistoryStripRequest{
-		Provider: provider,
-		Body:     body,
-	}); stripErr != nil {
-		h.Logger.WarnContext(r.Context(), "lite-proxy synthetic approval history strip failed",
-			"request_id", requestID, "agent_id", agent.ID, "err", stripErr.Error())
-	} else if stripped.Modified {
-		body = stripped.Body
-		auditParams["synthetic_approval_history_stripped"] = true
-		reqSummary = liteProxyRequestDebugSummary(provider, body)
+	// Third migrated call site through pipeline.
+	{
+		pipeReq := &pipelineReadOnlyRequest{
+			provider:       provider,
+			httpReq:        r,
+			body:           body,
+			userID:         agent.UserID,
+			agentID:        agent.ID,
+			conversationID: conversationID,
+		}
+		result, err := runSinglePolicy(r.Context(), pipeReq, policies.NewSyntheticHistoryStrip())
+		if err != nil {
+			h.Logger.WarnContext(r.Context(), "lite-proxy synthetic approval history strip pipeline failed",
+				"request_id", requestID, "agent_id", agent.ID, "err", err.Error())
+		} else {
+			if string(result.FinalBody) != string(body) {
+				body = result.FinalBody
+				reqSummary = liteProxyRequestDebugSummary(provider, body)
+			}
+			for k, v := range result.AuditParams {
+				auditParams[k] = v
+			}
+		}
 	}
 
 	upstreamURL := ""
@@ -830,33 +1129,46 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 			}
 
 			cfg := llmproxy.PostprocessConfig{
-				Inspector:                        h.Inspector,
-				RewriteOpts:                      opts,
-				Store:                            h.Store,
-				AgentUserID:                      agent.UserID,
-				AgentID:                          agent.ID,
-				ConversationID:                   conversationID,
-				Audit:                            h.AuditEmitter,
-				RequestID:                        requestID,
-				Catalog:                          catalogIface,
-				TaskScope:                        h.TaskScope,
-				IntentVerifier:                   h.IntentVerifier,
-				Posture:                          liteProxyDecisionPosture(agent),
-				CandidateTasks:                   candidateTasks,
-				ToolRules:                        toolRules,
-				EgressRules:                      egressRules,
-				PreferredTaskID:                  preferredTaskID,
-				PendingApprovals:                 h.PendingApprovals,
-				ControlBaseURL:                   h.ControlBaseURL,
-				CallerNonces:                     h.CallerNonces,
-				Trace:                            h.TraceLogger,
-				TaskRiskAssessor:                 h.taskRiskBridge(),
-				AgentName:                        agent.Name,
-				RecentUserTurns:                  recentTurns,
-				ConversationAutoApproveThreshold: autoApproveThreshold,
-				InlineTaskCreator:                h.InlineTaskCreator,
-				Checkouts:                        h.TaskCheckouts,
-				DefaultTaskExpirySeconds:         h.DefaultTaskExpirySeconds,
+				ToolUseEvaluatorFactory: pipelineToolUseEvaluatorFactory,
+				AgentContext: llmproxy.AgentContext{
+					AgentUserID: agent.UserID,
+					AgentID:     agent.ID,
+					AgentName:   agent.Name,
+				},
+				AuditContext: llmproxy.AuditContext{
+					ConversationID: conversationID,
+					Audit:          h.AuditEmitter,
+					RequestID:      requestID,
+					Trace:          h.TraceLogger,
+				},
+				AuthorizationContext: llmproxy.AuthorizationContext{
+					Catalog:         catalogIface,
+					TaskScope:       h.TaskScope,
+					IntentVerifier:  h.IntentVerifier,
+					Posture:         liteProxyDecisionPosture(agent),
+					CandidateTasks:  candidateTasks,
+					ToolRules:       toolRules,
+					EgressRules:     egressRules,
+					PreferredTaskID: preferredTaskID,
+				},
+				ApprovalContext: llmproxy.ApprovalContext{
+					PendingApprovals:                 h.PendingApprovals,
+					TaskRiskAssessor:                 h.taskRiskBridge(),
+					RecentUserTurns:                  recentTurns,
+					ConversationAutoApproveThreshold: autoApproveThreshold,
+					InlineTaskCreator:                h.InlineTaskCreator,
+					Checkouts:                        h.TaskCheckouts,
+					DefaultTaskExpirySeconds:         h.DefaultTaskExpirySeconds,
+				},
+				RewriteContext: llmproxy.RewriteContext{
+					Inspector:    h.Inspector,
+					RewriteOpts:  opts,
+					Store:        h.Store,
+					CallerNonces: h.CallerNonces,
+				},
+				RoutingContext: llmproxy.RoutingContext{
+					ControlBaseURL: h.ControlBaseURL,
+				},
 			}
 			// First-turn routing notice. Mirrors the buffered path's
 			// invocation below (search "first-turn routing notice").
@@ -886,7 +1198,7 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 			var capturedUpstream bytes.Buffer
 			teeReader := io.TeeReader(resp.Body, &capturedUpstream)
 
-			processed, err := llmproxy.PostprocessStream(r.Context(), r, teeReader, streamW, upstreamCT, cfg)
+			processed, err := postproc.PostprocessStream(r.Context(), r, teeReader, streamW, upstreamCT, cfg)
 			if err != nil {
 				h.Logger.WarnContext(r.Context(), "lite-proxy postprocess streaming error",
 					"request_id", requestID, "agent_id", agent.ID, "err", err.Error())
@@ -894,12 +1206,12 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 				auditOutcome = "postprocess_stream_error"
 				auditReason = err.Error()
 				if !streamResp.WroteHeader() {
-					clearHeaders(w.Header())
+					clearHeadersPreservingRequestIDs(w.Header())
 					h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadGateway, "POSTPROCESS_STREAM_ERROR",
 						"couldn't process the upstream stream. Please retry; details are in the Clawvisor audit log.")
 				} else {
-					llmproxy.WriteStreamError(streamW, r, provider, processed.StreamingResult,
-						"[Clawvisor] The upstream connection was lost before the response completed. The content above may be incomplete. Please retry.")
+					postproc.WriteStreamError(streamW, r, provider, processed.StreamingResult,
+						"[Clawvisor] The upstream connection was lost before the response completed. The content above may be incomplete. Please retry; details are in the Clawvisor audit log.")
 				}
 				return
 			}
@@ -916,7 +1228,7 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 
 			if auditTaskID == "" {
 				for _, dec := range processed.Decisions {
-					if dec.Verdict.ContinueWithToolResult != "" && dec.Verdict.CreatedTaskID != "" {
+					if _, ok := dec.Verdict.ContinuationToolResultContent(); ok && dec.Verdict.CreatedTaskID != "" {
 						auditTaskID = dec.Verdict.CreatedTaskID
 						break
 					}
@@ -931,11 +1243,11 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 				case contErr != nil:
 					h.Logger.WarnContext(r.Context(), "lite-proxy streaming continuation failed",
 						"request_id", requestID, "agent_id", agent.ID, "err", contErr.Error())
+					auditStatus = http.StatusBadGateway
+					auditOutcome = "streaming_continuation_failed"
+					auditReason = contErr.Error()
 					if !streamResp.WroteHeader() {
-						clearHeaders(w.Header())
-						auditStatus = http.StatusBadGateway
-						auditOutcome = "streaming_continuation_failed"
-						auditReason = contErr.Error()
+						clearHeadersPreservingRequestIDs(w.Header())
 						h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadGateway, "STREAMING_CONTINUATION_FAILED",
 							"couldn't continue the streamed tool result. Please retry; details are in the Clawvisor audit log.")
 					}
@@ -948,11 +1260,11 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 							"skipped_reason", contFinal.SkippedReason,
 							"body_bytes", len(contFinal.Body),
 						)
+						auditStatus = http.StatusBadGateway
+						auditOutcome = "streaming_continuation_postprocess_error"
+						auditReason = contFinal.SkippedReason
 						if !streamResp.WroteHeader() {
-							clearHeaders(w.Header())
-							auditStatus = http.StatusBadGateway
-							auditOutcome = "streaming_continuation_postprocess_error"
-							auditReason = contFinal.SkippedReason
+							clearHeadersPreservingRequestIDs(w.Header())
 							h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadGateway, "STREAMING_CONTINUATION_POSTPROCESS_ERROR",
 								"couldn't process the streamed continuation response. Please retry; details are in the Clawvisor audit log.")
 						}
@@ -977,11 +1289,11 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 						if spliceErr != nil {
 							h.Logger.WarnContext(r.Context(), "lite-proxy streaming continuation splice failed",
 								"request_id", requestID, "agent_id", agent.ID, "err", spliceErr.Error())
+							auditStatus = http.StatusBadGateway
+							auditOutcome = "streaming_continuation_splice_failed"
+							auditReason = spliceErr.Error()
 							if !streamResp.WroteHeader() {
-								clearHeaders(w.Header())
-								auditStatus = http.StatusBadGateway
-								auditOutcome = "streaming_continuation_splice_failed"
-								auditReason = spliceErr.Error()
+								clearHeadersPreservingRequestIDs(w.Header())
 								h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusBadGateway, "STREAMING_CONTINUATION_SPLICE_FAILED",
 									"couldn't merge the streamed continuation response. Please retry; details are in the Clawvisor audit log.")
 							}
@@ -990,6 +1302,9 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 						if _, writeErr := streamW.Write(continuationBody); writeErr != nil {
 							h.Logger.WarnContext(r.Context(), "lite-proxy streaming continuation write failed",
 								"request_id", requestID, "agent_id", agent.ID, "err", writeErr.Error())
+							auditStatus = http.StatusBadGateway
+							auditOutcome = "streaming_continuation_write_failed"
+							auditReason = writeErr.Error()
 							return
 						}
 					}
@@ -1219,37 +1534,47 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 			Body:     body,
 		})
 		autoApproveThreshold := agentConversationAutoApproveThreshold(agent)
-		processed := llmproxy.Postprocess(r, full, upstreamCT, llmproxy.PostprocessConfig{
-			Inspector:        h.Inspector,
-			RewriteOpts:      opts,
-			Store:            h.Store,
-			AgentUserID:      agent.UserID,
-			AgentID:          agent.ID,
-			ConversationID:   conversationID,
-			Audit:            h.AuditEmitter,
-			RequestID:        requestID,
-			Catalog:          catalogIface,
-			TaskScope:        h.TaskScope,
-			IntentVerifier:   h.IntentVerifier,
-			Posture:          liteProxyDecisionPosture(agent),
-			CandidateTasks:   candidateTasks,
-			ToolRules:        toolRules,
-			EgressRules:      egressRules,
-			PreferredTaskID:  preferredTaskID,
-			PendingApprovals: h.PendingApprovals,
-			ControlBaseURL:   h.ControlBaseURL,
-			// Per-tool-use nonce minting overrides RewriteOpts.CallerToken
-			// inside the credentialed rewrite path so the agent's raw
-			// bearer token never enters the model's conversation context.
-			CallerNonces:                     h.CallerNonces,
-			Trace:                            h.TraceLogger,
-			TaskRiskAssessor:                 h.taskRiskBridge(),
-			AgentName:                        agent.Name,
-			RecentUserTurns:                  recentTurns,
-			ConversationAutoApproveThreshold: autoApproveThreshold,
-			InlineTaskCreator:                h.InlineTaskCreator,
-			Checkouts:                        h.TaskCheckouts,
-			DefaultTaskExpirySeconds:         h.DefaultTaskExpirySeconds,
+		processed := postproc.Postprocess(r, full, upstreamCT, llmproxy.PostprocessConfig{
+			ToolUseEvaluatorFactory: pipelineToolUseEvaluatorFactory,
+			AgentContext: llmproxy.AgentContext{
+				AgentUserID: agent.UserID,
+				AgentID:     agent.ID,
+				AgentName:   agent.Name,
+			},
+			AuditContext: llmproxy.AuditContext{
+				ConversationID: conversationID,
+				Audit:          h.AuditEmitter,
+				RequestID:      requestID,
+				Trace:          h.TraceLogger,
+			},
+			AuthorizationContext: llmproxy.AuthorizationContext{
+				Catalog:         catalogIface,
+				TaskScope:       h.TaskScope,
+				IntentVerifier:  h.IntentVerifier,
+				Posture:         liteProxyDecisionPosture(agent),
+				CandidateTasks:  candidateTasks,
+				ToolRules:       toolRules,
+				EgressRules:     egressRules,
+				PreferredTaskID: preferredTaskID,
+			},
+			ApprovalContext: llmproxy.ApprovalContext{
+				PendingApprovals:                 h.PendingApprovals,
+				TaskRiskAssessor:                 h.taskRiskBridge(),
+				RecentUserTurns:                  recentTurns,
+				ConversationAutoApproveThreshold: autoApproveThreshold,
+				InlineTaskCreator:                h.InlineTaskCreator,
+				Checkouts:                        h.TaskCheckouts,
+				DefaultTaskExpirySeconds:         h.DefaultTaskExpirySeconds,
+			},
+			RewriteContext: llmproxy.RewriteContext{
+				Inspector:    h.Inspector,
+				RewriteOpts:  opts,
+				Store:        h.Store,
+				CallerNonces: h.CallerNonces,
+			},
+			RoutingContext: llmproxy.RoutingContext{
+				ControlBaseURL: h.ControlBaseURL,
+			},
 		})
 		h.Logger.DebugContext(r.Context(), "lite-proxy postprocess complete",
 			"request_id", requestID,
@@ -1277,33 +1602,46 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 		// terminal assistant text), so the harness never sees an empty body.
 		{
 			contFinal, contStatus, contCT, contUsage, contErr := h.tryContinuation(r, agent, provider, requestID, body, full, upstreamCT, resp.StatusCode, processed, llmproxy.PostprocessConfig{
-				Inspector:                        h.Inspector,
-				RewriteOpts:                      opts,
-				Store:                            h.Store,
-				AgentUserID:                      agent.UserID,
-				AgentID:                          agent.ID,
-				ConversationID:                   conversationID,
-				Audit:                            h.AuditEmitter,
-				RequestID:                        requestID,
-				Catalog:                          catalogIface,
-				TaskScope:                        h.TaskScope,
-				IntentVerifier:                   h.IntentVerifier,
-				Posture:                          liteProxyDecisionPosture(agent),
-				CandidateTasks:                   candidateTasks,
-				ToolRules:                        toolRules,
-				EgressRules:                      egressRules,
-				PreferredTaskID:                  preferredTaskID,
-				PendingApprovals:                 h.PendingApprovals,
-				ControlBaseURL:                   h.ControlBaseURL,
-				CallerNonces:                     h.CallerNonces,
-				Trace:                            h.TraceLogger,
-				TaskRiskAssessor:                 h.taskRiskBridge(),
-				AgentName:                        agent.Name,
-				RecentUserTurns:                  recentTurns,
-				ConversationAutoApproveThreshold: autoApproveThreshold,
-				InlineTaskCreator:                h.InlineTaskCreator,
-				Checkouts:                        h.TaskCheckouts,
-				DefaultTaskExpirySeconds:         h.DefaultTaskExpirySeconds,
+				ToolUseEvaluatorFactory: pipelineToolUseEvaluatorFactory,
+				AgentContext: llmproxy.AgentContext{
+					AgentUserID: agent.UserID,
+					AgentID:     agent.ID,
+					AgentName:   agent.Name,
+				},
+				AuditContext: llmproxy.AuditContext{
+					ConversationID: conversationID,
+					Audit:          h.AuditEmitter,
+					RequestID:      requestID,
+					Trace:          h.TraceLogger,
+				},
+				AuthorizationContext: llmproxy.AuthorizationContext{
+					Catalog:         catalogIface,
+					TaskScope:       h.TaskScope,
+					IntentVerifier:  h.IntentVerifier,
+					Posture:         liteProxyDecisionPosture(agent),
+					CandidateTasks:  candidateTasks,
+					ToolRules:       toolRules,
+					EgressRules:     egressRules,
+					PreferredTaskID: preferredTaskID,
+				},
+				ApprovalContext: llmproxy.ApprovalContext{
+					PendingApprovals:                 h.PendingApprovals,
+					TaskRiskAssessor:                 h.taskRiskBridge(),
+					RecentUserTurns:                  recentTurns,
+					ConversationAutoApproveThreshold: autoApproveThreshold,
+					InlineTaskCreator:                h.InlineTaskCreator,
+					Checkouts:                        h.TaskCheckouts,
+					DefaultTaskExpirySeconds:         h.DefaultTaskExpirySeconds,
+				},
+				RewriteContext: llmproxy.RewriteContext{
+					Inspector:    h.Inspector,
+					RewriteOpts:  opts,
+					Store:        h.Store,
+					CallerNonces: h.CallerNonces,
+				},
+				RoutingContext: llmproxy.RoutingContext{
+					ControlBaseURL: h.ControlBaseURL,
+				},
 			})
 			switch {
 			case contErr != nil:
@@ -1351,7 +1689,7 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 				// rather than overwrite with the just-minted task.
 				if auditTaskID == "" {
 					for _, dec := range processed.Decisions {
-						if dec.Verdict.ContinueWithToolResult != "" && dec.Verdict.CreatedTaskID != "" {
+						if _, ok := dec.Verdict.ContinuationToolResultContent(); ok && dec.Verdict.CreatedTaskID != "" {
 							auditTaskID = dec.Verdict.CreatedTaskID
 							break
 						}
@@ -1660,12 +1998,13 @@ func (h *LLMEndpointHandler) tryContinuation(
 	}
 	var toolResults []llmproxy.ContinuationToolResult
 	for _, dec := range processed.Decisions {
-		if dec.Verdict.ContinueWithToolResult == "" {
+		content, ok := dec.Verdict.ContinuationToolResultContent()
+		if !ok {
 			continue
 		}
 		toolResults = append(toolResults, llmproxy.ContinuationToolResult{
 			ToolUseID: dec.ToolUse.ID,
-			Content:   dec.Verdict.ContinueWithToolResult,
+			Content:   content,
 		})
 	}
 	if len(toolResults) == 0 {
@@ -1698,7 +2037,7 @@ func (h *LLMEndpointHandler) tryContinuation(
 		var droppedNames []string
 		var autoApprovedTUID, autoApprovedTaskID string
 		for _, dec := range processed.Decisions {
-			if dec.Verdict.ContinueWithToolResult != "" {
+			if _, ok := dec.Verdict.ContinuationToolResultContent(); ok {
 				autoApprovedTUID = dec.ToolUse.ID
 				if autoApprovedTaskID == "" {
 					autoApprovedTaskID = dec.Verdict.CreatedTaskID
@@ -1794,12 +2133,12 @@ func (h *LLMEndpointHandler) tryContinuation(
 	// not loop, so the second Postprocess pass below runs at most once
 	// per inbound harness request. If that second pass fires the
 	// auto-approve gate again, the gate's verdict still carries
-	// ContinueWithToolResult, but we never act on it — the caller
+	// a continuation signal, but we never act on it — the caller
 	// (serve()) doesn't re-invoke tryContinuation. The verdict's
 	// SubstituteWith fallback renders as a terminal text turn instead,
 	// which is the right behavior for a model that re-emits a task-
 	// creation tool_use on the continuation.
-	newProcessed := llmproxy.Postprocess(r, full, contCT, cfg)
+	newProcessed := postproc.Postprocess(r, full, contCT, cfg)
 	// Force Rewritten=true on a successful continuation swap. The
 	// body now comes from a SECOND upstream call whose length almost
 	// certainly differs from the first call's Content-Length (which
@@ -1819,7 +2158,7 @@ func (h *LLMEndpointHandler) tryContinuation(
 	newProcessed.Rewritten = true
 
 	// User-facing notices. The auto-approve gate records a one-line
-	// notice on each verdict via PrependAssistantNotice; we collect
+	// notice on each continuation verdict; we collect
 	// them here and inject into the continuation's assistant turn so
 	// the user sees what was auto-approved at the top of the model's
 	// response. Multiple notices (one per auto-approved tool_use in
@@ -1840,7 +2179,7 @@ func (h *LLMEndpointHandler) tryContinuation(
 	seen := map[string]struct{}{}
 	collect := func(decs []conversation.ToolUseDecisionRecord) {
 		for _, dec := range decs {
-			n := strings.TrimSpace(dec.Verdict.PrependAssistantNotice)
+			n := strings.TrimSpace(dec.Verdict.ContinuationNotice())
 			if n == "" {
 				continue
 			}
@@ -1942,6 +2281,21 @@ func (w *delayedHeaderWriter) WroteHeader() bool {
 func clearHeaders(h http.Header) {
 	for k := range h {
 		delete(h, k)
+	}
+}
+
+func clearHeadersPreservingRequestIDs(h http.Header) {
+	preserved := make(http.Header)
+	for _, key := range []string{"request-id", "x-request-id", "anthropic-request-id"} {
+		for _, value := range h.Values(key) {
+			preserved.Add(key, value)
+		}
+	}
+	clearHeaders(h)
+	for key, values := range preserved {
+		for _, value := range values {
+			h.Add(key, value)
+		}
 	}
 }
 
@@ -2750,26 +3104,39 @@ func (h *LLMEndpointHandler) forwardLitePassthrough(w http.ResponseWriter, r *ht
 }
 
 func (h *LLMEndpointHandler) preprocessLiteSecretBody(w http.ResponseWriter, r *http.Request, agent *store.Agent, provider conversation.Provider, requestID string, body []byte, extraSuppressed map[string]struct{}, liteProxySecretDetectionDisabled bool, auditParams map[string]any, auditStatus *int, auditDecide, auditOutcome, auditReason *string) ([]byte, bool) {
-	if stripped, err := llmproxy.StripSecretDecisionHistory(llmproxy.SecretDecisionHistoryStripRequest{
-		Provider: provider,
-		Body:     body,
-	}); err != nil {
-		h.emitLiteSecretPipelineTrace(requestID, agent, "history_strip_error", map[string]any{
-			"provider": string(provider),
-			"body_sha": liteSecretBodySHA(body),
-			"err":      err.Error(),
-		})
-		h.Logger.WarnContext(r.Context(), "lite-proxy secret decision history strip failed",
-			"agent_id", agent.ID, "err", err.Error())
-	} else if stripped.Modified {
-		h.emitLiteSecretPipelineTrace(requestID, agent, "history_stripped", map[string]any{
-			"provider":        string(provider),
-			"body_sha_before": liteSecretBodySHA(body),
-			"body_sha_after":  liteSecretBodySHA(stripped.Body),
-			"body_bytes":      len(stripped.Body),
-		})
-		body = stripped.Body
-		auditParams["secret_decision_history_stripped"] = true
+	// Eleventh migrated call site through pipeline: SecretHistoryStrip.
+	// The policy emits secret_history_stripped:true on rewrite; for
+	// compatibility with the legacy audit-flag name, we map it back to
+	// secret_decision_history_stripped at the handler boundary.
+	{
+		preBodySHA := liteSecretBodySHA(body)
+		pipeReq := &pipelineReadOnlyRequest{
+			provider: provider,
+			httpReq:  r,
+			body:     body,
+			userID:   agent.UserID,
+			agentID:  agent.ID,
+		}
+		result, err := runSinglePolicy(r.Context(), pipeReq, policies.NewSecretHistoryStrip())
+		if err != nil {
+			h.emitLiteSecretPipelineTrace(requestID, agent, "history_strip_error", map[string]any{
+				"provider": string(provider),
+				"body_sha": preBodySHA,
+				"err":      err.Error(),
+			})
+			h.Logger.WarnContext(r.Context(), "lite-proxy secret decision history strip pipeline failed",
+				"agent_id", agent.ID, "err", err.Error())
+		} else if string(result.FinalBody) != string(body) {
+			h.emitLiteSecretPipelineTrace(requestID, agent, "history_stripped", map[string]any{
+				"provider":        string(provider),
+				"body_sha_before": preBodySHA,
+				"body_sha_after":  liteSecretBodySHA(result.FinalBody),
+				"body_bytes":      len(result.FinalBody),
+			})
+			body = result.FinalBody
+			// Keep the legacy audit-flag name for dashboard compatibility.
+			auditParams["secret_decision_history_stripped"] = true
+		}
 	}
 	if liteProxySecretDetectionDisabled {
 		h.emitLiteSecretPipelineTrace(requestID, agent, "lite_proxy_secret_detection_skipped", map[string]any{
@@ -2779,11 +3146,119 @@ func (h *LLMEndpointHandler) preprocessLiteSecretBody(w http.ResponseWriter, r *
 		})
 		return body, false
 	}
-	if rewritten, modified := h.applyRememberedSecretRewrites(r.Context(), agent, provider, requestID, body); modified {
-		body = rewritten
-		auditParams["secret_rewrites_applied"] = true
+	// Ninth migrated call site through pipeline: SecretRewrites.
+	{
+		pipeReq := &pipelineReadOnlyRequest{
+			provider: provider,
+			httpReq:  r,
+			body:     body,
+			userID:   agent.UserID,
+			agentID:  agent.ID,
+		}
+		resolver := func(ctx context.Context, b []byte) ([]byte, bool, error) {
+			return h.applyRememberedSecretRewrites(ctx, agent, provider, requestID, b)
+		}
+		result, err := runSinglePolicy(r.Context(), pipeReq, policies.NewSecretRewrites(resolver))
+		if err != nil {
+			h.Logger.WarnContext(r.Context(), "lite-proxy secret rewrites pipeline failed",
+				"agent_id", agent.ID, "err", err.Error())
+			auditParams["secret_rewrites_error"] = err.Error()
+			*auditStatus = http.StatusInternalServerError
+			*auditDecide = "deny"
+			*auditOutcome = "secret_rewrites_failed"
+			*auditReason = "remembered secret rewrite failed"
+			h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusInternalServerError, "SECRET_REWRITES_FAILED",
+				"couldn't apply remembered secret rewrites. Please retry; details are in the Clawvisor audit log.")
+			return body, true
+		} else {
+			body = result.FinalBody
+			for k, v := range result.AuditParams {
+				auditParams[k] = v
+			}
+		}
 	}
-	if h.maybeHoldInboundSecret(w, r, agent, provider, requestID, body, extraSuppressed, auditParams, auditStatus, auditDecide, auditOutcome, auditReason) {
+	// Tenth migrated call site through pipeline: SecretHold.
+	pipeReq := &pipelineReadOnlyRequest{
+		provider: provider,
+		httpReq:  r,
+		body:     body,
+		userID:   agent.UserID,
+		agentID:  agent.ID,
+	}
+	resolver := func(_ context.Context, b []byte) policies.SecretHoldResult {
+		out := h.tryHoldInboundSecret(r, agent, provider, requestID, b, extraSuppressed)
+		if !out.Held {
+			return policies.SecretHoldResult{Held: false}
+		}
+		fields := map[string]any{}
+		if out.DecisionID != "" {
+			fields["secret_decision_id"] = out.DecisionID
+		}
+		if len(out.Findings) > 0 {
+			fields["secret_findings"] = len(out.Findings)
+			fields["secret_suggested_name"] = out.Findings[0].SuggestedName
+			fields["secret_sources"] = liteSecretFindingSources(out.Findings)
+		}
+		// IsError → handler writes a writeLiteProxyError-shaped response,
+		// not a 200 hold prompt. Surface the error info via the policy
+		// AuditParams so the handler can branch on it.
+		if out.IsError {
+			fields["secret_hold_is_error"] = true
+			fields["secret_hold_error_code"] = out.ErrorCode
+			fields["secret_hold_error_message"] = out.ErrorMessage
+		}
+		return policies.SecretHoldResult{
+			Held:        true,
+			HTTPStatus:  out.HTTPStatus,
+			Body:        out.Body,
+			ContentType: out.ContentType,
+			Decision:    out.Decision,
+			Outcome:     out.Outcome,
+			Reason:      out.Reason,
+			AuditParams: fields,
+		}
+	}
+	holdResult, err := runSinglePolicy(r.Context(), pipeReq, policies.NewSecretHold(resolver))
+	if err != nil {
+		h.Logger.WarnContext(r.Context(), "lite-proxy secret hold pipeline failed",
+			"agent_id", agent.ID, "err", err.Error())
+		auditParams["secret_hold_error"] = llmproxy.SafeAuditErrorDetail(err.Error())
+		*auditStatus = http.StatusInternalServerError
+		*auditDecide = "deny"
+		*auditOutcome = "secret_hold_failed"
+		*auditReason = "secret hold failed"
+		h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusInternalServerError, "SECRET_HOLD_FAILED",
+			"couldn't evaluate inbound secret handling. Please retry; details are in the Clawvisor audit log.")
+		return body, true
+	}
+	for k, v := range holdResult.AuditParams {
+		auditParams[k] = v
+	}
+	if sc := holdResult.ShortCircuit; sc != nil {
+		*auditStatus = sc.StatusCode
+		if v, _ := holdResult.AuditParams["secret_hold_outcome"].(string); v != "" {
+			*auditOutcome = v
+		}
+		if v, _ := holdResult.AuditParams["secret_hold_decision"].(string); v != "" {
+			*auditDecide = v
+		}
+		if v, _ := holdResult.AuditParams["secret_hold_reason"].(string); v != "" {
+			*auditReason = v
+		}
+		// Error path: writeLiteProxyError formatting.
+		if isErr, _ := holdResult.AuditParams["secret_hold_is_error"].(bool); isErr {
+			code, _ := holdResult.AuditParams["secret_hold_error_code"].(string)
+			msg, _ := holdResult.AuditParams["secret_hold_error_message"].(string)
+			h.writeLiteProxyError(w, r, agent, provider, body, requestID, sc.StatusCode, code, msg)
+			return body, true
+		}
+		// Success path: 200 with synthesized hold prompt.
+		for k, v := range sc.Headers {
+			w.Header().Set(k, v)
+		}
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(sc.StatusCode)
+		_, _ = w.Write(sc.Body)
 		return body, true
 	}
 	return body, false
@@ -2808,22 +3283,49 @@ func agentConversationAutoApproveThreshold(agent *store.Agent) string {
 	return store.ConversationAutoApproveOff
 }
 
-func (h *LLMEndpointHandler) maybeHandleLiteSecretDecision(w http.ResponseWriter, r *http.Request, agent *store.Agent, provider conversation.Provider, requestID string, body []byte, auditParams map[string]any, auditStatus *int, auditDecide, auditOutcome, auditReason *string) ([]byte, llmproxy.SecretDecisionAction, map[string]struct{}, bool) {
+// liteSecretDecisionAttempt is the result-returning shape of the
+// secret-decision adjudication. Used by both the legacy
+// maybeHandleLiteSecretDecision method (which writes the response
+// from this struct) and the SecretDecision pipeline policy (which
+// converts it into Allow/ShortCircuit verdicts).
+type liteSecretDecisionAttempt struct {
+	// Handled is true when the decision was acted on (verb recognized,
+	// pending bound). False = no-op pass-through.
+	Handled bool
+	// Action is the recognized decision verb.
+	Action llmproxy.SecretDecisionAction
+	// ModifiedBody is the post-decision body when no error. May be
+	// nil when IsError=true (error response replaces the request).
+	ModifiedBody []byte
+	// Suppressed is the fingerprint set to add to extraSuppressed.
+	Suppressed map[string]struct{}
+	// DecisionID + FindingsCount populate audit_params.
+	DecisionID    string
+	FindingsCount int
+	// AuditStatusOverride sets *auditStatus when non-zero (vault paths
+	// use this to record the error status code; success paths leave
+	// status untouched).
+	AuditStatusOverride int
+	// IsError flags the vault error paths.
+	IsError      bool
+	ErrorCode    string
+	ErrorMessage string
+	ErrorReason  string
+	ErrorOutcome string
+}
+
+// tryHandleLiteSecretDecision runs the adjudication without writing
+// to the response. Returns liteSecretDecisionAttempt; the caller
+// either applies the result (write error response or use modified
+// body) or short-circuits via the SecretDecision pipeline policy.
+func (h *LLMEndpointHandler) tryHandleLiteSecretDecision(r *http.Request, agent *store.Agent, provider conversation.Provider, requestID string, body []byte) liteSecretDecisionAttempt {
 	if h == nil || h.PendingSecrets == nil || agent == nil {
-		return nil, "", nil, false
+		return liteSecretDecisionAttempt{}
 	}
 	reply := llmproxy.SecretDecisionReplyFromBody(provider, body)
 	if reply.Action == llmproxy.SecretDecisionNone {
-		return nil, "", nil, false
+		return liteSecretDecisionAttempt{}
 	}
-	// Prefer resolving by the specific decision ID embedded in the
-	// preceding assistant prompt. Without this, a second pending
-	// decision queued between the user being shown decision A and
-	// replying would let "allow once" release A or B at random — and
-	// can leak the wrong original body. Fall back to last-pending
-	// only when the conversation history doesn't carry the marker
-	// (e.g. corrupted client transport stripped it), which still
-	// preserves the existing behavior for pre-existing flows.
 	pendingID := llmproxy.LatestAssistantSecretDecisionID(provider, body)
 	var (
 		pending *llmproxy.PendingSecretDecision
@@ -2837,17 +3339,10 @@ func (h *LLMEndpointHandler) maybeHandleLiteSecretDecision(w http.ResponseWriter
 	if err != nil {
 		h.Logger.WarnContext(r.Context(), "lite-proxy pending secret decision consume failed",
 			"agent_id", agent.ID, "provider", string(provider), "err", err.Error())
-		return nil, "", nil, false
+		return liteSecretDecisionAttempt{}
 	}
 	if pending == nil {
-		// Ambiguous: user typed a decision verb but we can't bind it
-		// to a specific pending. Treat as no-op so the next pipeline
-		// stage sees an ordinary turn.
-		return nil, "", nil, false
-	}
-	if auditParams != nil {
-		auditParams["secret_decision_id"] = pending.ID
-		auditParams["secret_findings"] = len(pending.Findings)
+		return liteSecretDecisionAttempt{}
 	}
 	h.emitLiteSecretPipelineTrace(requestID, agent, "decision_received", map[string]any{
 		"provider":           string(provider),
@@ -2860,16 +3355,23 @@ func (h *LLMEndpointHandler) maybeHandleLiteSecretDecision(w http.ResponseWriter
 		"decision_body_sha":  liteSecretBodySHA(body),
 		"decision_body_size": len(body),
 	})
+	base := liteSecretDecisionAttempt{
+		Handled:       true,
+		Action:        reply.Action,
+		DecisionID:    pending.ID,
+		FindingsCount: len(pending.Findings),
+	}
 	switch reply.Action {
 	case llmproxy.SecretDecisionAllowOnce:
-		*auditStatus = 0
 		h.emitLiteSecretPipelineTrace(requestID, agent, "decision_released", map[string]any{
 			"provider":   string(provider),
 			"decision":   string(reply.Action),
 			"body_sha":   liteSecretBodySHA(pending.OriginalBody),
 			"body_bytes": len(pending.OriginalBody),
 		})
-		return pending.OriginalBody, reply.Action, secretFindingFingerprintSet(pending.Findings), true
+		base.ModifiedBody = pending.OriginalBody
+		base.Suppressed = secretFindingFingerprintSet(pending.Findings)
+		return base
 	case llmproxy.SecretDecisionNotSecret:
 		h.rememberNotSecretFindings(r.Context(), agent, pending.Findings)
 		h.emitLiteSecretPipelineTrace(requestID, agent, "decision_released", map[string]any{
@@ -2879,7 +3381,8 @@ func (h *LLMEndpointHandler) maybeHandleLiteSecretDecision(w http.ResponseWriter
 			"body_sha":                liteSecretBodySHA(pending.OriginalBody),
 			"body_bytes":              len(pending.OriginalBody),
 		})
-		return pending.OriginalBody, reply.Action, nil, true
+		base.ModifiedBody = pending.OriginalBody
+		return base
 	case llmproxy.SecretDecisionDiscard:
 		h.emitLiteSecretPipelineTrace(requestID, agent, "decision_released", map[string]any{
 			"provider":   string(provider),
@@ -2887,7 +3390,8 @@ func (h *LLMEndpointHandler) maybeHandleLiteSecretDecision(w http.ResponseWriter
 			"body_sha":   liteSecretBodySHA(pending.RedactedBody),
 			"body_bytes": len(pending.RedactedBody),
 		})
-		return pending.RedactedBody, reply.Action, nil, true
+		base.ModifiedBody = pending.RedactedBody
+		return base
 	case llmproxy.SecretDecisionVault:
 		name := strings.TrimSpace(reply.VaultName)
 		if name == "" && len(pending.Findings) > 0 {
@@ -2906,18 +3410,20 @@ func (h *LLMEndpointHandler) maybeHandleLiteSecretDecision(w http.ResponseWriter
 			if err != nil {
 				h.rollbackPartialSecretVaults(r.Context(), agent, vaulted)
 				h.requeuePendingSecretDecision(r.Context(), pending)
+				base.IsError = true
+				base.ErrorReason = err.Error()
 				if errors.Is(err, errSecretVaultNameConflict) {
-					*auditStatus = http.StatusConflict
-					*auditOutcome = "secret_vault_name_conflict"
-					h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusConflict, "SECRET_VAULT_NAME_CONFLICT", "a vault item with that name already exists with a different value. Please choose a different name and retry.")
+					base.AuditStatusOverride = http.StatusConflict
+					base.ErrorOutcome = "secret_vault_name_conflict"
+					base.ErrorCode = "SECRET_VAULT_NAME_CONFLICT"
+					base.ErrorMessage = "a vault item with that name already exists with a different value. Please choose a different name and retry."
 				} else {
-					*auditStatus = http.StatusInternalServerError
-					*auditOutcome = "secret_vault_failed"
-					h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusInternalServerError, "SECRET_VAULT_FAILED", "couldn't save the detected secret to your vault. Please retry.")
+					base.AuditStatusOverride = http.StatusInternalServerError
+					base.ErrorOutcome = "secret_vault_failed"
+					base.ErrorCode = "SECRET_VAULT_FAILED"
+					base.ErrorMessage = "couldn't save the detected secret to your vault. Please retry."
 				}
-				*auditDecide = "deny"
-				*auditReason = err.Error()
-				return nil, reply.Action, nil, true
+				return base
 			}
 			vaulted = append(vaulted, liteSecretVaultedFinding{
 				vaultName:       vaultName,
@@ -2941,16 +3447,17 @@ func (h *LLMEndpointHandler) maybeHandleLiteSecretDecision(w http.ResponseWriter
 			if rewriteErr != nil || !modified {
 				h.rollbackPartialSecretVaults(r.Context(), agent, vaulted)
 				h.requeuePendingSecretDecision(r.Context(), pending)
-				*auditStatus = http.StatusInternalServerError
-				*auditDecide = "deny"
-				*auditOutcome = "secret_vault_failed"
+				base.IsError = true
+				base.AuditStatusOverride = http.StatusInternalServerError
+				base.ErrorOutcome = "secret_vault_failed"
+				base.ErrorCode = "SECRET_VAULT_FAILED"
+				base.ErrorMessage = "couldn't substitute the detected secret into the request. Please retry."
 				if rewriteErr != nil {
-					*auditReason = rewriteErr.Error()
+					base.ErrorReason = rewriteErr.Error()
 				} else {
-					*auditReason = "detected secret was not present in request JSON"
+					base.ErrorReason = "detected secret was not present in request JSON"
 				}
-				h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusInternalServerError, "SECRET_VAULT_FAILED", "couldn't substitute the detected secret into the request. Please retry.")
-				return nil, reply.Action, nil, true
+				return base
 			}
 			resumeBody = rewrittenBody
 		}
@@ -2963,11 +3470,40 @@ func (h *LLMEndpointHandler) maybeHandleLiteSecretDecision(w http.ResponseWriter
 			"body_sha":   liteSecretBodySHA(resumeBody),
 			"body_bytes": len(resumeBody),
 		})
-		return resumeBody, reply.Action, nil, true
-	default:
+		base.ModifiedBody = resumeBody
+		return base
+	}
+	return liteSecretDecisionAttempt{}
+}
+
+func (h *LLMEndpointHandler) maybeHandleLiteSecretDecision(w http.ResponseWriter, r *http.Request, agent *store.Agent, provider conversation.Provider, requestID string, body []byte, auditParams map[string]any, auditStatus *int, auditDecide, auditOutcome, auditReason *string) ([]byte, llmproxy.SecretDecisionAction, map[string]struct{}, bool) {
+	attempt := h.tryHandleLiteSecretDecision(r, agent, provider, requestID, body)
+	if !attempt.Handled {
 		return nil, "", nil, false
 	}
+	if auditParams != nil && attempt.DecisionID != "" {
+		auditParams["secret_decision_id"] = attempt.DecisionID
+		auditParams["secret_findings"] = attempt.FindingsCount
+	}
+	if attempt.IsError {
+		*auditStatus = attempt.AuditStatusOverride
+		*auditDecide = "deny"
+		*auditOutcome = attempt.ErrorOutcome
+		*auditReason = attempt.ErrorReason
+		h.writeLiteProxyError(w, r, agent, provider, body, requestID, attempt.AuditStatusOverride, attempt.ErrorCode, attempt.ErrorMessage)
+		return nil, attempt.Action, nil, true
+	}
+	if attempt.Action == llmproxy.SecretDecisionAllowOnce {
+		*auditStatus = 0
+	}
+	return attempt.ModifiedBody, attempt.Action, attempt.Suppressed, true
 }
+
+// maybeHandleLiteSecretDecisionLegacy was the pre-refactor body of
+// maybeHandleLiteSecretDecision. The logic has been extracted into
+// tryHandleLiteSecretDecision (the helper) and the legacy body is
+// removed. Retained name is intentional — git history preserves the
+// old implementation for reference.
 
 func (h *LLMEndpointHandler) requeuePendingSecretDecision(ctx context.Context, pending *llmproxy.PendingSecretDecision) {
 	if h == nil || h.PendingSecrets == nil || pending == nil {
@@ -3111,18 +3647,21 @@ func (h *LLMEndpointHandler) rollbackPartialSecretVaults(ctx context.Context, ag
 	}
 }
 
-func (h *LLMEndpointHandler) applyRememberedSecretRewrites(ctx context.Context, agent *store.Agent, provider conversation.Provider, requestID string, body []byte) ([]byte, bool) {
+func (h *LLMEndpointHandler) applyRememberedSecretRewrites(ctx context.Context, agent *store.Agent, provider conversation.Provider, requestID string, body []byte) ([]byte, bool, error) {
 	if h == nil || h.Store == nil || agent == nil || len(body) == 0 {
-		return body, false
+		return body, false, nil
 	}
-	rewrites := h.loadActiveSecretRewrites(ctx, agent)
+	rewrites, err := h.loadActiveSecretRewrites(ctx, agent)
+	if err != nil {
+		return body, false, err
+	}
 	if len(rewrites) == 0 {
 		h.emitLiteSecretPipelineTrace(requestID, agent, "rewrite_scan_skipped", map[string]any{
 			"provider": string(provider),
 			"reason":   "no_active_rewrites",
 			"body_sha": liteSecretBodySHA(body),
 		})
-		return body, false
+		return body, false, nil
 	}
 	scan, found, err := llmproxy.ScanInboundSecretsWithOptions(ctx, llmproxy.InboundSecretScanOptions{
 		Provider: provider,
@@ -3136,7 +3675,7 @@ func (h *LLMEndpointHandler) applyRememberedSecretRewrites(ctx context.Context, 
 			"body_sha":      liteSecretBodySHA(body),
 			"error_message": err.Error(),
 		})
-		return body, false
+		return body, false, err
 	}
 	if !found {
 		h.emitLiteSecretPipelineTrace(requestID, agent, "rewrite_scan_no_findings", map[string]any{
@@ -3144,7 +3683,7 @@ func (h *LLMEndpointHandler) applyRememberedSecretRewrites(ctx context.Context, 
 			"active_rules": len(rewrites),
 			"body_sha":     liteSecretBodySHA(body),
 		})
-		return body, false
+		return body, false, nil
 	}
 	out := append([]byte{}, body...)
 	modified := false
@@ -3167,7 +3706,7 @@ func (h *LLMEndpointHandler) applyRememberedSecretRewrites(ctx context.Context, 
 				"body_sha":      liteSecretBodySHA(body),
 				"error_message": rewriteErr.Error(),
 			})
-			return body, false
+			return body, false, rewriteErr
 		}
 		out = rewritten
 		modified = rewriteModified
@@ -3183,7 +3722,7 @@ func (h *LLMEndpointHandler) applyRememberedSecretRewrites(ctx context.Context, 
 		"body_sha_before": liteSecretBodySHA(body),
 		"body_sha_after":  liteSecretBodySHA(out),
 	})
-	return out, modified
+	return out, modified, nil
 }
 
 func rewriteJSONStrings(body []byte, replacements map[string]string) ([]byte, bool, error) {
@@ -3258,10 +3797,10 @@ func rewriteJSONValueStrings(value any, replacements map[string]string, keys []s
 	}
 }
 
-func (h *LLMEndpointHandler) loadActiveSecretRewrites(ctx context.Context, agent *store.Agent) map[string]liteSecretVaultRewrite {
+func (h *LLMEndpointHandler) loadActiveSecretRewrites(ctx context.Context, agent *store.Agent) (map[string]liteSecretVaultRewrite, error) {
 	out := map[string]liteSecretVaultRewrite{}
 	if h == nil || h.Store == nil || agent == nil {
-		return out
+		return out, nil
 	}
 	enabled := true
 	rules, err := h.Store.ListRuntimePolicyRules(ctx, agent.UserID, store.RuntimePolicyRuleFilter{
@@ -3270,7 +3809,7 @@ func (h *LLMEndpointHandler) loadActiveSecretRewrites(ctx context.Context, agent
 		Enabled: &enabled,
 	})
 	if err != nil {
-		return out
+		return out, err
 	}
 	now := time.Now().UTC()
 	for _, rule := range rules {
@@ -3297,12 +3836,40 @@ func (h *LLMEndpointHandler) loadActiveSecretRewrites(ctx context.Context, agent
 			Placeholder: strings.TrimSpace(rule.Path),
 		}
 	}
-	return out
+	return out, nil
 }
 
-func (h *LLMEndpointHandler) maybeHoldInboundSecret(w http.ResponseWriter, r *http.Request, agent *store.Agent, provider conversation.Provider, requestID string, body []byte, extraSuppressed map[string]struct{}, auditParams map[string]any, auditStatus *int, auditDecide, auditOutcome, auditReason *string) bool {
+// liteSecretHoldOutcome is the result-returning shape of the
+// secret-hold check. Used by both the legacy maybeHoldInboundSecret
+// method (which writes the response from this struct) and the
+// SecretHold pipeline policy (which converts it into a ShortCircuit
+// verdict).
+type liteSecretHoldOutcome struct {
+	Held        bool
+	HTTPStatus  int
+	Body        []byte
+	ContentType string
+	Decision    string
+	Outcome     string
+	Reason      string
+	DecisionID  string
+	Findings    []llmproxy.InboundSecretFinding
+	// IsError flags whether the hold attempt itself failed (vs.
+	// successfully created a hold). Errors map to writeLiteProxyError
+	// with SECRET_HOLD_FAILED; successful holds map to the synthetic
+	// hold-prompt response.
+	IsError      bool
+	ErrorCode    string
+	ErrorMessage string
+}
+
+// tryHoldInboundSecret runs the secret-hold scan and adjudication
+// without writing to the response. Returns liteSecretHoldOutcome
+// which the caller maps to either a written response or a pipeline
+// ShortCircuit verdict.
+func (h *LLMEndpointHandler) tryHoldInboundSecret(r *http.Request, agent *store.Agent, provider conversation.Provider, requestID string, body []byte, extraSuppressed map[string]struct{}) liteSecretHoldOutcome {
 	if h == nil || h.PendingSecrets == nil || agent == nil {
-		return false
+		return liteSecretHoldOutcome{Held: false}
 	}
 	suppressed := h.secretSuppressionFingerprints(r.Context(), agent)
 	for fp := range extraSuppressed {
@@ -3328,10 +3895,8 @@ func (h *LLMEndpointHandler) maybeHoldInboundSecret(w http.ResponseWriter, r *ht
 			"error_message": err.Error(),
 		})
 		h.Logger.WarnContext(r.Context(), "lite-proxy inbound secret scan failed",
-			"request_id", requestID,
-			"agent_id", agent.ID,
-			"err", err.Error())
-		return false
+			"request_id", requestID, "agent_id", agent.ID, "err", err.Error())
+		return liteSecretHoldOutcome{Held: false}
 	}
 	if !found {
 		h.emitLiteSecretPipelineTrace(requestID, agent, "hold_scan_no_findings", map[string]any{
@@ -3339,7 +3904,7 @@ func (h *LLMEndpointHandler) maybeHoldInboundSecret(w http.ResponseWriter, r *ht
 			"adjudications": liteSecretAdjudicationTraceSummaries(scan.Adjudications),
 			"body_sha":      liteSecretBodySHA(body),
 		})
-		return false
+		return liteSecretHoldOutcome{Held: false}
 	}
 	scan.Findings = h.annotateExistingVaultSecrets(r.Context(), agent.UserID, scan.Findings)
 	h.emitLiteSecretPipelineTrace(requestID, agent, "hold_scan_findings", map[string]any{
@@ -3364,18 +3929,16 @@ func (h *LLMEndpointHandler) maybeHoldInboundSecret(w http.ResponseWriter, r *ht
 			"body_sha":      liteSecretBodySHA(body),
 			"error_message": err.Error(),
 		})
-		*auditStatus = http.StatusInternalServerError
-		*auditDecide = "deny"
-		*auditOutcome = "secret_hold_failed"
-		*auditReason = err.Error()
-		h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusInternalServerError, "SECRET_HOLD_FAILED", "couldn't pause this request for secret review. Please retry.")
-		return true
-	}
-	if auditParams != nil {
-		auditParams["secret_decision_id"] = held.ID
-		auditParams["secret_findings"] = len(scan.Findings)
-		auditParams["secret_suggested_name"] = scan.Findings[0].SuggestedName
-		auditParams["secret_sources"] = liteSecretFindingSources(scan.Findings)
+		return liteSecretHoldOutcome{
+			Held:         true,
+			HTTPStatus:   http.StatusInternalServerError,
+			Decision:     "deny",
+			Outcome:      "secret_hold_failed",
+			Reason:       err.Error(),
+			IsError:      true,
+			ErrorCode:    "SECRET_HOLD_FAILED",
+			ErrorMessage: "couldn't pause this request for secret review. Please retry.",
+		}
 	}
 	h.emitLiteSecretPipelineTrace(requestID, agent, "hold_created", map[string]any{
 		"provider":          string(provider),
@@ -3403,16 +3966,46 @@ func (h *LLMEndpointHandler) maybeHoldInboundSecret(w http.ResponseWriter, r *ht
 			Marker:       "redacted_pre_hold",
 		})
 	}
-	*auditStatus = http.StatusOK
-	*auditDecide = "block"
-	*auditOutcome = "secret_detected"
-	*auditReason = "raw secret detected in inbound LLM request"
 	prompt := renderInboundSecretPrompt(held)
 	bodyBytes, contentType := syntheticLiteTextResponse(r, provider, body, prompt)
-	w.Header().Set("Content-Type", contentType)
+	return liteSecretHoldOutcome{
+		Held:        true,
+		HTTPStatus:  http.StatusOK,
+		Body:        bodyBytes,
+		ContentType: contentType,
+		Decision:    "block",
+		Outcome:     "secret_detected",
+		Reason:      "raw secret detected in inbound LLM request",
+		DecisionID:  held.ID,
+		Findings:    scan.Findings,
+	}
+}
+
+func (h *LLMEndpointHandler) maybeHoldInboundSecret(w http.ResponseWriter, r *http.Request, agent *store.Agent, provider conversation.Provider, requestID string, body []byte, extraSuppressed map[string]struct{}, auditParams map[string]any, auditStatus *int, auditDecide, auditOutcome, auditReason *string) bool {
+	outcome := h.tryHoldInboundSecret(r, agent, provider, requestID, body, extraSuppressed)
+	if !outcome.Held {
+		return false
+	}
+	*auditStatus = outcome.HTTPStatus
+	*auditDecide = outcome.Decision
+	*auditOutcome = outcome.Outcome
+	*auditReason = outcome.Reason
+	if outcome.IsError {
+		h.writeLiteProxyError(w, r, agent, provider, body, requestID, outcome.HTTPStatus, outcome.ErrorCode, outcome.ErrorMessage)
+		return true
+	}
+	if auditParams != nil {
+		auditParams["secret_decision_id"] = outcome.DecisionID
+		auditParams["secret_findings"] = len(outcome.Findings)
+		if len(outcome.Findings) > 0 {
+			auditParams["secret_suggested_name"] = outcome.Findings[0].SuggestedName
+			auditParams["secret_sources"] = liteSecretFindingSources(outcome.Findings)
+		}
+	}
+	w.Header().Set("Content-Type", outcome.ContentType)
 	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(bodyBytes)
+	w.WriteHeader(outcome.HTTPStatus)
+	_, _ = w.Write(outcome.Body)
 	return true
 }
 
@@ -3742,20 +4335,24 @@ func syntheticLiteTextResponse(r *http.Request, provider conversation.Provider, 
 	}
 }
 
-func (h *LLMEndpointHandler) maybeHandleLiteApprovalRelease(w http.ResponseWriter, r *http.Request, agent *store.Agent, provider conversation.Provider, requestID, conversationID string, body []byte, auditStatus *int, auditDecide, auditOutcome, auditReason *string) bool {
+// tryApprovalRelease runs the release attempt and returns the result
+// without writing to the response. Used by both the legacy
+// maybeHandleLiteApprovalRelease method and the policies.ApprovalRelease
+// pipeline policy — the latter calls this via a constructor closure.
+//
+// Returns a sentinel ReleaseResult with HTTPStatus=503 +
+// Outcome=decision_input_load_failed when the decision-input load
+// fails; the caller maps that to a 503 response.
+func (h *LLMEndpointHandler) tryApprovalRelease(r *http.Request, agent *store.Agent, provider conversation.Provider, requestID, conversationID string, body []byte) llmproxy.ReleaseResult {
 	candidateTasks, toolRules, egressRules, decisionLoadErr := h.loadLiteProxyDecisionInputs(r.Context(), agent)
 	if decisionLoadErr != nil {
-		// Approval-release path also authorizes; same fail-closed rule
-		// as the main serve() path applies.
-		h.Logger.WarnContext(r.Context(), "lite-proxy approval-release decision-input load failed; failing closed",
-			"request_id", requestID, "agent_id", agent.ID, "err", decisionLoadErr.Error())
-		*auditStatus = http.StatusServiceUnavailable
-		*auditDecide = "deny"
-		*auditOutcome = "decision_input_load_failed"
-		*auditReason = decisionLoadErr.Error()
-		h.writeLiteProxyError(w, r, agent, provider, body, requestID, http.StatusServiceUnavailable, "DECISION_INPUT_UNAVAILABLE",
-			"couldn't load authorization data right now. Please retry in a moment.")
-		return true
+		return llmproxy.ReleaseResult{
+			Handled:    true,
+			HTTPStatus: http.StatusServiceUnavailable,
+			Decision:   "deny",
+			Outcome:    "decision_input_load_failed",
+			Reason:     decisionLoadErr.Error(),
+		}
 	}
 	var catalogIface interface {
 		Resolve(host, method, path string) (llmproxy.ResolvedAction, bool)
@@ -3765,7 +4362,7 @@ func (h *LLMEndpointHandler) maybeHandleLiteApprovalRelease(w http.ResponseWrite
 	}
 	opts := inspector.DefaultRewriteOpts(h.ResolverBaseURL)
 	opts.CallerToken = inboundAgentToken(r)
-	result := llmproxy.TryReleasePendingApproval(r.Context(), llmproxy.ReleaseRequest{
+	return llmproxy.TryReleasePendingApproval(r.Context(), llmproxy.ReleaseRequest{
 		HTTPRequest:     r,
 		RequestID:       requestID,
 		Provider:        provider,
@@ -3787,6 +4384,21 @@ func (h *LLMEndpointHandler) maybeHandleLiteApprovalRelease(w http.ResponseWrite
 		// this release by an arbitrary amount, so any old nonce is gone.
 		CallerNonces: h.CallerNonces,
 	})
+}
+
+func (h *LLMEndpointHandler) maybeHandleLiteApprovalRelease(w http.ResponseWriter, r *http.Request, agent *store.Agent, provider conversation.Provider, requestID, conversationID string, body []byte, auditStatus *int, auditDecide, auditOutcome, auditReason *string) bool {
+	result := h.tryApprovalRelease(r, agent, provider, requestID, conversationID, body)
+	if result.Outcome == "decision_input_load_failed" {
+		h.Logger.WarnContext(r.Context(), "lite-proxy approval-release decision-input load failed; failing closed",
+			"request_id", requestID, "agent_id", agent.ID, "err", result.Reason)
+		*auditStatus = result.HTTPStatus
+		*auditDecide = result.Decision
+		*auditOutcome = result.Outcome
+		*auditReason = result.Reason
+		h.writeLiteProxyError(w, r, agent, provider, body, requestID, result.HTTPStatus, "DECISION_INPUT_UNAVAILABLE",
+			"couldn't load authorization data right now. Please retry in a moment.")
+		return true
+	}
 	if result.Handled {
 		h.Logger.DebugContext(r.Context(), "lite-proxy approval release handled",
 			"request_id", requestID,
@@ -3977,6 +4589,13 @@ func truncateForLog(s string, max int) string {
 	return s[:max] + "...<truncated>"
 }
 
+func liteProxyAuditErrorDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	return llmproxy.SafeAuditErrorDetail(err.Error())
+}
+
 func firstNonEmptyLog(values ...string) string {
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {
@@ -4038,6 +4657,56 @@ func clawvisorAgentTokenHeader(r *http.Request) string {
 		return strings.TrimSpace(v[len(prefix):])
 	}
 	return v
+}
+
+func streamingPostprocessErrorFrame(r *http.Request, provider conversation.Provider, message string) ([]byte, bool) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return nil, false
+	}
+	switch provider {
+	case conversation.ProviderAnthropic:
+		body, _ := json.Marshal(map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "clawvisor_postprocess_error",
+				"message": message,
+			},
+		})
+		return []byte("event: error\ndata: " + string(body) + "\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"), true
+	case conversation.ProviderOpenAI:
+		if conversation.IsOpenAIChatCompletionsEndpoint(r) {
+			return conversation.SynthOpenAIChatTextSSE(message), true
+		}
+		body, _ := json.Marshal(map[string]any{
+			"type": "response.failed",
+			"response": map[string]any{
+				"status": "failed",
+				"error": map[string]any{
+					"type":    "clawvisor_postprocess_error",
+					"message": message,
+				},
+			},
+		})
+		return []byte("event: response.failed\ndata: " + string(body) + "\n\n"), true
+	case conversation.ProviderGoogle:
+		body, _ := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"code":    http.StatusBadGateway,
+				"message": message,
+				"status":  "INTERNAL",
+			},
+		})
+		return []byte("data: " + string(body) + "\n\n"), true
+	default:
+		body, _ := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"type":    "clawvisor_postprocess_error",
+				"message": message,
+			},
+		})
+		return []byte("data: " + string(body) + "\n\n"), true
+	}
 }
 
 // taskRiskBridge adapts the handler's taskrisk.Assessor (which speaks the

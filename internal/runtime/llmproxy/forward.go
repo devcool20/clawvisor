@@ -26,6 +26,7 @@ import (
 var DefaultUpstream = UpstreamSelector{
 	AnthropicBaseURL: "https://api.anthropic.com",
 	OpenAIBaseURL:    "https://api.openai.com",
+	GoogleBaseURL:    "https://generativelanguage.googleapis.com",
 }
 
 // UpstreamSelector resolves a (provider, path) pair to a concrete upstream
@@ -34,6 +35,7 @@ var DefaultUpstream = UpstreamSelector{
 type UpstreamSelector struct {
 	AnthropicBaseURL string
 	OpenAIBaseURL    string
+	GoogleBaseURL    string
 }
 
 // URL returns the upstream URL the lite-proxy should forward to for a given
@@ -44,6 +46,8 @@ func (s UpstreamSelector) URL(provider conversation.Provider, path string) (*url
 		return joinURL(s.AnthropicBaseURL, path)
 	case conversation.ProviderOpenAI:
 		return joinURL(s.OpenAIBaseURL, path)
+	case conversation.ProviderGoogle:
+		return joinURL(s.GoogleBaseURL, path)
 	}
 	return nil, fmt.Errorf("llmproxy: unknown provider %q", provider)
 }
@@ -78,6 +82,8 @@ func VaultServiceID(provider conversation.Provider) string {
 		return "anthropic"
 	case conversation.ProviderOpenAI:
 		return "openai"
+	case conversation.ProviderGoogle:
+		return "google"
 	}
 	return ""
 }
@@ -186,6 +192,10 @@ func (f *Forwarder) Forward(ctx context.Context, userID, agentID string, provide
 				injectPassthroughAnthropicAuth(req, auth)
 				return f.Client.Do(req)
 			}
+			if provider == conversation.ProviderGoogle {
+				injectPassthroughGoogleAuth(req, auth)
+				return f.Client.Do(req)
+			}
 		}
 	}
 
@@ -235,8 +245,8 @@ func (f *Forwarder) lookupVaultKey(ctx context.Context, userID, agentID string, 
 }
 
 // injectUpstreamAuth writes the upstream-specific auth header using the raw
-// API key bytes. Handles both Anthropic (x-api-key + anthropic-version) and
-// OpenAI (Authorization: Bearer).
+// API key bytes. Handles Anthropic (x-api-key + anthropic-version), OpenAI
+// (Authorization: Bearer), and Google Gemini (x-goog-api-key).
 //
 // Validates the key bytes contain no CR/LF/NUL so a corrupted vault entry
 // (or one that round-tripped through a system that did its own escaping)
@@ -257,6 +267,12 @@ func injectUpstreamAuth(req *http.Request, provider conversation.Provider, key [
 		}
 	case conversation.ProviderOpenAI:
 		req.Header.Set("Authorization", "Bearer "+keyStr)
+	case conversation.ProviderGoogle:
+		// Gemini uses x-goog-api-key for credential auth (not
+		// Authorization: Bearer). Strip the caller's Authorization
+		// header so it doesn't double-up.
+		req.Header.Set("x-goog-api-key", keyStr)
+		req.Header.Del("Authorization")
 	default:
 		return fmt.Errorf("llmproxy: unknown provider %q", provider)
 	}
@@ -372,14 +388,22 @@ func scopesIncludes(raw json.RawMessage, want string) bool {
 func injectPassthroughOpenAIAuth(req *http.Request, authorization string) {
 	req.Header.Set("Authorization", authorization)
 	req.Header.Del("x-api-key")
+	req.Header.Del("x-goog-api-key")
 }
 
 func injectPassthroughAnthropicAuth(req *http.Request, authorization string) {
 	req.Header.Set("Authorization", authorization)
 	req.Header.Del("x-api-key")
+	req.Header.Del("x-goog-api-key")
 	if req.Header.Get("anthropic-version") == "" {
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
+}
+
+func injectPassthroughGoogleAuth(req *http.Request, authorization string) {
+	req.Header.Set("Authorization", authorization)
+	req.Header.Del("x-api-key")
+	req.Header.Del("x-goog-api-key")
 }
 
 // forwardSkipHeaders are stripped from the inbound request when copying
@@ -392,6 +416,7 @@ func injectPassthroughAnthropicAuth(req *http.Request, authorization string) {
 var forwardSkipHeaders = map[string]struct{}{
 	"authorization":       {}, // agent token is for us, not upstream
 	"x-api-key":           {}, // agent token (Anthropic SDK convention) is for us
+	"x-goog-api-key":      {}, // agent token / Google upstream key is restored explicitly
 	"cookie":              {}, // session cookies for the clawvisor UI must not reach api.anthropic.com / api.openai.com
 	"connection":          {},
 	"keep-alive":          {},

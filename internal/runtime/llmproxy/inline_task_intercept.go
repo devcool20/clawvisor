@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
+	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/controltool"
 	runtimepolicy "github.com/clawvisor/clawvisor/internal/runtime/policy"
 	runtimetasks "github.com/clawvisor/clawvisor/internal/runtime/tasks"
 	"github.com/clawvisor/clawvisor/internal/taskrisk"
@@ -66,7 +67,12 @@ const InlineSurfaceQueryValue = "inline"
 // parse, or the path isn't POST /api/control/tasks — callers should
 // fall through to the regular control-rewrite path so headless task
 // creation still routes through the dashboard handler unchanged.
-func maybeInterceptInlineTaskDefinition(
+// MaybeInterceptInlineTaskDefinition is the entry point for inline
+// task-definition interception. Used by the handler-side pipeline
+// factory's ControlToolUseEvaluator InterceptInline hook. Audit +
+// trace callbacks are supplied per-call so the caller routes events
+// into whichever sink it owns.
+func MaybeInterceptInlineTaskDefinition(
 	req *http.Request,
 	cfg PostprocessConfig,
 	audit func(decision, outcome, reason string),
@@ -252,7 +258,7 @@ func maybeInterceptInlineTaskDefinition(
 				// name so dashboards can distinguish gate-bypassed
 				// approvals from human ones.
 				if cfg.Audit != nil {
-					if auditAgent := auditAgentForCfg(cfg); auditAgent != nil {
+					if auditAgent := AuditAgentForCfg(cfg); auditAgent != nil {
 						cfg.Audit.LogInlineTaskAutoApproved(
 							req.Context(),
 							auditAgent,
@@ -275,6 +281,7 @@ func maybeInterceptInlineTaskDefinition(
 					"reason", reason,
 				)
 				augmentation := inlineApprovedReplyAugmentationContext(created.ID, checkedOut, created.Credentials)
+				continuationPayload, _ := json.Marshal(augmentation)
 				return conversation.ToolUseVerdict{
 					Allowed: false,
 					Reason:  "Clawvisor: auto-approved from conversation context",
@@ -287,20 +294,15 @@ func maybeInterceptInlineTaskDefinition(
 					// harness as an assistant text turn if the handler
 					// can't complete the recursive continuation call
 					// (unsupported provider, recursion bound reached,
-					// upstream error). ContinueWithToolResult is the
-					// happy path: the handler feeds this same text back
-					// to the upstream as a synthetic user/tool_result
-					// turn so the model proceeds with its next tool_use
-					// without bouncing to the user.
-					SubstituteWith:         augmentation,
-					ContinueWithToolResult: augmentation,
-					// PrependAssistantNotice is shown to the human in
-					// the continuation's assistant turn so they see
-					// what happened on their behalf. Quoting the
-					// model-authored Purpose makes the notice
-					// self-describing without leaking task IDs or
-					// internal scope details.
-					PrependAssistantNotice: autoApproveUserNotice(created.Purpose),
+					// upstream error). Continue is the happy path: the
+					// handler feeds this same text back upstream as a
+					// synthetic user/tool_result turn so the model can
+					// proceed without bouncing to the user.
+					SubstituteWith: augmentation,
+					Continue: &conversation.ContinueSignal{
+						SyntheticToolResults: []json.RawMessage{continuationPayload},
+						PrependNotice:        AutoApproveUserNotice(created.Purpose),
+					},
 				}, true
 			}
 		}
@@ -379,7 +381,7 @@ func maybeInterceptInlineTaskDefinition(
 		// task's DB anchor so the dashboard doesn't keep showing
 		// "reply in chat" guidance for a hold that can no longer be
 		// resolved from chat.
-		cleanupEvictedInlineTask(req.Context(), cfg, innerHold.Evicted)
+		CleanupEvictedInlineTask(req.Context(), cfg, innerHold.Evicted)
 	}
 
 	audit("approve", "pending", "inline_task_pending_approval: awaiting user yes/no on inline task definition (query)")
@@ -393,10 +395,11 @@ func maybeInterceptInlineTaskDefinition(
 		Allowed:        false,
 		Reason:         "Clawvisor: awaiting inline task approval",
 		SubstituteWith: renderTaskApprovalPromptWithRisk(parsed, innerHold.Pending.ID, assessment, cfg.DefaultTaskExpirySeconds),
+		HeldKindHint:   "approval",
 	}, true
 }
 
-// cleanupEvictedInlineTask expires the store.Task row anchoring an
+// CleanupEvictedInlineTask expires the store.Task row anchoring an
 // evicted inline-task hold. The LRU cache only carries N holds per
 // (user, agent, provider, conversation) tuple; when a new Hold
 // displaces an older inline-task hold, the cache anchor is gone and
@@ -411,7 +414,7 @@ func maybeInterceptInlineTaskDefinition(
 // inline holds minted before the pending-task surface was wired),
 // or when the creator doesn't implement the pending extension.
 // Safe to call unconditionally on any eviction.
-func cleanupEvictedInlineTask(ctx context.Context, cfg PostprocessConfig, evicted *PendingLiteApproval) {
+func CleanupEvictedInlineTask(ctx context.Context, cfg PostprocessConfig, evicted *PendingLiteApproval) {
 	if evicted == nil || evicted.PendingTaskID == "" || evicted.UserID == "" {
 		return
 	}
@@ -451,7 +454,7 @@ func hasNonEmptyTurn(turns []string) bool {
 	return false
 }
 
-// autoApproveUserNotice renders the human-facing one-liner the
+// AutoApproveUserNotice renders the human-facing one-liner the
 // handler prepends to the continuation's assistant turn after the
 // gate fires. Quoting the task purpose makes the message
 // self-describing — the user sees both that an auto-approval
@@ -459,7 +462,7 @@ func hasNonEmptyTurn(turns []string) bool {
 // dashboard. The purpose is model-authored, so we strip control
 // characters and cap the length defensively so a runaway purpose
 // can't dominate the assistant turn.
-func autoApproveUserNotice(purpose string) string {
+func AutoApproveUserNotice(purpose string) string {
 	const maxPurposeRunes = 200
 	cleaned := strings.TrimSpace(purpose)
 	cleaned = strings.ReplaceAll(cleaned, "\r", " ")
@@ -632,26 +635,5 @@ func inlineTaskValidationReason(issues []runtimepolicy.ValidationIssue) string {
 // heredoc) and multi-statement (cat-heredoc + curl --data @file)
 // shapes resolve to the actual body bytes.
 func controlTaskBodyFromInput(in json.RawMessage) ([]byte, bool) {
-	if len(in) == 0 {
-		return nil, false
-	}
-	// Structured form: { "url": "...", "method": "POST", "body": ... }
-	var structured struct {
-		Body json.RawMessage `json:"body,omitempty"`
-	}
-	if err := json.Unmarshal(in, &structured); err == nil && len(structured.Body) > 0 {
-		var bodyString string
-		if json.Unmarshal(structured.Body, &bodyString) == nil {
-			return []byte(bodyString), true
-		}
-		return structured.Body, true
-	}
-	// Bash form: { "cmd"/"command": "..." }. Re-use the same parser the
-	// rewrite path uses so single-stmt and cat-then-curl resolve
-	// identically; controlPartsFromCommandInput already handles
-	// @path → heredoc body substitution.
-	if _, _, body, ok := controlPartsFromCommandInput(in, ""); ok && len(body) > 0 {
-		return body, true
-	}
-	return nil, false
+	return controltool.TaskBodyFromInput(in)
 }

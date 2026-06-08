@@ -31,6 +31,23 @@ var litePlaceholderExtractRE = regexp.MustCompile(`autovault_[A-Za-z0-9._:-]+`)
 
 type stubVault struct{ data map[string][]byte }
 
+func TestLiteProxyResponsePolicyAvailableRequiresRegisteredRewriter(t *testing.T) {
+	registry := conversation.DefaultResponseRegistry()
+
+	for _, provider := range []conversation.Provider{
+		conversation.ProviderAnthropic,
+		conversation.ProviderOpenAI,
+	} {
+		if !liteProxyResponsePolicyAvailable(provider, registry) {
+			t.Fatalf("%s should be available through inspected lite-proxy", provider)
+		}
+	}
+
+	if liteProxyResponsePolicyAvailable(conversation.ProviderGoogle, registry) {
+		t.Fatal("Google must stay unavailable until a Gemini response rewriter is registered")
+	}
+}
+
 var errCreateRuntimePlaceholderTest = errors.New("create runtime placeholder failed")
 var errCreateCredentialAuthorizationTest = errors.New("create credential authorization failed")
 
@@ -1018,13 +1035,21 @@ func TestLoadActiveSecretRewritesSkipsDeletedVaultItem(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateRuntimePolicyRule: %v", err)
 	}
-	if rewrites := h.loadActiveSecretRewrites(ctx, agent); len(rewrites) != 0 {
+	rewrites, err := h.loadActiveSecretRewrites(ctx, agent)
+	if err != nil {
+		t.Fatalf("loadActiveSecretRewrites: %v", err)
+	}
+	if len(rewrites) != 0 {
 		t.Fatalf("rewrite should be inactive when backing vault item is gone: %+v", rewrites)
 	}
 	if err := h.Vault.(*stubVault).Set(ctx, user.ID, "slack", []byte(rawSecret)); err != nil {
 		t.Fatalf("seed slack vault item: %v", err)
 	}
-	if rewrites := h.loadActiveSecretRewrites(ctx, agent); len(rewrites) != 1 {
+	rewrites, err = h.loadActiveSecretRewrites(ctx, agent)
+	if err != nil {
+		t.Fatalf("loadActiveSecretRewrites: %v", err)
+	}
+	if len(rewrites) != 1 {
 		t.Fatalf("rewrite should be active once backing vault item exists: %+v", rewrites)
 	}
 }
@@ -1566,8 +1591,11 @@ func TestLLMEndpoint_RejectsMalformedBody(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 harness-shaped error, got %d (%s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "invalid character") {
-		t.Fatalf("body should carry parse error message:\n%s", rec.Body.String())
+	if strings.Contains(rec.Body.String(), "invalid character") {
+		t.Fatalf("body should not include raw parse error detail:\n%s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "This usually means a client bug; please retry.") {
+		t.Fatalf("body should carry parse failure guidance:\n%s", rec.Body.String())
 	}
 }
 

@@ -32,9 +32,22 @@ func firstSeededAgent(t *testing.T, st store.Store) *store.Agent {
 	return agents[0]
 }
 
+func structuredContinuationVerdict(text, reason, notice string) conversation.ToolUseVerdict {
+	payload, _ := json.Marshal(text)
+	return conversation.ToolUseVerdict{
+		Allowed:        false,
+		Reason:         reason,
+		SubstituteWith: text,
+		Continue: &conversation.ContinueSignal{
+			SyntheticToolResults: []json.RawMessage{payload},
+			PrependNotice:        notice,
+		},
+	}
+}
+
 // TestTryContinuation_PostsSecondCallWithToolResult exercises the
 // recursive-call mechanics directly: when the handler is handed a
-// processed result with a ContinueWithToolResult decision, it must
+// processed result with a structured continuation decision, it must
 // (a) POST a second request upstream whose messages array contains
 // the original assistant turn + a synthetic user/tool_result turn,
 // and (b) return the second response's body to the caller. This is
@@ -86,12 +99,7 @@ func TestTryContinuation_PostsSecondCallWithToolResult(t *testing.T) {
 		ContentType: "application/json",
 		Decisions: []conversation.ToolUseDecisionRecord{{
 			ToolUse: conversation.ToolUse{ID: "toolu_auto", Name: "Bash"},
-			Verdict: conversation.ToolUseVerdict{
-				Allowed:                false,
-				Reason:                 "auto-approved",
-				SubstituteWith:         "[Clawvisor: task was approved]",
-				ContinueWithToolResult: "[Clawvisor: task was approved]",
-			},
+			Verdict: structuredContinuationVerdict("[Clawvisor: task was approved]", "auto-approved", ""),
 		}},
 	}
 
@@ -117,13 +125,16 @@ func TestTryContinuation_PostsSecondCallWithToolResult(t *testing.T) {
 		http.StatusOK,
 		processed,
 		llmproxy.PostprocessConfig{
-			// Postprocess on the second call needs at least an inspector
-			// configured to not be skipped; pass the handler's.
-			Inspector:   h.Inspector,
-			RewriteOpts: inspector.DefaultRewriteOpts(h.ResolverBaseURL),
-			Store:       h.Store,
-			AgentUserID: agent.UserID,
-			AgentID:     agent.ID,
+			ToolUseEvaluatorFactory: pipelineToolUseEvaluatorFactory,
+			AgentContext: llmproxy.AgentContext{
+				AgentUserID: agent.UserID,
+				AgentID:     agent.ID,
+			},
+			RewriteContext: llmproxy.RewriteContext{
+				Inspector:   h.Inspector,
+				RewriteOpts: inspector.DefaultRewriteOpts(h.ResolverBaseURL),
+				Store:       h.Store,
+			},
 		},
 	)
 	if err != nil {
@@ -255,11 +266,7 @@ func TestTryContinuation_PostsSecondCallWithSSEToolResult(t *testing.T) {
 		ContentType: "text/event-stream",
 		Decisions: []conversation.ToolUseDecisionRecord{{
 			ToolUse: conversation.ToolUse{ID: "toolu_auto", Name: "Bash"},
-			Verdict: conversation.ToolUseVerdict{
-				Allowed:                false,
-				SubstituteWith:         "[Clawvisor: task was approved]",
-				ContinueWithToolResult: "[Clawvisor: task was approved]",
-			},
+			Verdict: structuredContinuationVerdict("[Clawvisor: task was approved]", "", ""),
 		}},
 		ContinuationToolResults: []conversation.ContinuationToolResult{{
 			ToolUseID: "toolu_auto",
@@ -281,11 +288,16 @@ func TestTryContinuation_PostsSecondCallWithSSEToolResult(t *testing.T) {
 		http.StatusOK,
 		processed,
 		llmproxy.PostprocessConfig{
-			Inspector:   h.Inspector,
-			RewriteOpts: inspector.DefaultRewriteOpts(h.ResolverBaseURL),
-			Store:       h.Store,
-			AgentUserID: agent.UserID,
-			AgentID:     agent.ID,
+			ToolUseEvaluatorFactory: pipelineToolUseEvaluatorFactory,
+			AgentContext: llmproxy.AgentContext{
+				AgentUserID: agent.UserID,
+				AgentID:     agent.ID,
+			},
+			RewriteContext: llmproxy.RewriteContext{
+				Inspector:   h.Inspector,
+				RewriteOpts: inspector.DefaultRewriteOpts(h.ResolverBaseURL),
+				Store:       h.Store,
+			},
 		},
 	)
 	if err != nil {
@@ -465,11 +477,7 @@ func TestTryContinuation_RefreshesCandidateTasksFromStore(t *testing.T) {
 		Body: []byte("fallback"),
 		Decisions: []conversation.ToolUseDecisionRecord{{
 			ToolUse: conversation.ToolUse{ID: "toolu_auto", Name: "Bash"},
-			Verdict: conversation.ToolUseVerdict{
-				Allowed:                false,
-				SubstituteWith:         "[approved]",
-				ContinueWithToolResult: "[approved]",
-			},
+			Verdict: structuredContinuationVerdict("[approved]", "", ""),
 		}},
 	}
 
@@ -485,17 +493,26 @@ func TestTryContinuation_RefreshesCandidateTasksFromStore(t *testing.T) {
 		inboundBody, firstUpstreamBody, "application/json", http.StatusOK,
 		processed,
 		llmproxy.PostprocessConfig{
-			Inspector:        h.Inspector,
-			RewriteOpts:      inspector.DefaultRewriteOpts(h.ResolverBaseURL),
-			Store:            h.Store,
-			AgentUserID:      agent.UserID,
-			AgentID:          agent.ID,
-			Catalog:          nil,
-			CandidateTasks:   nil, // STALE — refresh must rebuild this
-			ToolRules:        nil,
-			EgressRules:      nil,
-			CallerNonces:     h.CallerNonces,
-			PendingApprovals: h.PendingApprovals,
+			ToolUseEvaluatorFactory: pipelineToolUseEvaluatorFactory,
+			AgentContext: llmproxy.AgentContext{
+				AgentUserID: agent.UserID,
+				AgentID:     agent.ID,
+			},
+			AuthorizationContext: llmproxy.AuthorizationContext{
+				Catalog:        nil,
+				CandidateTasks: nil,
+				ToolRules:      nil,
+				EgressRules:    nil,
+			},
+			ApprovalContext: llmproxy.ApprovalContext{
+				PendingApprovals: h.PendingApprovals,
+			},
+			RewriteContext: llmproxy.RewriteContext{
+				Inspector:    h.Inspector,
+				RewriteOpts:  inspector.DefaultRewriteOpts(h.ResolverBaseURL),
+				Store:        h.Store,
+				CallerNonces: h.CallerNonces,
+			},
 		},
 	)
 	if err != nil {
@@ -521,7 +538,7 @@ func TestTryContinuation_RefreshesCandidateTasksFromStore(t *testing.T) {
 }
 
 // TestTryContinuation_PrependsUserFacingNotice verifies the handler
-// injects the verdict's PrependAssistantNotice text into the
+// injects the verdict's structured continuation notice into the
 // continuation's assistant turn — so when the auto-approve gate fires,
 // the user sees a "[Clawvisor] approved" line at the top of the
 // model's next response in the same turn as the model's actions.
@@ -555,12 +572,7 @@ func TestTryContinuation_PrependsUserFacingNotice(t *testing.T) {
 		Body: []byte("fallback"),
 		Decisions: []conversation.ToolUseDecisionRecord{{
 			ToolUse: conversation.ToolUse{ID: "toolu_a", Name: "Bash"},
-			Verdict: conversation.ToolUseVerdict{
-				Allowed:                false,
-				SubstituteWith:         "[task approved]",
-				ContinueWithToolResult: "[task approved]",
-				PrependAssistantNotice: `[Clawvisor] Auto-approved task: Create files in /tmp`,
-			},
+			Verdict: structuredContinuationVerdict("[task approved]", "", `[Clawvisor] Auto-approved task: Create files in /tmp`),
 		}},
 	}
 
@@ -572,11 +584,16 @@ func TestTryContinuation_PrependsUserFacingNotice(t *testing.T) {
 		inboundBody, firstUpstreamBody, "application/json", http.StatusOK,
 		processed,
 		llmproxy.PostprocessConfig{
-			Inspector:   h.Inspector,
-			RewriteOpts: inspector.DefaultRewriteOpts(h.ResolverBaseURL),
-			Store:       h.Store,
-			AgentUserID: agent.UserID,
-			AgentID:     agent.ID,
+			ToolUseEvaluatorFactory: pipelineToolUseEvaluatorFactory,
+			AgentContext: llmproxy.AgentContext{
+				AgentUserID: agent.UserID,
+				AgentID:     agent.ID,
+			},
+			RewriteContext: llmproxy.RewriteContext{
+				Inspector:   h.Inspector,
+				RewriteOpts: inspector.DefaultRewriteOpts(h.ResolverBaseURL),
+				Store:       h.Store,
+			},
 		},
 	)
 	if err != nil {
@@ -620,7 +637,12 @@ func TestTryContinuation_NoContinueDecisionIsNoOp(t *testing.T) {
 	final, status, ct, _, err := h.tryContinuation(
 		req, agent, conversation.ProviderAnthropic, "req-x",
 		[]byte(`{"messages":[]}`), []byte(`{"content":[]}`), "application/json", http.StatusOK,
-		processed, llmproxy.PostprocessConfig{Inspector: h.Inspector},
+		processed, llmproxy.PostprocessConfig{
+			ToolUseEvaluatorFactory: pipelineToolUseEvaluatorFactory,
+			RewriteContext: llmproxy.RewriteContext{
+				Inspector: h.Inspector,
+			},
+		},
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -678,11 +700,7 @@ func TestServe_ContinuationClearsStaleContentLengthHeader(t *testing.T) {
 		Rewritten:   false,
 		Decisions: []conversation.ToolUseDecisionRecord{{
 			ToolUse: conversation.ToolUse{ID: "toolu_a", Name: "Bash"},
-			Verdict: conversation.ToolUseVerdict{
-				Allowed:                false,
-				SubstituteWith:         "[fallback]",
-				ContinueWithToolResult: "[approved]",
-			},
+			Verdict: structuredContinuationVerdict("[approved]", "", ""),
 		}},
 	}
 
@@ -693,11 +711,16 @@ func TestServe_ContinuationClearsStaleContentLengthHeader(t *testing.T) {
 		"application/json", http.StatusOK,
 		processed,
 		llmproxy.PostprocessConfig{
-			Inspector:   h.Inspector,
-			RewriteOpts: inspector.DefaultRewriteOpts(h.ResolverBaseURL),
-			Store:       h.Store,
-			AgentUserID: agent.UserID,
-			AgentID:     agent.ID,
+			ToolUseEvaluatorFactory: pipelineToolUseEvaluatorFactory,
+			AgentContext: llmproxy.AgentContext{
+				AgentUserID: agent.UserID,
+				AgentID:     agent.ID,
+			},
+			RewriteContext: llmproxy.RewriteContext{
+				Inspector:   h.Inspector,
+				RewriteOpts: inspector.DefaultRewriteOpts(h.ResolverBaseURL),
+				Store:       h.Store,
+			},
 		},
 	)
 	if err != nil {
@@ -741,11 +764,7 @@ func TestTryContinuation_UpstreamErrorFallsBack(t *testing.T) {
 		Body: []byte("fallback"),
 		Decisions: []conversation.ToolUseDecisionRecord{{
 			ToolUse: conversation.ToolUse{ID: "toolu_x"},
-			Verdict: conversation.ToolUseVerdict{
-				Allowed:                false,
-				SubstituteWith:         "[fallback]",
-				ContinueWithToolResult: "[fallback]",
-			},
+			Verdict: structuredContinuationVerdict("[fallback]", "", ""),
 		}},
 	}
 	inbound := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
@@ -753,7 +772,12 @@ func TestTryContinuation_UpstreamErrorFallsBack(t *testing.T) {
 	final, _, _, _, err := h.tryContinuation(
 		req, agent, conversation.ProviderAnthropic, "req-y",
 		inbound, first, "application/json", http.StatusOK,
-		processed, llmproxy.PostprocessConfig{Inspector: h.Inspector},
+		processed, llmproxy.PostprocessConfig{
+			ToolUseEvaluatorFactory: pipelineToolUseEvaluatorFactory,
+			RewriteContext: llmproxy.RewriteContext{
+				Inspector: h.Inspector,
+			},
+		},
 	)
 	if err == nil {
 		t.Fatal("expected error on upstream failure; got nil so caller would silently swap in continuation result")

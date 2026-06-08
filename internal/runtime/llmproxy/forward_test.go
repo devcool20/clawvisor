@@ -111,10 +111,11 @@ func TestForward_AnthropicInjectsKey(t *testing.T) {
 func TestForward_AnthropicPassthroughAuthPreservesOAuthAuthorization(t *testing.T) {
 	v := &stubVault{}
 
-	var seenAuth, seenAPIKey, seenVersion string
+	var seenAuth, seenAPIKey, seenGoogleAPIKey, seenVersion string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenAuth = r.Header.Get("Authorization")
 		seenAPIKey = r.Header.Get("x-api-key")
+		seenGoogleAPIKey = r.Header.Get("x-goog-api-key")
 		seenVersion = r.Header.Get("anthropic-version")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"msg_1"}`))
@@ -127,6 +128,7 @@ func TestForward_AnthropicPassthroughAuthPreservesOAuthAuthorization(t *testing.
 	inbound := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{"model":"claude"}`)))
 	inbound.Header.Set("Authorization", "Bearer claude-oauth-token")
 	inbound.Header.Set("x-api-key", "cvis_agent_token")
+	inbound.Header.Set("x-goog-api-key", "caller-google-key")
 
 	ctx := WithPassthroughUpstreamAuth(context.Background())
 	resp, err := f.Forward(ctx, "user1", "", conversation.ProviderAnthropic, inbound, []byte(`{"model":"claude"}`))
@@ -140,6 +142,9 @@ func TestForward_AnthropicPassthroughAuthPreservesOAuthAuthorization(t *testing.
 	}
 	if seenAPIKey != "" {
 		t.Fatalf("expected upstream x-api-key stripped in passthrough mode, got %q", seenAPIKey)
+	}
+	if seenGoogleAPIKey != "" {
+		t.Fatalf("expected upstream x-goog-api-key stripped in passthrough mode, got %q", seenGoogleAPIKey)
 	}
 	if seenVersion == "" {
 		t.Errorf("expected default anthropic-version header")
@@ -176,10 +181,11 @@ func TestForward_OpenAIInjectsKey(t *testing.T) {
 func TestForward_OpenAIPassthroughAuthPreservesOAuthAuthorization(t *testing.T) {
 	v := &stubVault{}
 
-	var seenAuth, seenAccountID string
+	var seenAuth, seenAccountID, seenGoogleAPIKey string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenAuth = r.Header.Get("Authorization")
 		seenAccountID = r.Header.Get("ChatGPT-Account-Id")
+		seenGoogleAPIKey = r.Header.Get("x-goog-api-key")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{}`))
 	}))
@@ -192,6 +198,7 @@ func TestForward_OpenAIPassthroughAuthPreservesOAuthAuthorization(t *testing.T) 
 	inbound.Header.Set("Authorization", "Bearer codex-oauth-token")
 	inbound.Header.Set("ChatGPT-Account-Id", "acct_123")
 	inbound.Header.Set("X-Clawvisor-Agent-Token", "cvis_agent_token")
+	inbound.Header.Set("x-goog-api-key", "caller-google-key")
 
 	ctx := WithPassthroughUpstreamAuth(context.Background())
 	resp, err := f.Forward(ctx, "user1", "", conversation.ProviderOpenAI, inbound, []byte("{}"))
@@ -205,6 +212,81 @@ func TestForward_OpenAIPassthroughAuthPreservesOAuthAuthorization(t *testing.T) 
 	}
 	if seenAccountID != "acct_123" {
 		t.Fatalf("expected ChatGPT-Account-Id to pass through when present, got %q", seenAccountID)
+	}
+	if seenGoogleAPIKey != "" {
+		t.Fatalf("expected upstream x-goog-api-key stripped in passthrough mode, got %q", seenGoogleAPIKey)
+	}
+}
+
+func TestForward_GoogleInjectsKey(t *testing.T) {
+	v := &stubVault{}
+	v.Set(context.Background(), "user1", "google", []byte("gemini-real-key"))
+
+	var seenAuth, seenAPIKey string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		seenAPIKey = r.Header.Get("x-goog-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	f := NewForwarder(v)
+	f.Upstream = UpstreamSelector{GoogleBaseURL: upstream.URL}
+
+	inbound := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini:generateContent", strings.NewReader("{}"))
+	inbound.Header.Set("Authorization", "Bearer cvis_agent_token")
+
+	resp, err := f.Forward(context.Background(), "user1", "", conversation.ProviderGoogle, inbound, []byte("{}"))
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if seenAPIKey != "gemini-real-key" {
+		t.Fatalf("expected x-goog-api-key=gemini-real-key, got %q", seenAPIKey)
+	}
+	if seenAuth != "" {
+		t.Fatalf("expected caller Authorization stripped for Google key auth, got %q", seenAuth)
+	}
+}
+
+func TestForward_GooglePassthroughAuthPreservesOAuthAuthorization(t *testing.T) {
+	v := &stubVault{}
+
+	var seenAuth, seenAPIKey, seenXAPIKey string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		seenAPIKey = r.Header.Get("x-goog-api-key")
+		seenXAPIKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	f := NewForwarder(v)
+	f.Upstream = UpstreamSelector{GoogleBaseURL: upstream.URL}
+
+	inbound := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini:generateContent", strings.NewReader("{}"))
+	inbound.Header.Set("Authorization", "Bearer google-oauth-token")
+	inbound.Header.Set("x-goog-api-key", "cvis_agent_token")
+	inbound.Header.Set("x-api-key", "caller-anthropic-key")
+
+	ctx := WithPassthroughUpstreamAuth(context.Background())
+	resp, err := f.Forward(ctx, "user1", "", conversation.ProviderGoogle, inbound, []byte("{}"))
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if seenAuth != "Bearer google-oauth-token" {
+		t.Fatalf("expected upstream OAuth Authorization to pass through, got %q", seenAuth)
+	}
+	if seenAPIKey != "" {
+		t.Fatalf("expected upstream x-goog-api-key stripped in passthrough mode, got %q", seenAPIKey)
+	}
+	if seenXAPIKey != "" {
+		t.Fatalf("expected upstream x-api-key stripped in passthrough mode, got %q", seenXAPIKey)
 	}
 }
 
@@ -370,6 +452,9 @@ func TestVaultServiceID(t *testing.T) {
 	if VaultServiceID(conversation.ProviderOpenAI) != "openai" {
 		t.Errorf("openai service id mismatch")
 	}
+	if VaultServiceID(conversation.ProviderGoogle) != "google" {
+		t.Errorf("google service id mismatch")
+	}
 	if VaultServiceID("unknown") != "" {
 		t.Errorf("unknown provider should map to empty serviceID")
 	}
@@ -384,6 +469,7 @@ func TestCopyForwardableHeaders_StripsConnectionScoped(t *testing.T) {
 	src.Set("Upgrade", "websocket")
 	src.Set("X-Forwarded-For", "1.2.3.4")
 	src.Set("Authorization", "Bearer cvis_agent_token")
+	src.Set("x-goog-api-key", "caller-google-key")
 	dst := http.Header{}
 	copyForwardableHeaders(dst, src)
 	if dst.Get("X-Internal") != "" {
@@ -397,6 +483,9 @@ func TestCopyForwardableHeaders_StripsConnectionScoped(t *testing.T) {
 	}
 	if dst.Get("Authorization") != "" {
 		t.Errorf("Authorization (static skip) should still be stripped, got %q", dst.Get("Authorization"))
+	}
+	if dst.Get("x-goog-api-key") != "" {
+		t.Errorf("x-goog-api-key (static skip) should be stripped, got %q", dst.Get("x-goog-api-key"))
 	}
 }
 

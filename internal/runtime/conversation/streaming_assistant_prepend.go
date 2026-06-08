@@ -20,6 +20,9 @@ const (
 	StreamShapeAnthropicMessages
 	StreamShapeOpenAIChat
 	StreamShapeOpenAIResponses
+	// StreamShapeGoogleGemini is Gemini's :streamGenerateContent SSE
+	// shape, with a different envelope than Anthropic or OpenAI.
+	StreamShapeGoogleGemini
 )
 
 // DetectStreamShape picks the streaming SSE shape from the inbound LLM
@@ -35,6 +38,11 @@ func DetectStreamShape(req *http.Request, provider Provider) StreamShape {
 			return StreamShapeOpenAIChat
 		}
 		return StreamShapeOpenAIResponses
+	case ProviderGoogle:
+		if req != nil && strings.EqualFold(req.URL.Query().Get("alt"), "sse") {
+			return StreamShapeGoogleGemini
+		}
+		return StreamShapeUnknown
 	}
 	return StreamShapeUnknown
 }

@@ -11,9 +11,22 @@ import (
 
 type ToolUseEvaluator func(ToolUse) ToolUseVerdict
 
+// ToolUseVerdict is the unified per-tool-use verdict shape consumed by
+// response rewriters AND produced by the policy pipeline. Both pipelines
+// share this type — there is no separate pipeline.ToolUseVerdict.
 type ToolUseVerdict struct {
-	Allowed        bool
-	Reason         string
+	// Allowed is the compatibility boolean derived from Outcome.
+	// Rewriters read this directly. Set true when Outcome is
+	// OutcomeAllow or OutcomeRewrite; false otherwise.
+	Allowed bool
+	// Outcome is the typed verdict category produced by pipeline
+	// evaluators. Optional for callers that only set Allowed.
+	Outcome Outcome
+	Reason  string
+
+	// SubstituteWith replaces the tool_use block with a plain-text
+	// assistant block in the rewritten response. Used by approval-prompt
+	// rendering, inline-task interception, etc.
 	SubstituteWith string
 	// SuppressSubstituteText, when true and Allowed=false, prevents the
 	// rewriter/formatter from falling back to a default "Tool 'X' was
@@ -22,42 +35,50 @@ type ToolUseVerdict struct {
 	// not render their own separate block messages.
 	SuppressSubstituteText bool
 
-	// RewriteInput, when non-nil and Allowed=true, replaces the tool_use's
-	// input field in-place. Used by the lite-proxy inspector to redirect
-	// the harness's eventual HTTP call at the resolver while preserving
-	// the original method/path/body. Per-block mutation; the assistant
-	// turn otherwise streams through unchanged.
+	// RewriteInput, when non-nil, replaces the tool_use's input field
+	// in-place. Used by the lite-proxy inspector to redirect the
+	// harness's eventual HTTP call at the resolver while preserving
+	// the original method/path/body.
 	RewriteInput json.RawMessage
 
-	// ContinueWithToolResult, when non-empty, signals that the proxy
-	// has answered the tool_use itself and wants to feed the result back
-	// to the model so it continues with its next tool_use rather than
-	// terminating the turn. The handler builds a synthetic user turn
-	// containing a tool_result block with this content and re-calls the
-	// upstream LLM. SubstituteWith remains the fallback rendered to the
-	// harness if the continuation call fails.
+	// ContinueWithToolResult is the legacy flattened continuation
+	// payload. New evaluators should set Continue instead; final
+	// adapter code should read ContinuationToolResultContent(), which
+	// prefers Continue and falls back to this field for compatibility.
 	ContinueWithToolResult string
 
-	// PrependAssistantNotice, when non-empty, is text the handler
-	// prepends to the assistant turn it returns to the harness AFTER a
-	// successful ContinueWithToolResult round-trip. The use case is
-	// surfacing a user-facing notice ("a task was auto-approved on
-	// your behalf") in the same response that carries the model's next
-	// actions, so the user sees what happened without a separate turn.
-	// Ignored when ContinueWithToolResult is empty or when the
-	// continuation failed and the substitute fallback rendered
-	// instead.
+	// PrependAssistantNotice is the legacy flattened continuation
+	// notice. New evaluators should set Continue.PrependNotice instead;
+	// final adapter code should read ContinuationNotice().
 	PrependAssistantNotice string
 
-	// CreatedTaskID is set by the conversation auto-approval gate to
-	// the ID of the inline task it created before returning the
-	// verdict. Carried so downstream audit rows in the lite-proxy
-	// handler (e.g. LogContinuationSkippedSiblingTools when sibling
-	// tool_uses force a fallback) can link to the same task_id the
-	// rest of the approval audit trail uses — without parsing the
-	// augmentation text or threading a separate map. Empty for any
-	// other verdict source.
+	// CreatedTaskID names the inline task created by the
+	// conversation auto-approval gate. Carried so downstream audit
+	// rows can link to the same task_id.
 	CreatedTaskID string
+
+	// HeldKindHint is the policy-set classification of this verdict
+	// for postproc's coalescing pass. When empty, classification falls
+	// back to the Allowed / RewriteInput shape.
+	HeldKindHint HeldKindHint
+
+	// --- response orchestration fields ---
+
+	// HoldKey groups sibling tool_uses for coalescing. Empty means
+	// "do not coalesce" (each Hold gets its own approval row).
+	HoldKey string
+
+	// Continue lifts continuation out of "mutation" into a control-flow
+	// signal. When set, the tool_use is being served locally and the
+	// pipeline re-enters with the synthetic continuation as the next
+	// request.
+	Continue *ContinueSignal
+
+	// Facts carries typed observations the evaluator emitted. Audit
+	// emission branches via type switch on Facts. Populated for EVERY
+	// evaluator that runs, including those returning Skip —
+	// observation is a separate channel from verdict claiming.
+	Facts []EvaluationFact
 }
 
 type RewriteResult struct {
@@ -91,6 +112,59 @@ type ContinuationToolResult struct {
 	Content   string
 }
 
+// ContinuationToolResultContent returns the text payload a final
+// provider adapter should wrap in the provider-specific tool_result
+// shape. Structured Continue is canonical; ContinueWithToolResult is a
+// compatibility fallback for older call sites that have not migrated.
+func (v ToolUseVerdict) ContinuationToolResultContent() (string, bool) {
+	if v.Continue != nil {
+		text := continuationToolResultContent(v.Continue.SyntheticToolResults)
+		return text, true
+	}
+	if v.ContinueWithToolResult != "" {
+		return v.ContinueWithToolResult, true
+	}
+	return "", false
+}
+
+// ContinuationNotice returns the user-facing notice to prepend after a
+// successful continuation. Structured Continue is canonical; the flat
+// field is a compatibility fallback.
+func (v ToolUseVerdict) ContinuationNotice() string {
+	if v.Continue != nil && strings.TrimSpace(v.Continue.PrependNotice) != "" {
+		return v.Continue.PrependNotice
+	}
+	return v.PrependAssistantNotice
+}
+
+func continuationToolResultContent(results []json.RawMessage) string {
+	parts := make([]string, 0, len(results))
+	for _, raw := range results {
+		if len(raw) == 0 {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil {
+			parts = append(parts, s)
+			continue
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			continue
+		}
+		if content, ok := obj["content"]; ok {
+			if err := json.Unmarshal(content, &s); err == nil {
+				parts = append(parts, s)
+				continue
+			}
+			parts = append(parts, string(content))
+			continue
+		}
+		parts = append(parts, string(raw))
+	}
+	return strings.Join(parts, "\n")
+}
+
 type StreamingRewriteResult struct {
 	ToolUses                  []ToolUse
 	AssistantTurn             *Turn
@@ -111,7 +185,16 @@ type ResponseRewriter interface {
 type StreamingResponseRewriter interface {
 	Name() Provider
 	MatchesResponse(req *http.Request, resp *http.Response) bool
-	StreamRewrite(ctx context.Context, r io.Reader, w io.Writer) (StreamingRewriteResult, error)
+	// StreamRewrite reads the upstream SSE stream from r, writes the
+	// rewritten (or unchanged) stream to w, and returns the per-stream
+	// summary the post-pass needs (tool_uses observed, indices, IDs).
+	//
+	// onToolUse, if non-nil, is invoked as each tool_use's parsing
+	// completes (content_block_stop for Anthropic; the equivalent for
+	// OpenAI). Streaming callers use this to collect tool_uses as they
+	// arrive; the returned result still carries the full ToolUses slice
+	// for callers that don't supply a callback.
+	StreamRewrite(ctx context.Context, r io.Reader, w io.Writer, onToolUse func(ToolUse)) (StreamingRewriteResult, error)
 }
 
 type ResponseRegistry struct {
@@ -222,19 +305,20 @@ func applyBlockSubstitutions(frags []assistantFragment, decisions []ToolUseDecis
 		decision := decisions[toolDecisionIdx]
 		toolDecisionIdx++
 		if !decision.Verdict.Allowed {
-			txt := decision.Verdict.SubstituteWith
-			if txt == "" && !decision.Verdict.SuppressSubstituteText {
-				reason := decision.Verdict.Reason
-				if reason == "" {
-					reason = "blocked by policy"
-				}
-				txt = fmt.Sprintf("Tool '%s' was blocked by Clawvisor policy: %s", frag.ToolName, reason)
+			if substitute := strings.TrimSpace(decision.Verdict.SubstituteWith); substitute != "" {
+				out = append(out, assistantFragment{Text: substitute})
+				continue
 			}
-			if txt != "" {
-				out = append(out, assistantFragment{
-					Text: txt,
-				})
+			if decision.Verdict.SuppressSubstituteText {
+				continue
 			}
+			reason := decision.Verdict.Reason
+			if reason == "" {
+				reason = "blocked by policy"
+			}
+			out = append(out, assistantFragment{
+				Text: fmt.Sprintf("Tool '%s' was blocked by Clawvisor policy: %s", frag.ToolName, reason),
+			})
 			continue
 		}
 		out = append(out, frag)

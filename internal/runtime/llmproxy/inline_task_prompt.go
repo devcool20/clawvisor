@@ -4,6 +4,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/approvaltext"
 	runtimetasks "github.com/clawvisor/clawvisor/internal/runtime/tasks"
 	"github.com/clawvisor/clawvisor/internal/taskrisk"
 )
@@ -13,7 +14,7 @@ import (
 // POST /api/control/tasks when the user is mid-flight on an inline task gesture
 // (StageAwaitingTaskApproval).
 //
-// The output is plain text in the same shape as approvalPrompt — the harness
+// The output is plain text in the same shape as ApprovalPrompt — the harness
 // renders it verbatim, so the user sees a continuation of the same approval
 // conversation rather than a context switch to the dashboard.
 //
@@ -158,13 +159,18 @@ func renderTaskApprovalPromptWithRisk(req *runtimetasks.TaskCreateRequest, appro
 // InlineApprovalIDMarker is the prefix of the footer line that
 // renderTaskApprovalPrompt appends and that the history augmenter
 // parses. Format: "\n\n[clawvisor:approval=<id>]".
-const InlineApprovalIDMarker = "[clawvisor:approval="
+const InlineApprovalIDMarker = approvaltext.InlineApprovalIDMarker
 
 func approvalIDFooter(approvalID string) string {
-	if approvalID == "" {
-		return ""
-	}
-	return "\n\n" + InlineApprovalIDMarker + approvalID + "]"
+	return approvaltext.ApprovalIDFooter(approvalID)
+}
+
+// ApprovalIDFooter returns the marker the postproc layer appends to
+// approval-prompt substitute text so subsequent agent turns can
+// disambiguate which hold a bare "y"/"n" reply targets. Exported for
+// the postproc package's coalescedApprovalPrompt.
+func ApprovalIDFooter(approvalID string) string {
+	return approvaltext.ApprovalIDFooter(approvalID)
 }
 
 // extractApprovalIDFromPrompt pulls the approval ID out of an assistant

@@ -1782,18 +1782,17 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func (rw OpenAIResponseRewriter) StreamRewrite(ctx context.Context, r io.Reader, w io.Writer) (StreamingRewriteResult, error) {
+func (rw OpenAIResponseRewriter) StreamRewrite(ctx context.Context, r io.Reader, w io.Writer, onToolUse func(ToolUse)) (StreamingRewriteResult, error) {
 	br := bufio.NewReader(r)
 	prefix, isResponses, err := sniffOpenAIStreamFormat(br)
 	if err != nil {
 		return StreamingRewriteResult{}, err
 	}
 	stream := io.MultiReader(bytes.NewReader(prefix), br)
-
 	if isResponses {
-		return rw.streamRewriteResponses(ctx, stream, w)
+		return rw.streamRewriteResponses(ctx, stream, w, onToolUse)
 	}
-	return rw.streamRewriteChatCompletions(ctx, stream, w)
+	return rw.streamRewriteChatCompletions(ctx, stream, w, onToolUse)
 }
 
 func sniffOpenAIStreamFormat(br *bufio.Reader) ([]byte, bool, error) {
@@ -1827,7 +1826,7 @@ func sniffOpenAIStreamFormat(br *bufio.Reader) ([]byte, bool, error) {
 	return prefix.Bytes(), bytes.Contains(prefix.Bytes(), []byte("response.")), nil
 }
 
-func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Context, r io.Reader, w io.Writer) (StreamingRewriteResult, error) {
+func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Context, r io.Reader, w io.Writer, onToolUse func(ToolUse)) (StreamingRewriteResult, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64<<10), 8<<20)
 
@@ -1841,6 +1840,7 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 	var msgModel string
 	var text strings.Builder
 	var frags []assistantFragment
+	delivered := map[int]bool{}
 
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -1946,6 +1946,26 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 			}
 		}
 		if isToolCallFinish {
+			if onToolUse != nil {
+				indexes := make([]int, 0, len(pending))
+				for idx := range pending {
+					indexes = append(indexes, idx)
+				}
+				sort.Ints(indexes)
+				for _, idx := range indexes {
+					pc := pending[idx]
+					if delivered[idx] {
+						continue
+					}
+					onToolUse(ToolUse{
+						ID:    pc.id,
+						Index: idx,
+						Name:  pc.name,
+						Input: rawIfJSONOpenAI(pc.args.String()),
+					})
+					delivered[idx] = true
+				}
+			}
 			continue
 		}
 
@@ -1998,7 +2018,7 @@ func (rw OpenAIResponseRewriter) streamRewriteChatCompletions(ctx context.Contex
 	}, nil
 }
 
-func (rw OpenAIResponseRewriter) streamRewriteResponses(ctx context.Context, r io.Reader, w io.Writer) (StreamingRewriteResult, error) {
+func (rw OpenAIResponseRewriter) streamRewriteResponses(ctx context.Context, r io.Reader, w io.Writer, onToolUse func(ToolUse)) (StreamingRewriteResult, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64<<10), 8<<20)
 
@@ -2016,6 +2036,8 @@ func (rw OpenAIResponseRewriter) streamRewriteResponses(ctx context.Context, r i
 	var dataLns []string
 	withheldTool := false
 	streamID := "resp_clawvisor_rewrite"
+	delivered := map[string]bool{}
+	nextDeliveredToolIndex := 0
 
 	flushEvent := func() error {
 		if len(dataLns) == 0 {
@@ -2161,6 +2183,16 @@ func (rw OpenAIResponseRewriter) streamRewriteResponses(ctx context.Context, r i
 					name:        pc.name,
 					arguments:   pc.arguments.String(),
 				})
+				if onToolUse != nil && !delivered[pc.itemID] {
+					onToolUse(ToolUse{
+						ID:    pc.callID,
+						Index: nextDeliveredToolIndex,
+						Name:  pc.name,
+						Input: rawIfJSONOpenAI(pc.arguments.String()),
+					})
+					delivered[pc.itemID] = true
+					nextDeliveredToolIndex++
+				}
 				return nil
 			case "custom_tool_call":
 				withheldTool = true
@@ -2176,6 +2208,12 @@ func (rw OpenAIResponseRewriter) streamRewriteResponses(ctx context.Context, r i
 					name:             tu.Name,
 					customInput:      customToolInputForReemit(raw.Item.Input, raw.Item.Arguments),
 				})
+				if onToolUse != nil && !delivered[raw.Item.ID] {
+					tu.Index = nextDeliveredToolIndex
+					onToolUse(tu)
+					delivered[raw.Item.ID] = true
+					nextDeliveredToolIndex++
+				}
 				return nil
 			default:
 				if len(rawItem.Item) > 0 {
