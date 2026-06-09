@@ -13,6 +13,7 @@ import Settings from './Settings'
 import Overview from './Overview'
 import GetStarted from './GetStarted'
 import HowItWorks from './HowItWorks'
+import Inbox from './Inbox'
 import Tasks from './Tasks'
 import AdapterGen from './AdapterGen'
 import OrgSettings from './OrgSettings'
@@ -361,6 +362,7 @@ export default function Dashboard() {
           {features?.adapter_gen && <Route path="adapter-gen" element={<AdapterGen />} />}
           <Route path="activity" element={<Activity />} />
           <Route path="audit" element={<Navigate to="/dashboard/activity" replace />} />
+          <Route path="inbox" element={<Inbox />} />
           <Route path="agents" element={<Agents />} />
           <Route path="agents/:agentId" element={<Agents />} />
           {/* Focused deep-link page for vaulting one upstream LLM API key.
