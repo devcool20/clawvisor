@@ -25,7 +25,6 @@ import OrgMCPServers from './OrgMCPServers'
 import Billing from './Billing'
 import KeyVault from './KeyVault'
 import OrgSelector from '../components/OrgSelector'
-import OnboardingBanner from '../components/OnboardingBanner'
 
 // Unified nav: same labels and routes across every deployment mode. Per-flag
 // content variation lives inside individual pages now, not in the nav array.
@@ -278,7 +277,6 @@ export default function Dashboard() {
             </span>
           </div>
         )}
-        <OnboardingBanner />
         {llmStatus?.spend_cap_exhausted && (
           <div className="mx-4 mt-3 px-4 py-2.5 rounded-md bg-warning/10 border border-warning/30 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 text-sm">
             <span className="text-text-primary">
