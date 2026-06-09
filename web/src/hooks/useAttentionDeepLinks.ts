@@ -66,22 +66,36 @@ export function useAttentionDeepLinks() {
     const taskId = searchParams.get('task_id') ?? undefined
     if (!action || (!requestId && !taskId)) return
 
-    setSearchParams({}, { replace: true })
+    // Resolve the action first; only clear the URL once a mutation has
+    // actually been dispatched. Otherwise a deep link that we couldn't act
+    // on (org context blocks task actions, unknown action name) would lose
+    // its params silently with no recovery path.
+    let dispatched = false
 
     if (requestId) {
-      if (action === 'approve') approveRequest.mutate({ requestId, taskId })
-      else if (action === 'deny') denyRequest.mutate({ requestId, taskId })
-      return
+      if (action === 'approve') {
+        approveRequest.mutate({ requestId, taskId })
+        dispatched = true
+      } else if (action === 'deny') {
+        denyRequest.mutate({ requestId, taskId })
+        dispatched = true
+      }
+    } else if (taskId) {
+      if (currentOrg) {
+        setResult('Switch to your personal context to act on this task.')
+        dispatched = true
+      } else {
+        switch (action) {
+          case 'approve': approveTask.mutate(taskId); dispatched = true; break
+          case 'deny': denyTask.mutate(taskId); dispatched = true; break
+          case 'expand_approve': expandApproveTask.mutate(taskId); dispatched = true; break
+          case 'expand_deny': expandDenyTask.mutate(taskId); dispatched = true; break
+        }
+      }
     }
 
-    if (taskId) {
-      if (currentOrg) return // task API is personal-context only
-      switch (action) {
-        case 'approve': approveTask.mutate(taskId); break
-        case 'deny': denyTask.mutate(taskId); break
-        case 'expand_approve': expandApproveTask.mutate(taskId); break
-        case 'expand_deny': expandDenyTask.mutate(taskId); break
-      }
+    if (dispatched) {
+      setSearchParams({}, { replace: true })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])

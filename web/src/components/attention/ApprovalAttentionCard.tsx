@@ -123,7 +123,7 @@ export default function ApprovalAttentionCard({ item }: { item: QueueItem }) {
         <div className="px-5 pb-3">
           <div className="rounded border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger flex items-center justify-between gap-3">
             <span>{error}</span>
-            <button onClick={() => setError(null)} className="text-xs underline hover:opacity-80">Retry</button>
+            <button onClick={() => setError(null)} className="text-xs underline hover:opacity-80">Dismiss</button>
           </div>
         </div>
       )}

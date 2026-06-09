@@ -22,6 +22,18 @@ export default function DashboardIndex() {
   const taskId = searchParams.get('task_id')
   const hasDeepLink = !!action && (!!requestId || !!taskId)
 
+  // Hooks must be called in the same order on every render, so the agents
+  // query is hoisted above the deep-link branch. `enabled: !hasDeepLink`
+  // skips the network round-trip when the deep-link path will redirect
+  // away before this component ever uses `agents`.
+  const orgId = currentOrg?.id
+  const { data: agents, isLoading, isError } = useQuery({
+    queryKey: orgId ? ['org-agents', orgId] : ['agents'],
+    queryFn: (): Promise<Agent[]> =>
+      orgId ? api.orgs.agents(orgId) : api.agents.list(),
+    enabled: !hasDeepLink,
+  })
+
   if (hasDeepLink) {
     return (
       <Navigate
@@ -31,20 +43,17 @@ export default function DashboardIndex() {
     )
   }
 
-  const orgId = currentOrg?.id
-  const { data: agents, isLoading } = useQuery({
-    queryKey: orgId ? ['org-agents', orgId] : ['agents'],
-    queryFn: (): Promise<Agent[]> =>
-      orgId ? api.orgs.agents(orgId) : api.agents.list(),
-  })
-
-  if (isLoading || !agents) {
+  if (isLoading) {
     return (
       <div className="p-8 text-sm text-text-tertiary">Loading dashboard…</div>
     )
   }
 
-  if (agents.length === 0) {
+  // On error, fall through to Quickstart. A transient `/api/agents` failure
+  // shouldn't pin every magic-link landing on a permanent loading spinner;
+  // Quickstart is the safe first-run default and any nav item still works.
+  const agentCount = isError ? 0 : agents?.length ?? 0
+  if (agentCount === 0) {
     return <Navigate to="/dashboard/quickstart" replace />
   }
 

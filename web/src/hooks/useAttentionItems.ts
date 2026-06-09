@@ -37,6 +37,13 @@ export function useAttentionItems() {
   })
 
   const runtimeEnabled = !!runtimeStatusQuery.data?.enabled
+  // Per PRD §8.3, `runtime_activity` gates runtime approvals in the inbox;
+  // `agent_live_sessions` is a separate flag that controls the live-session
+  // count on Home. Deployments can flip these independently via FeaturesHook,
+  // so the approvals fetch is gated on both flag and proxy state to keep
+  // the badge math correct when a deployment intentionally disables the
+  // runtime-approval UX while still showing live sessions.
+  const showRuntimeApprovals = runtimeActivityUI && runtimeEnabled
 
   const runtimeApprovalsQuery = useQuery({
     queryKey: ['runtime-approvals'],
@@ -48,7 +55,7 @@ export function useAttentionItems() {
       }
     },
     refetchInterval: 30_000,
-    enabled: runtimeEnabled,
+    enabled: showRuntimeApprovals,
   })
 
   const runtimeSessionsQuery = useQuery({
@@ -67,13 +74,13 @@ export function useAttentionItems() {
   const queueItems = overviewQuery.data?.queue ?? []
   const liveRuntimeApprovals = useMemo(
     () =>
-      runtimeEnabled
+      showRuntimeApprovals
         ? filterLiveRuntimeApprovals(
             runtimeApprovalsQuery.data?.entries ?? [],
             runtimeSessionsQuery.data?.entries ?? [],
           )
         : [],
-    [runtimeEnabled, runtimeApprovalsQuery.data, runtimeSessionsQuery.data],
+    [showRuntimeApprovals, runtimeApprovalsQuery.data, runtimeSessionsQuery.data],
   )
 
   const items = useMemo<AttentionItem[]>(() => {
