@@ -45,7 +45,18 @@ func AnthropicApprovalReply(body []byte) (verb, id string) {
 		return "", ""
 	}
 	verb, id = ParseApprovalReplyText(flattenAnthropicUserText(req.Messages[userIdx].Content))
-	if verb == "" || id != "" {
+	if verb == "" {
+		// No plain-text approval reply on the user turn. Try the
+		// AskUserQuestion path: the inline-approval intercept may
+		// have substituted the model's tool_use with a picker
+		// call, in which case the user's choice arrives as a
+		// tool_result block (not free text). All downstream
+		// callers — lite-proxy body editor, runtime proxy
+		// parseApprovalReplyForProvider, ad-hoc tooling — see
+		// AskUserQuestion releases via this fallback.
+		return anthropicAskUserQuestionApprovalReply(body)
+	}
+	if id != "" {
 		return verb, id
 	}
 	// Bare reply (e.g. "y"): scan back through assistant messages for the

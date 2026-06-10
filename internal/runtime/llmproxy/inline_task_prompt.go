@@ -4,6 +4,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/approvaltext"
 	runtimetasks "github.com/clawvisor/clawvisor/internal/runtime/tasks"
 	"github.com/clawvisor/clawvisor/internal/taskrisk"
@@ -38,7 +39,29 @@ import (
 // a failed one when both leave only a bare "approve" in conversation
 // history.
 func renderTaskApprovalPrompt(req *runtimetasks.TaskCreateRequest, approvalID string) string {
-	return renderTaskApprovalPromptWithRisk(req, approvalID, nil, 0)
+	return renderTaskApprovalPromptWithRiskAndTools(req, approvalID, nil, 0, nil)
+}
+
+// AskUserQuestionToolName re-exports the canonical constant from
+// the conversation package so producers in llmproxy don't have to
+// import the parser-side package just to reference the tool name.
+// Producer (the inline-approval intercept) and consumer (the
+// AskUserQuestion-aware parser) must agree on the literal; one
+// shared definition keeps them in lockstep.
+const AskUserQuestionToolName = conversation.AskUserQuestionToolName
+
+// askUserQuestionAvailable reports whether AskUserQuestionToolName
+// appears in the request's declared tool list. Match is case-sensitive
+// because the harness emits the exact name we teach in
+// inspector/parser.go's allowlist; a mixed-case variant is not a shape
+// we promise to honor.
+func askUserQuestionAvailable(availableTools []string) bool {
+	for _, name := range availableTools {
+		if name == AskUserQuestionToolName {
+			return true
+		}
+	}
+	return false
 }
 
 // renderTaskApprovalPromptWithRisk renders the inline approval prompt.
@@ -50,6 +73,17 @@ func renderTaskApprovalPrompt(req *runtimetasks.TaskCreateRequest, approvalID st
 // don't have access to live config (tests, the renderTaskApprovalPrompt
 // convenience wrapper) still produce an honest-looking prompt.
 func renderTaskApprovalPromptWithRisk(req *runtimetasks.TaskCreateRequest, approvalID string, risk *taskrisk.RiskAssessment, defaultExpirySeconds int) string {
+	return renderTaskApprovalPromptWithRiskAndTools(req, approvalID, risk, defaultExpirySeconds, nil)
+}
+
+// renderTaskApprovalPromptWithRiskAndTools renders the inline approval
+// prompt. The `availableTools` parameter is retained for callers that
+// branch on which substitution shape to use; the rendered text is
+// identical regardless — the substitution shape (text vs. AskUserQuestion
+// tool_use) is decided by the caller, not by the trailer wording. See
+// inline_task_intercept.go where the renderer's output becomes either
+// SubstituteWith (text) or SubstituteWithToolCall.Input["questions"][0].question.
+func renderTaskApprovalPromptWithRiskAndTools(req *runtimetasks.TaskCreateRequest, approvalID string, risk *taskrisk.RiskAssessment, defaultExpirySeconds int, _ []string) string {
 	suffix := approvalIDFooter(approvalID)
 	if req == nil {
 		return "Clawvisor wants to create a task.\n\nReply `yes` or `y` to authorize, `no` or `n` to cancel." + suffix

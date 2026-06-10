@@ -228,3 +228,10 @@ func TestOpenAIApprovalReplyResponsesInputHeldCallBeforeReplyStillFires(t *testi
 		t.Fatalf("verb=%q id=%q, want approve cv-gggggggggggg", verb, id)
 	}
 }
+
+// AskUserQuestion-shape coverage lives in
+// internal/runtime/llmproxy/askuserquestion_reply_test.go now that the
+// AskUserQuestion-aware parser moved out of this package — the
+// conversation package only knows about Clawvisor's marker
+// conventions and Anthropic wire shapes, not specific harness tool
+// names.
