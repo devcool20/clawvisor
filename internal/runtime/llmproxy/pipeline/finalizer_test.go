@@ -3,6 +3,7 @@ package pipeline_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
@@ -22,6 +23,7 @@ type finalizerTestDeps struct {
 	coalescedEvictedAuditToolUseID []string
 	omitCoalescedPerToolAudit      bool
 	rolledBack                     []pipeline.HoldCapture
+	sequence                       []string
 }
 
 func (d *finalizerTestDeps) SubmitHold(context.Context, any) (pipeline.HoldSubmitResult, error) {
@@ -34,6 +36,7 @@ func (d *finalizerTestDeps) SubmitHold(context.Context, any) (pipeline.HoldSubmi
 
 func (d *finalizerTestDeps) DropHold(_ context.Context, c pipeline.HoldCapture) error {
 	d.dropped = append(d.dropped, c)
+	d.sequence = append(d.sequence, "drop-"+c.ToolUseID)
 	d.dropCalls++
 	if len(d.dropErrs) >= d.dropCalls && d.dropErrs[d.dropCalls-1] != nil {
 		return d.dropErrs[d.dropCalls-1]
@@ -80,6 +83,7 @@ func (d *finalizerTestDeps) CleanupEvictedHold(context.Context, any) {}
 
 func (d *finalizerTestDeps) RollbackPendingTask(_ context.Context, c pipeline.HoldCapture) {
 	d.rolledBack = append(d.rolledBack, c)
+	d.sequence = append(d.sequence, "rollback-"+c.ToolUseID)
 }
 
 func (d *finalizerTestDeps) WriteAudit(_ context.Context, ev conversation.AuditEvent) {
@@ -447,14 +451,14 @@ func TestFinalizerCoalescedEvictionAuditUsesApprovalPrimary(t *testing.T) {
 	}
 }
 
-func TestFinalizerReplayFailureRollsBackPendingTaskForFailedCapture(t *testing.T) {
+func TestFinalizerReplayFailureRollsBackPendingTasksForFailedAndRemainingCaptures(t *testing.T) {
 	submitErr := errors.New("third submit failed")
 	deps := &finalizerTestDeps{
 		submit:     pipeline.HoldSubmitResult{ApprovalID: "cv-committed"},
 		submitErrs: []error{nil, nil, submitErr},
 	}
 	f := pipeline.NewFinalizer(deps)
-	for _, id := range []string{"toolu_ok1", "toolu_ok2", "toolu_fail"} {
+	for _, id := range []string{"toolu_ok1", "toolu_ok2", "toolu_fail", "toolu_after"} {
 		f.AddCapture(pipeline.HoldCapture{
 			ToolUseID: id,
 			Kind:      eval.HeldKindHintApproval,
@@ -477,10 +481,22 @@ func TestFinalizerReplayFailureRollsBackPendingTaskForFailedCapture(t *testing.T
 	}
 
 	// Should rollback pending tasks for the remaining (failed) captures (index 2 onwards)
-	if len(deps.rolledBack) != 1 {
-		t.Fatalf("rolledBack count = %d, want 1", len(deps.rolledBack))
+	if len(deps.rolledBack) != 2 {
+		t.Fatalf("rolledBack count = %d, want 2", len(deps.rolledBack))
 	}
-	if deps.rolledBack[0].ToolUseID != "toolu_fail" {
-		t.Fatalf("rolledBack = %+v, want toolu_fail", deps.rolledBack)
+	if deps.rolledBack[0].ToolUseID != "toolu_fail" || deps.rolledBack[1].ToolUseID != "toolu_after" {
+		t.Fatalf("rolledBack = %+v, want toolu_fail and toolu_after", deps.rolledBack)
+	}
+
+	// Verify contract: DropHold calls must fire before RollbackPendingTask calls
+	seenRollback := false
+	for _, step := range deps.sequence {
+		if strings.HasPrefix(step, "rollback-") {
+			seenRollback = true
+		} else if strings.HasPrefix(step, "drop-") {
+			if seenRollback {
+				t.Fatalf("DropHold called after RollbackPendingTask in sequence: %v", deps.sequence)
+			}
+		}
 	}
 }

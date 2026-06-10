@@ -1478,6 +1478,8 @@ func TestSyntheticApprovalToolUses_SingletonMatchesLegacy(t *testing.T) {
 	}
 }
 
+var errSimulatedPromptRewrite = errors.New("simulated prompt rewrite failure")
+
 func TestPostprocess_DropsCoalescedHoldOnPromptRewriteFailure(t *testing.T) {
 	body := []byte(`{
 		"id":"msg_1",
@@ -1530,7 +1532,7 @@ func TestPostprocess_DropsCoalescedHoldOnPromptRewriteFailure(t *testing.T) {
 	if got.SkippedReason == "" {
 		t.Fatal("expected coalesced prompt rewrite failure to fail closed")
 	}
-	if !strings.Contains(got.SkippedReason, "simulated prompt rewrite failure") {
+	if !strings.Contains(got.SkippedReason, errSimulatedPromptRewrite.Error()) {
 		t.Fatalf("expected simulated error in SkippedReason, got: %s", got.SkippedReason)
 	}
 	if got.Body != nil {
@@ -1573,7 +1575,7 @@ func (f *flakyRewriter) Rewrite(body []byte, contentType string, eval conversati
 		return res, err
 	}
 	if isCoalescedPass {
-		return conversation.RewriteResult{}, errors.New("simulated prompt rewrite failure")
+		return conversation.RewriteResult{}, errSimulatedPromptRewrite
 	}
 	return res, nil
 }
