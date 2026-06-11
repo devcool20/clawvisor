@@ -391,6 +391,24 @@ func MaybeInterceptInlineTaskDefinition(
 		"purpose", parsed.Purpose,
 		"signal", "query",
 	)
+	// Audit the in-flight task creation into task_lifecycle_events.
+	// Same rationale as the expansion-side write: the body editor on
+	// the next turn falls back to this row when the in-memory
+	// outcome cache misses (proxy restart between hold and approval).
+	// Best-effort; failures land in the trace channel and do NOT
+	// strand the hold.
+	if pendingTaskID != "" {
+		if payload, marshalErr := json.Marshal(parsed); marshalErr == nil {
+			logTaskLifecycleEventFromHold(req.Context(), taskLifecycleAuditCtx{
+				st:             cfg.Store,
+				trace:          trace,
+				userID:         cfg.AgentUserID,
+				agentID:        cfg.AgentID,
+				conversationID: cfg.ConversationID,
+				requestID:      cfg.RequestID,
+			}, pendingTaskID, innerHold.Pending.ID, store.TaskLifecycleEventTaskCreatePending, "inline_chat", tu, payload)
+		}
+	}
 	promptText := renderTaskApprovalPromptWithRiskAndTools(parsed, innerHold.Pending.ID, assessment, cfg.DefaultTaskExpirySeconds, cfg.AvailableTools)
 	verdict := conversation.ToolUseVerdict{
 		Allowed:        false,
@@ -430,21 +448,45 @@ func inlineSubstitutionShape(useAskUserQuestion bool) string {
 }
 
 // buildAskUserQuestionToolCall constructs the synthetic
-// AskUserQuestion tool_use the harness sees when AskUserQuestion is
-// in the agent's declared tool list. The question is intentionally
-// minimal ("Approve this task?") — the task body lives in a sibling
-// text block emitted alongside this tool_use, so duplicating it
-// inside the picker would just clutter the UI.
-//
-// The [clawvisor:approval=cv-...] marker is NOT embedded here; it
-// lives in the sibling text block and is found there by the parser.
-// The synthetic tool_use_id still namespaces under the approval ID
-// so audit logs and trace records correlate the AskUserQuestion call
-// back to the hold without an extra lookup.
+// AskUserQuestion tool_use for the task-creation surface. Wraps the
+// generic builder with the task-creation question/header strings.
 func buildAskUserQuestionToolCall(approvalID string) *conversation.SyntheticToolCall {
-	// SyntheticToolUseIDPrefix is the same namespace historystrip
-	// uses to identify orphaned synthetic tool_uses on subsequent
-	// turns — keep producer/consumer in lockstep via this constant.
+	return buildAskUserQuestionApprovalCall(approvalID, askUserQuestionApprovalSpec{
+		Question:       "Approve this task?",
+		Header:         "Approve task",
+		YesDescription: "Authorize the task",
+	})
+}
+
+// askUserQuestionApprovalSpec captures the parts of the
+// AskUserQuestion picker that change between surfaces (task
+// creation, scope expansion). Keep it small — Header is the
+// click-tag in the UI and tight on chars, Question is the
+// long-form ask.
+type askUserQuestionApprovalSpec struct {
+	Question       string
+	Header         string
+	YesDescription string
+}
+
+// buildAskUserQuestionApprovalCall constructs the synthetic
+// AskUserQuestion tool_use the harness sees when AskUserQuestion is
+// in the agent's declared tool list. The picker body is intentionally
+// minimal — the actual approval context (task body or expansion
+// delta) lives in a sibling text block emitted alongside this
+// tool_use, so duplicating it inside the picker would just clutter
+// the UI.
+//
+// The [clawvisor:approval=cv-...] marker is NOT embedded in the
+// question; it lives in the sibling text block and is found there
+// by the parser. The synthetic tool_use_id still namespaces under
+// the approval ID so audit logs and trace records correlate the
+// AskUserQuestion call back to the hold without an extra lookup.
+//
+// SyntheticToolUseIDPrefix is the same namespace historystrip uses
+// to identify orphaned synthetic tool_uses on subsequent turns —
+// producer / consumer stay in lockstep via this constant.
+func buildAskUserQuestionApprovalCall(approvalID string, spec askUserQuestionApprovalSpec) *conversation.SyntheticToolCall {
 	id := SyntheticToolUseIDPrefix + "ask"
 	if approvalID != "" {
 		id = SyntheticToolUseIDPrefix + "ask_" + approvalID
@@ -455,11 +497,11 @@ func buildAskUserQuestionToolCall(approvalID string) *conversation.SyntheticTool
 		Input: map[string]any{
 			"questions": []map[string]any{
 				{
-					"question":    "Approve this task?",
-					"header":      "Approve task",
+					"question":    spec.Question,
+					"header":      spec.Header,
 					"multiSelect": false,
 					"options": []map[string]any{
-						{"label": "yes", "description": "Authorize the task"},
+						{"label": "yes", "description": spec.YesDescription},
 						{"label": "no", "description": "Cancel"},
 					},
 				},

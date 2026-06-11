@@ -134,19 +134,62 @@ func toolDefs() []Tool {
 		},
 		{
 			Name:        "expand_task",
-			Description: "Request adding a new action to an existing task's scope. Use wait=true (recommended) to block until the user approves or denies.",
+			Description: "Request expanding an existing task's scope. The body mirrors create_task's envelope: list the new expected_tools / expected_egress / required_credentials (each with a why). Tool names shaped as 'service:action' (e.g. 'github:create_issue') also grant gateway scope for that action. Use this when the work is the same body of work but you discovered you need additional capabilities mid-task. Create a NEW task instead if the new ask is a genuinely different goal. Use wait=true (recommended) to block until the user approves or denies.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
 					"task_id": {"type": "string", "description": "The task ID to expand"},
-					"service": {"type": "string", "description": "Service ID for the new action"},
-					"action": {"type": "string", "description": "Action name for the new action"},
-					"auto_execute": {"type": "boolean", "description": "Execute without per-request approval"},
-					"reason": {"type": "string", "description": "Why this action is needed"},
+					"expected_tools": {
+						"type": "array",
+						"description": "New tools the task needs. Each entry: {tool_name, why} plus optional input_shape/input_regex constraints (same shape as create_task). For agent-routed gateway calls, use 'service:action' (e.g. 'github:create_issue'); for local tools, use the bare name (e.g. 'Edit', 'Bash'). Constraints not declared here cannot tighten an existing entry — restate the parent's constraint plus your additional intent if you want to reuse the row's why slot.",
+						"items": {
+							"type": "object",
+							"properties": {
+								"tool_name": {"type": "string"},
+								"why": {"type": "string"},
+								"input_shape": {"type": "object", "description": "Optional. Constraint shape on the tool's input (same semantics as create_task)."},
+								"input_regex": {"type": "string", "description": "Optional. Regex matched against the tool's stringified input."}
+							},
+							"required": ["tool_name", "why"]
+						}
+					},
+					"expected_egress": {
+						"type": "array",
+						"description": "New non-control hosts the task may reach. Each entry: {host, why} plus optional method/path/path_regex/query_shape/body_shape/headers/credential_alias (same shape as create_task). An addition that names the same host as an existing entry but DIFFERS on a structural field (Method, Path, …) lands as a NEW row — both endpoints coexist. To revise an existing row's why, leave structural fields empty.",
+						"items": {
+							"type": "object",
+							"properties": {
+								"host": {"type": "string"},
+								"why": {"type": "string"},
+								"method": {"type": "string", "description": "Optional. HTTP method (GET / POST / PUT / PATCH / DELETE / HEAD / OPTIONS)."},
+								"path": {"type": "string", "description": "Optional. Exact path. Mutually exclusive with path_regex."},
+								"path_regex": {"type": "string", "description": "Optional. Path regex. Mutually exclusive with path."},
+								"query_shape": {"type": "object", "description": "Optional. Constraint shape on the query string."},
+								"body_shape": {"type": "object", "description": "Optional. Constraint shape on the request body."},
+								"headers": {"type": "object", "description": "Optional. Constraint shape on the request headers."},
+								"credential_alias": {"type": "string", "description": "Optional. Bind a specific credential alias to this egress endpoint."}
+							},
+							"required": ["host", "why"]
+						}
+					},
+					"required_credentials": {
+						"type": "array",
+						"description": "New vault credentials the task needs. Each entry: {vault_item_id, why} or {vault_item_handle, why}. Exactly one of vault_item_id / vault_item_handle is required; the API rejects entries with neither.",
+						"items": {
+							"type": "object",
+							"properties": {
+								"vault_item_id": {"type": "string", "description": "Account-scoped vault item id (preferred), e.g. 'github:personal'."},
+								"vault_item_handle": {"type": "string", "description": "Vault item handle. Use when vault_item_id is not available; one of vault_item_id / vault_item_handle must be set."},
+								"why": {"type": "string"}
+							},
+							"required": ["why"]
+						}
+					},
+					"reason": {"type": "string", "description": "One-line summary of why this expansion is needed. If you are revising the why of an existing entry, write it so it covers BOTH the prior approved purpose AND the new capability — replace-by-name overwrites the old why wholesale."},
 					"wait": {"type": "boolean", "description": "Block until the expansion is approved or denied (default true)"},
 					"timeout": {"type": "integer", "description": "Long-poll timeout in seconds (default 120, max 120)"}
 				},
-				"required": ["task_id", "service", "action", "reason"]
+				"required": ["task_id", "reason"]
 			}`),
 		},
 		{

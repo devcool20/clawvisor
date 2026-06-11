@@ -2,6 +2,7 @@ package llmproxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -38,6 +39,17 @@ type InlineApprovalRewriteRequest struct {
 	// Checkouts stores the created task as the agent's current focus on
 	// successful inline approval. Checkout is a routing preference only.
 	Checkouts TaskCheckoutStore
+	// Store is used to write terminal task_lifecycle_events
+	// (task_create_approved/denied, task_expand_approved/denied) at
+	// resolution time. nil-safe: a missing store skips the audit
+	// write without blocking the rewrite path. Best-effort by
+	// design.
+	Store store.Store
+	// Trace is the structured logger forwarded into lifecycle audit
+	// writes so a store outage at resolution time surfaces under
+	// "task_lifecycle.write_failed" alongside the existing
+	// inline_task.* / inline_expansion.* events. Optional.
+	Trace func(event string, kv ...any)
 }
 
 // InlineApprovalRewriteResult reports what happened. When Rewritten
@@ -111,12 +123,31 @@ func RewriteInlineTaskApprovalReply(ctx context.Context, req InlineApprovalRewri
 	if err != nil {
 		return InlineApprovalRewriteResult{Body: req.Body}, err
 	}
-	if action.Kind != approvalReplyActionApproveInlineTask && action.Kind != approvalReplyActionDenyInlineTask {
-		// Most recent hold isn't an inline-task hold (or the named
-		// approval isn't one). Defer to TryReleasePendingApproval.
+	switch action.Kind {
+	case approvalReplyActionApproveInlineTask,
+		approvalReplyActionDenyInlineTask,
+		approvalReplyActionApproveInlineExpansion,
+		approvalReplyActionDenyInlineExpansion:
+		// handled below
+	default:
+		// Most recent hold isn't an inline-task or inline-expansion
+		// hold (or the named approval isn't one). Defer to
+		// TryReleasePendingApproval.
 		return InlineApprovalRewriteResult{Body: req.Body}, nil
 	}
 	if action.Hold == nil {
+		// Cache miss. The most common cause is a proxy restart
+		// between the original instance consuming the hold and
+		// the rewritten response being delivered to the harness.
+		// The harness retries with the same body; we land here.
+		// Try recovering the original tool_use from the
+		// lifecycle-events audit so the body editor can still
+		// reconstruct the model's missing assistant turn —
+		// otherwise the model loses evidence of its expand POST
+		// across the restart and re-emits on the next turn.
+		if recovered := tryRecoverApprovalFromLifecycle(ctx, req.Store, approvalID, verb); recovered != nil {
+			return rewriteFromRecoveredApproval(req, editor, verb, approvalID, recovered)
+		}
 		return InlineApprovalRewriteResult{Body: req.Body}, nil
 	}
 
@@ -138,7 +169,7 @@ func RewriteInlineTaskApprovalReply(ctx context.Context, req InlineApprovalRewri
 	if action.Hold != nil {
 		expectedApprovalID = action.Hold.ID
 	}
-	_, canRewrite, probeErr := editor.ReplaceLatestUserText(verb, expectedApprovalID, "")
+	_, canRewrite, probeErr := editor.ReplaceLatestUserText(verb, expectedApprovalID, "", nil)
 	if probeErr != nil {
 		return out, probeErr
 	}
@@ -168,7 +199,13 @@ func RewriteInlineTaskApprovalReply(ctx context.Context, req InlineApprovalRewri
 	// re-matching subsequent approval prompts. The model will re-emit
 	// the original tool naturally now that the task scope covers it.
 	dropLinkedToolHold(ctx, req.PendingApproval, req.Agent, req.Provider, req.ConversationID, resolved)
-	replacement, out := resolveInlineTaskApproval(ctx, req, resolved, verb)
+	var replacement string
+	switch action.Kind {
+	case approvalReplyActionApproveInlineExpansion, approvalReplyActionDenyInlineExpansion:
+		replacement, out = resolveInlineExpansionApproval(ctx, req, resolved, verb)
+	default:
+		replacement, out = resolveInlineTaskApproval(ctx, req, resolved, verb)
+	}
 
 	// Record the outcome before returning. The augmenter on later
 	// turns reads this to decide whether to inject success or failure
@@ -179,14 +216,32 @@ func RewriteInlineTaskApprovalReply(ctx context.Context, req InlineApprovalRewri
 			UserID:     req.Agent.UserID,
 			AgentID:    req.Agent.ID,
 			ApprovalID: resolved.ID,
-		}, inlineApprovalOutcomeFromRewrite(req.RequestID, out))
+		}, inlineApprovalOutcomeFromRewrite(req.RequestID, out, resolved))
 	}
 
 	resolvedApprovalID := ""
 	if resolved != nil {
 		resolvedApprovalID = resolved.ID
 	}
-	rewritten, ok, err := editor.ReplaceLatestUserText(verb, resolvedApprovalID, replacement)
+	// Reconstruction is only relevant on the approve path — deny
+	// renders a "you were denied" notice and doesn't need to forge
+	// evidence of the original call (the model SHOULDN'T treat the
+	// call as completed when it was rejected). Skipping
+	// reconstruction on deny also avoids the model interpreting a
+	// reconstructed tool_use as a successful action.
+	var reconstruction *InlineApprovalOriginalCall
+	if resolved != nil && verb == "approve" && resolved.ToolUse.ID != "" {
+		var input json.RawMessage
+		if len(resolved.ToolUse.Input) > 0 {
+			input = append(json.RawMessage(nil), resolved.ToolUse.Input...)
+		}
+		reconstruction = &InlineApprovalOriginalCall{
+			ToolUseID: resolved.ToolUse.ID,
+			ToolName:  resolved.ToolUse.Name,
+			Input:     input,
+		}
+	}
+	rewritten, ok, err := editor.ReplaceLatestUserText(verb, resolvedApprovalID, replacement, reconstruction)
 	if err != nil {
 		return out, err
 	}
@@ -201,7 +256,35 @@ func RewriteInlineTaskApprovalReply(ctx context.Context, req InlineApprovalRewri
 	return out, nil
 }
 
-func inlineApprovalOutcomeFromRewrite(requestID string, out InlineApprovalRewriteResult) InlineApprovalOutcome {
+func inlineApprovalOutcomeFromRewrite(requestID string, out InlineApprovalRewriteResult, resolved *PendingLiteApproval) InlineApprovalOutcome {
+	// Kind is derived from the outcome string the resolver emitted —
+	// outcomes starting with "inline_expansion_" came from the
+	// expansion path, anything else is the task-creation path. The
+	// augmenter dispatches on Kind so a previously-approved expansion
+	// renders "scope was expanded" history rather than the task-
+	// creation "Task was created" body.
+	kind := InlineApprovalOutcomeKindTaskCreate
+	if strings.HasPrefix(out.Outcome, "inline_expansion_") {
+		kind = InlineApprovalOutcomeKindTaskExpand
+	}
+	// Snapshot the original tool_use from the consumed hold so the
+	// body editor on the next turn can reconstruct the model's
+	// missing assistant turn. The substituted-prompt strip removed
+	// the prompt-turn from history; without this snapshot the model
+	// has no record of having emitted the original POST and re-emits
+	// it. Carries the verbatim agent input the rewrite path saw.
+	var original *InlineApprovalOriginalCall
+	if resolved != nil && resolved.ToolUse.ID != "" {
+		var input json.RawMessage
+		if len(resolved.ToolUse.Input) > 0 {
+			input = append(json.RawMessage(nil), resolved.ToolUse.Input...)
+		}
+		original = &InlineApprovalOriginalCall{
+			ToolUseID: resolved.ToolUse.ID,
+			ToolName:  resolved.ToolUse.Name,
+			Input:     input,
+		}
+	}
 	return InlineApprovalOutcome{
 		Decision:         out.Decision,
 		Outcome:          out.Outcome,
@@ -213,6 +296,8 @@ func inlineApprovalOutcomeFromRewrite(requestID string, out InlineApprovalRewrit
 		FailureReason:    out.Reason,
 		RequestID:        requestID,
 		ResolvedAt:       time.Now().UTC(),
+		Kind:             kind,
+		OriginalCall:     original,
 	}
 }
 
@@ -282,6 +367,14 @@ func augmentationContextForOutcome(key InlineApprovalOutcomeKey, store InlineApp
 		return "", false
 	}
 	if outcome.Succeeded {
+		// Dispatch on Kind so a previously-approved expansion
+		// renders the "scope was expanded" body (which tells the
+		// model the parent task still exists with broader scope)
+		// rather than the task-creation body (which would mislead
+		// the model into thinking a fresh task was just minted).
+		if outcome.Kind == InlineApprovalOutcomeKindTaskExpand {
+			return inlineExpansionApprovedReplyAugmentationContext(outcome.TaskID, outcome.Credentials), true
+		}
 		return inlineApprovedReplyAugmentationContext(outcome.TaskID, outcome.CheckedOut, outcome.Credentials), true
 	}
 	return inlineFailedReplyAugmentationContext(outcome.FailureReason), true
@@ -350,11 +443,25 @@ func inlineApprovedReplyAugmentation() string {
 // control-plane state rather than a fresh user instruction.
 func inlineApprovedReplyAugmentationContext(taskID string, checkedOut bool, credentials []InlineTaskCredentialPlaceholder) string {
 	var b strings.Builder
-	b.WriteString("Task was created and approved by the user. The task covers the originally requested work; proceed by emitting your next tool_use(s). Do NOT POST /control/tasks again for the same work. If an earlier tool_use already completed successfully, do NOT re-emit it; move on to the next step using the results above.")
+	b.WriteString("Task was created and approved by the user. The task covers the originally requested work; proceed by emitting your next tool_use(s). Do NOT POST /control/tasks to CREATE another task for the same body of work. If an earlier tool_use already completed successfully, do NOT re-emit it; move on to the next step using the results above.")
 	if strings.TrimSpace(taskID) != "" {
 		b.WriteString(" Task ID: ")
 		b.WriteString(strings.TrimSpace(taskID))
 		b.WriteString(".")
+		// Action-oriented expand pointer with the just-created task_id
+		// substituted. The system prompt teaches EXPAND vs NEW TASK at
+		// the top of the control notice, but the immediate decision
+		// point is several thousand tokens away by the time the model
+		// reads it on a later turn — this concrete URL with the
+		// agent's actual task_id removes the recall-and-substitute
+		// burden. The DEFAULT for any follow-up ask MUST be
+		// EXPAND-this-task; only a recognizably-different goal earns
+		// a new task. The choice is forced because the prior
+		// "Do NOT POST /control/tasks" guidance was too easy to
+		// satisfy by just emitting another /control/tasks POST anyway.
+		b.WriteString(" For the user's NEXT ask in this conversation, CHOOSE between two actions before emitting any tool_use: (A) follow-up in the SAME body of work (additional steps under the task's stated purpose — comments, replies, verifications, further API calls, additional tools/hosts/credentials) → POST https://clawvisor.local/control/tasks/")
+		b.WriteString(strings.TrimSpace(taskID))
+		b.WriteString("/expand?surface=inline against THIS task; (B) genuinely-different goal (purpose no longer describes the work) → POST a new /control/tasks?surface=inline. Default to (A) when in doubt. Never silently create a second task for related work.")
 	}
 	if checkedOut && strings.TrimSpace(taskID) != "" {
 		b.WriteString(" Task ")

@@ -775,20 +775,115 @@ func formatScopeExpansionMessage(req notify.ScopeExpansionRequest) string {
 	sb.WriteString("🔄 <b>Clawvisor — Scope Expansion Request</b>\n\n")
 	sb.WriteString(fmt.Sprintf("<b>Agent:</b> %s\n", html.EscapeString(req.AgentName)))
 	sb.WriteString(fmt.Sprintf("<b>Task:</b> %s\n", html.EscapeString(req.Purpose)))
-
-	mode := "auto-execute"
-	if !req.NewAction.AutoExecute {
-		mode = "requires per-request approval"
+	if req.RiskLevel != "" && req.RiskLevel != "unknown" {
+		// Risk on an expansion is the merged-envelope reassessment —
+		// shows when the expanded scope crosses a threshold the parent
+		// task didn't.
+		sb.WriteString(fmt.Sprintf("<b>Risk:</b> %s %s\n", riskEmoji(req.RiskLevel), html.EscapeString(req.RiskLevel)))
 	}
-	sb.WriteString(fmt.Sprintf("\n<b>New action:</b> %s (%s)\n",
-		html.EscapeString(display.FormatServiceAction(req.NewAction.Service, req.NewAction.Action)),
-		mode))
+	if lt := strings.TrimSpace(req.Lifetime); lt != "" {
+		// Expansion preserves the parent's lifetime — surfacing it
+		// here makes the higher-blast-radius case (standing tasks)
+		// visible to the reviewer before they approve.
+		sb.WriteString(fmt.Sprintf("<b>Lifetime:</b> %s\n", html.EscapeString(lt)))
+	}
+
+	if len(req.AddedTools) > 0 {
+		sb.WriteString("\n<b>New tools:</b>\n")
+		for _, t := range req.AddedTools {
+			sb.WriteString(fmt.Sprintf("• %s%s — %s\n",
+				html.EscapeString(t.ToolName),
+				expansionToolDisposition(t),
+				html.EscapeString(t.Why)))
+		}
+	}
+	if len(req.ReplacedTools) > 0 {
+		sb.WriteString("\n<b>Updated tools (why replaced):</b>\n")
+		for _, t := range req.ReplacedTools {
+			sb.WriteString(fmt.Sprintf("• %s%s\n   was: %s\n   now: %s\n",
+				html.EscapeString(t.New.ToolName),
+				expansionToolDisposition(t.New),
+				html.EscapeString(t.Prior.Why),
+				html.EscapeString(t.New.Why)))
+		}
+	}
+	if len(req.AddedEgress) > 0 {
+		sb.WriteString("\n<b>New egress:</b>\n")
+		for _, e := range req.AddedEgress {
+			sb.WriteString(fmt.Sprintf("• %s — %s\n",
+				html.EscapeString(e.Host), html.EscapeString(e.Why)))
+		}
+	}
+	if len(req.ReplacedEgress) > 0 {
+		sb.WriteString("\n<b>Updated egress (why replaced):</b>\n")
+		for _, e := range req.ReplacedEgress {
+			sb.WriteString(fmt.Sprintf("• %s\n   was: %s\n   now: %s\n",
+				html.EscapeString(e.New.Host),
+				html.EscapeString(e.Prior.Why),
+				html.EscapeString(e.New.Why)))
+		}
+	}
+	if len(req.AddedCredentials) > 0 {
+		sb.WriteString("\n<b>New credentials:</b>\n")
+		for _, c := range req.AddedCredentials {
+			id := c.VaultItemID
+			if id == "" {
+				id = c.VaultItemHandle
+			}
+			sb.WriteString(fmt.Sprintf("• %s — %s\n",
+				html.EscapeString(id), html.EscapeString(c.Why)))
+		}
+	}
+	if len(req.ReplacedCredentials) > 0 {
+		sb.WriteString("\n<b>Updated credentials (why replaced):</b>\n")
+		for _, c := range req.ReplacedCredentials {
+			id := c.New.VaultItemID
+			if id == "" {
+				id = c.New.VaultItemHandle
+			}
+			sb.WriteString(fmt.Sprintf("• %s\n   was: %s\n   now: %s\n",
+				html.EscapeString(id),
+				html.EscapeString(c.Prior.Why),
+				html.EscapeString(c.New.Why)))
+		}
+	}
 
 	if req.Reason != "" {
 		sb.WriteString(fmt.Sprintf("\n<b>Reason:</b> %s\n", html.EscapeString(req.Reason)))
 	}
 
 	return sb.String()
+}
+
+// expansionToolDisposition renders the auto-execute safety posture
+// next to a tool entry's name when the entry would materialize as a
+// gateway scope. Local-harness tools (GatewayAction=false) return ""
+// so the renderer omits the marker.
+//
+// Telegram is the primary mobile approval surface — without this
+// marker, a user widening a task they expected to gate per-call could
+// silently flip to auto-execute for the new action.
+//
+// When the addition is already covered by a parent same-service
+// wildcard, the merger drops the specific derivation; we surface
+// "covered by existing wildcard" with the wildcard's actual
+// AutoExecute disposition so reviewers don't read a misleading
+// "needs per-call approval" pill on an action they already
+// auto-approved through the wildcard.
+func expansionToolDisposition(t notify.ExpansionTool) string {
+	if !t.GatewayAction {
+		return ""
+	}
+	if t.WildcardCovered {
+		if t.AutoExecute {
+			return " <i>(covered by wildcard · auto-execute)</i>"
+		}
+		return " <i>(covered by wildcard · per-call approval)</i>"
+	}
+	if t.AutoExecute {
+		return " <i>(auto-execute)</i>"
+	}
+	return " <i>(per-call approval)</i>"
 }
 
 func formatConnectionRequestMessage(req notify.ConnectionRequest) string {

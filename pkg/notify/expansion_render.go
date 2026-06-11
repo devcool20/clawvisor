@@ -1,0 +1,178 @@
+package notify
+
+import (
+	"strings"
+)
+
+// scopeExpansionMaxCompactLen caps the joined "+x, ~y" summary so a
+// large expansion can't push the push-notification payload over the
+// APNs/FCM ~4KB limit (the daemon serializes the whole pushPayload
+// JSON — title, body, data map, live-activity attributes — and each
+// edge has its own ceiling). 256 bytes leaves headroom for body +
+// purpose + target_id + daemon_url within ~1KB total, which both
+// platforms accept without truncation.
+const scopeExpansionMaxCompactLen = 256
+
+// scopeExpansionMaxBodyLen caps the human-readable body string that
+// goes into AlertBody / notification body. Long agent reasons get
+// elided with an ellipsis so a runaway model can't smuggle multi-KB
+// text into a single push.
+const scopeExpansionMaxBodyLen = 512
+
+// RenderExpansionSummary builds a short, identifier-only summary of an
+// expansion envelope: new entries with "+" markers and replaced
+// entries with "~" markers, joined by ", ". Used by surfaces that
+// can't fit the full diff (push notification action_summary,
+// live-activity status). Identifiers only — no `why` — since the
+// notification body already carries the reason.
+//
+// The result is capped at ~scopeExpansionMaxCompactLen bytes;
+// remaining entries are summarized as "(+N more)". Empty envelopes
+// return the sentinel "scope_expansion" so consumers don't render
+// an empty action_summary.
+//
+// Shared with the Telegram renderer (which uses the structured
+// diff for prose) so both surfaces agree on the +/~ vocabulary.
+func RenderExpansionSummary(req ScopeExpansionRequest) string {
+	var parts []string
+	for _, t := range req.AddedTools {
+		parts = append(parts, "+"+t.ToolName)
+	}
+	for _, t := range req.ReplacedTools {
+		parts = append(parts, "~"+t.New.ToolName)
+	}
+	for _, e := range req.AddedEgress {
+		parts = append(parts, "+"+e.Host)
+	}
+	for _, e := range req.ReplacedEgress {
+		parts = append(parts, "~"+e.New.Host)
+	}
+	for _, c := range req.AddedCredentials {
+		parts = append(parts, "+"+credentialID(c))
+	}
+	for _, c := range req.ReplacedCredentials {
+		parts = append(parts, "~"+credentialID(c.New))
+	}
+	if len(parts) == 0 {
+		return "scope_expansion"
+	}
+	return joinWithCap(parts, ", ", scopeExpansionMaxCompactLen)
+}
+
+// CapExpansionBody bounds the body / AlertBody string a notifier
+// sends. The agent's reason is the dominant variable input here; an
+// uncapped body lets a runaway model push the surrounding push
+// payload over the APNs/FCM size limit. Mirrors the paramValue
+// truncation pattern from internal/notify/telegram.
+func CapExpansionBody(body string) string {
+	if len(body) <= scopeExpansionMaxBodyLen {
+		return body
+	}
+	return body[:scopeExpansionMaxBodyLen-3] + "..."
+}
+
+// credentialID picks the populated identifier off an ExpansionCredential.
+// Both fields can't be set after validation, but the helper stays
+// total so renderers don't need to defend against a malformed entry.
+func credentialID(c ExpansionCredential) string {
+	if c.VaultItemID != "" {
+		return c.VaultItemID
+	}
+	return c.VaultItemHandle
+}
+
+// joinWithCap joins parts with sep and truncates with a "(+N more)"
+// suffix when the joined string would exceed maxBytes. The cap is
+// hard: when this function returns, len(result) is guaranteed to be
+// ≤ maxBytes.
+//
+// Algorithm:
+//   - Fast path: if the full join fits, return it verbatim — no
+//     truncation, no suffix.
+//   - Otherwise the join overflows; find the largest k such that
+//     `parts[0..k]` joined plus its bail suffix `" (+N more)"`
+//     (N = remaining unwritten parts) fits within maxBytes. That k
+//     is where we stop. The previous "reserve suffix room every
+//     iteration" approach over-reserved for small parts: a
+//     two-item case where the full join easily fit was bailed
+//     anyway because the suffix length dominated maxBytes locally.
+//   - If even `parts[0]` alone with the smallest possible suffix
+//     can't fit, ellipsize `parts[0]` in place — keeps a runaway
+//     identifier from emitting an empty string.
+//
+// Returns "" if parts is empty.
+func joinWithCap(parts []string, sep string, maxBytes int) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	full := strings.Join(parts, sep)
+	if len(full) <= maxBytes {
+		return full
+	}
+	// Full join overflows: find the largest prefix that still
+	// leaves room for its bail suffix.
+	bestK := -1
+	prefixLen := 0
+	sepLen := len(sep)
+	for k := 0; k < len(parts); k++ {
+		if k > 0 {
+			prefixLen += sepLen
+		}
+		prefixLen += len(parts[k])
+		remaining := len(parts) - k - 1
+		if remaining == 0 {
+			// k is the last index; the full join doesn't fit
+			// (checked above), so we never want this k. Skip
+			// rather than updating bestK.
+			continue
+		}
+		suffix := " (+" + itoa(remaining) + " more)"
+		if prefixLen+len(suffix) <= maxBytes {
+			bestK = k
+			continue
+		}
+		// Adding parts[k] put us past the cap-with-suffix. prefixLen
+		// only grows with k, so later k's can only fail too — stop.
+		break
+	}
+	if bestK >= 0 {
+		var sb strings.Builder
+		for k := 0; k <= bestK; k++ {
+			if k > 0 {
+				sb.WriteString(sep)
+			}
+			sb.WriteString(parts[k])
+		}
+		sb.WriteString(" (+")
+		sb.WriteString(itoa(len(parts) - bestK - 1))
+		sb.WriteString(" more)")
+		return sb.String()
+	}
+	// Couldn't fit parts[0] + the smallest possible bail suffix.
+	// Truncate parts[0] in place with an ellipsis so consumers
+	// don't render an empty string for a single runaway identifier.
+	p := parts[0]
+	if maxBytes > 3 && len(p) > maxBytes-3 {
+		return p[:maxBytes-3] + "..."
+	}
+	if len(p) <= maxBytes {
+		return p
+	}
+	return p[:maxBytes]
+}
+
+// itoa is a tiny stdlib-free int→ascii helper so this file doesn't
+// pull strconv just for a "+N more" suffix.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
+}

@@ -591,6 +591,12 @@ export interface TaskAction {
   auto_execute: boolean
   expected_use?: string
   verification?: 'strict' | 'lenient' | 'off'
+  expansion_rationale?: string
+  // wildcard_covered is true on response-only pending_derived_actions
+  // entries synthesized for an addition whose service:action is
+  // already authorized by a same-service wildcard on the parent.
+  // auto_execute / verification reflect the wildcard's disposition.
+  wildcard_covered?: boolean
 }
 
 export interface ScopeOverride {
@@ -626,6 +632,25 @@ export interface ExpectedEgress {
   credential_alias?: string
 }
 
+export interface RequiredCredential {
+  vault_item_id?: string
+  vault_item_handle?: string
+  why: string
+}
+
+// PendingTaskExpansion is the in-flight scope-expansion request stored
+// on a task whose status is 'pending_scope_expansion'. It mirrors the
+// envelope shape the agent posts (expected_tools / expected_egress /
+// required_credentials, each with a per-entry why) plus the one-line
+// reason. The dashboard reads it to show the user what scope they
+// would be granting before they approve.
+export interface PendingTaskExpansion {
+  expected_tools?: ExpectedTool[]
+  expected_egress?: ExpectedEgress[]
+  required_credentials?: RequiredCredential[]
+  reason?: string
+}
+
 export interface Task {
   id: string
   user_id: string
@@ -637,6 +662,7 @@ export interface Task {
   planned_calls?: PlannedCall[]
   expected_tools?: ExpectedTool[]
   expected_egress?: ExpectedEgress[]
+  required_credentials?: RequiredCredential[]
   intent_verification_mode?: 'strict' | 'lenient' | 'off'
   expected_use?: string
   schema_version?: number
@@ -646,8 +672,8 @@ export interface Task {
   expires_at?: string
   expires_in_seconds: number
   request_count: number
-  pending_action?: TaskAction
-  pending_reason?: string
+  pending_expansion?: PendingTaskExpansion
+  pending_derived_actions?: TaskAction[]
   risk_level?: string
   risk_details?: RiskAssessment
   approval_source?: string

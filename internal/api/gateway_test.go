@@ -710,26 +710,54 @@ func TestStandingTask_ResponseOmitsExpiry(t *testing.T) {
 	t.Error("standing task not found in list response")
 }
 
-func TestStandingTask_Expand_Rejected(t *testing.T) {
+// TestStandingTask_Expand_PreservesLifetime locks in the lift of the
+// "standing tasks can't be expanded" rule. The expand path now
+// accepts standing-lifetime tasks; the approve transition preserves
+// the lifetime (the row stays at the far-future ExpiresAt sentinel
+// rather than collapsing to now via the now + 0 math). Without this
+// branch in taskApprovedExpiresAt, an approved standing-task
+// expansion would immediately expire.
+func TestStandingTask_Expand_PreservesLifetime(t *testing.T) {
 	adapter := newMockAdapter("mock.echo", "echo", "other")
 	env := newTestEnv(t, adapter)
 	sc := newScenario(t, env, "automation")
 
 	taskID := sc.createApprovedStandingTask(t, env, "mock.echo", "echo", true)
 
-	// Try to expand the standing task — should fail
 	resp := env.do("POST", fmt.Sprintf("/api/tasks/%s/expand", taskID), sc.AgentToken, map[string]any{
-		"service": "mock.echo", "action": "other", "auto_execute": true, "reason": "need more",
+		"expected_tools": []map[string]any{
+			{"tool_name": "mock.echo:other", "why": "need other action"},
+		},
+		"reason": "need more",
 	})
-	body := mustStatus(t, resp, http.StatusConflict)
-	if body["code"] != "INVALID_OPERATION" {
-		t.Errorf("expected code=INVALID_OPERATION, got %v", body["code"])
+	mustStatus(t, resp, http.StatusAccepted)
+
+	resp = sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/expand/approve", taskID), nil)
+	body := mustStatus(t, resp, http.StatusOK)
+	if body["status"] != "active" {
+		t.Errorf("status after approve = %v, want active", body["status"])
 	}
-	msg, _ := body["error"].(string)
-	strContains(t, msg, "standing tasks cannot be expanded", "error message")
+	// Standing tasks must NOT emit expires_at on the response, and
+	// the row must remain at lifetime=standing with the same
+	// no-expiry semantics it had before the expansion.
+	if _, hasExpiry := body["expires_at"]; hasExpiry {
+		t.Errorf("standing expand response leaked expires_at: %v", body["expires_at"])
+	}
+
+	resp = env.do("GET", fmt.Sprintf("/api/tasks/%s", taskID), sc.AgentToken, nil)
+	body = mustStatus(t, resp, http.StatusOK)
+	if body["lifetime"] != "standing" {
+		t.Errorf("lifetime after expand = %v, want standing", body["lifetime"])
+	}
+	if body["status"] != "active" {
+		t.Errorf("status after expand = %v, want active", body["status"])
+	}
+	if body["expires_at"] != nil {
+		t.Errorf("standing task expires_at = %v, want nil (sentinel must be hidden on response)", body["expires_at"])
+	}
 }
 
-func TestStandingTask_OutOfScope_MessageSuggestsNewTask(t *testing.T) {
+func TestStandingTask_OutOfScope_MessageSuggestsExpand(t *testing.T) {
 	adapter := newMockAdapter("mock.echo", "echo", "other")
 	env := newTestEnv(t, adapter)
 	sc := newScenario(t, env, "automation")
@@ -745,8 +773,13 @@ func TestStandingTask_OutOfScope_MessageSuggestsNewTask(t *testing.T) {
 		t.Errorf("expected status=pending_scope_expansion, got %v", result["status"])
 	}
 	msg, _ := result["message"].(string)
+	// Lifting the standing-cannot-expand rule means the out-of-scope
+	// message now steers the agent to expand instead of revoke+recreate.
+	// The "lifetime preserved" wording is what we want the model to
+	// see — it shouldn't think the standing-ness is at risk.
 	strContains(t, msg, "standing task", "gateway out-of-scope message for standing task")
-	strContains(t, msg, "cannot be expanded", "gateway out-of-scope message for standing task")
+	strContains(t, msg, "/expand", "gateway out-of-scope message should suggest expand for standing tasks")
+	strContains(t, msg, "lifetime will be preserved", "gateway out-of-scope message should reassure the model the standing lifetime survives")
 }
 
 func TestStandingTask_MissingSessionID_Error(t *testing.T) {
@@ -776,7 +809,14 @@ func TestStandingTask_MissingSessionID_Error(t *testing.T) {
 
 // ── Scope expansion ───────────────────────────────────────────────────────────
 
-func TestExpand_ReasonBecomesExpansionRationale(t *testing.T) {
+// TestExpand_EnvelopeMergedOnApprove verifies the v2 reshape: an
+// envelope-shape expansion declaring "service:action" tool names
+// (a) updates the envelope's expected_tools with the per-entry why,
+// (b) derives a matching AuthorizedAction so the gateway path will
+// accept the newly authorized scope, and
+// (c) carries the per-entry why into the new TaskAction's ExpansionRationale
+// for intent verification.
+func TestExpand_EnvelopeMergedOnApprove(t *testing.T) {
 	adapter := newMockAdapter("mock.echo", "echo", "other")
 	env := newTestEnv(t, adapter)
 	sc := newScenario(t, env, "automation")
@@ -784,38 +824,486 @@ func TestExpand_ReasonBecomesExpansionRationale(t *testing.T) {
 
 	taskID := sc.createApprovedTask(t, env, "mock.echo", "echo", true)
 
-	// Request expansion with a reason.
 	resp := env.do("POST", fmt.Sprintf("/api/tasks/%s/expand", taskID), sc.AgentToken, map[string]any{
-		"service": "mock.echo", "action": "other", "auto_execute": true,
-		"reason": "Need to run other action for analysis",
+		"expected_tools": []map[string]any{
+			{"tool_name": "mock.echo:other", "why": "Need to run other action for analysis"},
+		},
+		"reason": "Discovered after fetching that we need to follow up via other action",
 	})
 	mustStatus(t, resp, http.StatusAccepted)
 
-	// Approve the expansion.
 	resp = sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/expand/approve", taskID), nil)
 	mustStatus(t, resp, http.StatusOK)
 
-	// Fetch the task and verify the expanded action has expected_use set to the reason.
 	resp = env.do("GET", fmt.Sprintf("/api/tasks/%s", taskID), sc.AgentToken, nil)
 	body := mustStatus(t, resp, http.StatusOK)
-	actions := arr(t, body, "authorized_actions")
-
+	if body["status"] != "active" {
+		t.Errorf("status after approve = %v, want active", body["status"])
+	}
+	tools := arr(t, body, "expected_tools")
 	found := false
+	for _, raw := range tools {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if entry["tool_name"] == "mock.echo:other" {
+			found = true
+			if entry["why"] != "Need to run other action for analysis" {
+				t.Errorf("why = %v, want the agent-supplied why", entry["why"])
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expanded tool 'mock.echo:other' not found in expected_tools (have %v)", tools)
+	}
+
+	// AuthorizedAction derived + ExpansionRationale carried.
+	actions := arr(t, body, "authorized_actions")
+	derivedFound := false
 	for _, raw := range actions {
 		a, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
-		if a["action"] == "other" {
-			found = true
-			er, _ := a["expansion_rationale"].(string)
-			if er != "Need to run other action for analysis" {
-				t.Errorf("expansion_rationale: got %q, want expansion reason", er)
+		if a["service"] == "mock.echo" && a["action"] == "other" {
+			derivedFound = true
+			if a["expansion_rationale"] != "Need to run other action for analysis" {
+				t.Errorf("expansion_rationale = %v, want the per-entry why", a["expansion_rationale"])
 			}
 		}
 	}
-	if !found {
-		t.Error("expanded action 'other' not found in authorized_actions")
+	if !derivedFound {
+		t.Errorf("derived AuthorizedAction mock.echo:other not found (have %v) — gateway will reject the expanded scope", actions)
+	}
+
+	// End-to-end: the gateway path now accepts the newly authorized action.
+	result := sc.gatewayRequestWithTask(env, fmt.Sprintf("req-postexpand-%s", randSuffix()), "mock.echo", "other", taskID)
+	if status, _ := result["status"].(string); status == "out_of_scope" || status == "pending_scope_expansion" {
+		t.Errorf("gateway status = %q after expansion approve; expected to be in scope (result=%+v)", status, result)
+	}
+}
+
+// TestExpand_EmptyBodyRejected confirms an envelope-shape expansion
+// request must declare at least one addition. An empty body would
+// otherwise flip the task to pending_scope_expansion with nothing to
+// approve, leaving the dashboard / chat surfaces with a no-op
+// approval prompt.
+func TestExpand_EmptyBodyRejected(t *testing.T) {
+	adapter := newMockAdapter("mock.echo", "echo")
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "automation")
+	sc.activateService(t, env, "mock.echo")
+
+	taskID := sc.createApprovedTask(t, env, "mock.echo", "echo", true)
+
+	resp := env.do("POST", fmt.Sprintf("/api/tasks/%s/expand", taskID), sc.AgentToken, map[string]any{
+		"reason": "forgot to include any actual additions",
+	})
+	body := mustStatus(t, resp, http.StatusBadRequest)
+	if body["code"] != "INVALID_REQUEST" {
+		t.Errorf("code = %v, want INVALID_REQUEST", body["code"])
+	}
+}
+
+// TestExpand_DedupReplacesWhy exercises the load-bearing replace-by-name
+// contract end-to-end: when the agent expands with a tool that already
+// exists on the parent task, the merged envelope persisted on approve
+// has exactly one entry per canonical tool name, with the new why.
+func TestExpand_DedupReplacesWhy(t *testing.T) {
+	adapter := newMockAdapter("mock.echo", "echo")
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "automation")
+	sc.activateService(t, env, "mock.echo")
+
+	// Create a task carrying both an AuthorizedAction (so the v1 path
+	// is happy) and an envelope-shape expected_tools entry that the
+	// expansion will collide with.
+	createBody := map[string]any{
+		"purpose": "smoke — dedup replace",
+		"authorized_actions": []map[string]any{
+			{"service": "mock.echo", "action": "echo", "auto_execute": true},
+		},
+		"expected_tools": []map[string]any{
+			{"tool_name": "Bash", "why": "run a single curl to list emails"},
+		},
+		"expires_in_seconds": 600,
+	}
+	resp := env.do("POST", "/api/tasks", sc.AgentToken, createBody)
+	body := mustStatus(t, resp, http.StatusCreated)
+	taskID := str(t, body, "task_id")
+	resp = sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/approve", taskID), nil)
+	mustStatus(t, resp, http.StatusOK)
+
+	// Expand with the same Bash entry but a new, broader why.
+	resp = env.do("POST", fmt.Sprintf("/api/tasks/%s/expand", taskID), sc.AgentToken, map[string]any{
+		"expected_tools": []map[string]any{
+			{"tool_name": "Bash", "why": "list emails AND run a local processing script"},
+		},
+		"reason": "discovered we need local processing of the listed emails",
+	})
+	mustStatus(t, resp, http.StatusAccepted)
+
+	resp = sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/expand/approve", taskID), nil)
+	mustStatus(t, resp, http.StatusOK)
+
+	resp = env.do("GET", fmt.Sprintf("/api/tasks/%s", taskID), sc.AgentToken, nil)
+	body = mustStatus(t, resp, http.StatusOK)
+	tools := arr(t, body, "expected_tools")
+	if len(tools) != 1 {
+		t.Fatalf("expected_tools = %v, want exactly one entry after dedup-replace", tools)
+	}
+	entry, _ := tools[0].(map[string]any)
+	if entry["tool_name"] != "Bash" {
+		t.Errorf("tool_name = %v, want Bash", entry["tool_name"])
+	}
+	if entry["why"] != "list emails AND run a local processing script" {
+		t.Errorf("why = %v, want the new broadened why (replace-by-name failed)", entry["why"])
+	}
+}
+
+// TestExpand_CredentialsOnlyAccepted covers credentials-only expansion:
+// the agent already has the tool/egress shape approved and just needs a
+// newly-discovered credential. The handler must NOT require
+// expected_tools or expected_egress in the body.
+func TestExpand_CredentialsOnlyAccepted(t *testing.T) {
+	adapter := newMockAdapter("mock.echo", "echo")
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "automation")
+	sc.activateService(t, env, "mock.echo")
+
+	// Seed the vault item so the credential addition validates.
+	if err := env.Vault.Set(context.Background(), sc.session.UserID, "mock.echo:account", []byte("cred")); err != nil {
+		t.Fatalf("vault seed: %v", err)
+	}
+
+	taskID := sc.createApprovedTask(t, env, "mock.echo", "echo", true)
+
+	resp := env.do("POST", fmt.Sprintf("/api/tasks/%s/expand", taskID), sc.AgentToken, map[string]any{
+		"required_credentials": []map[string]any{
+			{"vault_item_id": "mock.echo:account", "why": "Need credential for the already-approved echo action"},
+		},
+		"reason": "follow-up call needs an authenticated path",
+	})
+	mustStatus(t, resp, http.StatusAccepted)
+
+	resp = sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/expand/approve", taskID), nil)
+	mustStatus(t, resp, http.StatusOK)
+}
+
+// TestExpand_DerivedActionRejectedForUnknownService confirms an
+// expansion whose ExpectedTool names a service the user has no adapter
+// for gets a 400 at request time — we will NOT land the pending state
+// and waste user approval time only to discover the scope is unusable.
+func TestExpand_DerivedActionRejectedForUnknownService(t *testing.T) {
+	adapter := newMockAdapter("mock.echo", "echo")
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "automation")
+	sc.activateService(t, env, "mock.echo")
+
+	taskID := sc.createApprovedTask(t, env, "mock.echo", "echo", true)
+
+	resp := env.do("POST", fmt.Sprintf("/api/tasks/%s/expand", taskID), sc.AgentToken, map[string]any{
+		"expected_tools": []map[string]any{
+			{"tool_name": "mock.nonexistent:do_thing", "why": "would be unusable"},
+		},
+		"reason": "agent invented a service id",
+	})
+	body := mustStatus(t, resp, http.StatusBadRequest)
+	if body["code"] != "INVALID_REQUEST" {
+		t.Errorf("code = %v, want INVALID_REQUEST", body["code"])
+	}
+}
+
+// TestExpand_DenyClearsPendingAndResolvesStatus exercises the atomic
+// deny path end-to-end: after the user denies, the task returns to
+// status=active, pending_expansion is cleared, and the canonical
+// approval record is marked denied. Locks in the contract of
+// ResolveTaskPendingExpansion so a future refactor can't split the
+// clear-and-status update into a non-atomic pair again.
+func TestExpand_DenyClearsPendingAndResolvesStatus(t *testing.T) {
+	adapter := newMockAdapter("mock.echo", "echo", "other")
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "automation")
+	sc.activateService(t, env, "mock.echo")
+
+	taskID := sc.createApprovedTask(t, env, "mock.echo", "echo", true)
+
+	resp := env.do("POST", fmt.Sprintf("/api/tasks/%s/expand", taskID), sc.AgentToken, map[string]any{
+		"expected_tools": []map[string]any{
+			{"tool_name": "mock.echo:other", "why": "Need other action"},
+		},
+		"reason": "downstream summary step",
+	})
+	mustStatus(t, resp, http.StatusAccepted)
+
+	// Mid-state check: status is pending, pending_expansion populated.
+	resp = env.do("GET", fmt.Sprintf("/api/tasks/%s", taskID), sc.AgentToken, nil)
+	body := mustStatus(t, resp, http.StatusOK)
+	if body["status"] != "pending_scope_expansion" {
+		t.Fatalf("status before deny = %v, want pending_scope_expansion", body["status"])
+	}
+	if body["pending_expansion"] == nil {
+		t.Fatalf("pending_expansion missing before deny")
+	}
+
+	resp = sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/expand/deny", taskID), nil)
+	mustStatus(t, resp, http.StatusOK)
+
+	resp = env.do("GET", fmt.Sprintf("/api/tasks/%s", taskID), sc.AgentToken, nil)
+	body = mustStatus(t, resp, http.StatusOK)
+	if body["status"] != "active" {
+		t.Errorf("status after deny = %v, want active", body["status"])
+	}
+	if body["pending_expansion"] != nil {
+		t.Errorf("pending_expansion = %v after deny; want cleared", body["pending_expansion"])
+	}
+	// AuthorizedActions must NOT include the proposed derived action.
+	for _, raw := range arr(t, body, "authorized_actions") {
+		a, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if a["service"] == "mock.echo" && a["action"] == "other" {
+			t.Errorf("denied expansion's mock.echo:other appears in authorized_actions: %v", a)
+		}
+	}
+}
+
+// TestExpand_CrossAgentRejected asserts an agent under the same user
+// cannot expand another agent's task. The owner gate (task.UserID !=
+// agent.UserID) alone would let any sibling agent silently broaden a
+// task it didn't create — the second-agent path is gated separately
+// on task.AgentID. Without a dedicated test, a future refactor could
+// re-loosen this without anyone noticing.
+func TestExpand_CrossAgentRejected(t *testing.T) {
+	adapter := newMockAdapter("mock.echo", "echo", "other")
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "automation")
+	sc.activateService(t, env, "mock.echo")
+
+	taskID := sc.createApprovedTask(t, env, "mock.echo", "echo", true)
+
+	// Create a second agent under the same user and obtain its token.
+	resp := sc.session.do("POST", "/api/agents", map[string]any{
+		"name": "test-agent-2",
+	})
+	body := mustStatus(t, resp, http.StatusCreated)
+	secondAgentToken := str(t, body, "token")
+
+	resp = env.do("POST", fmt.Sprintf("/api/tasks/%s/expand", taskID), secondAgentToken, map[string]any{
+		"expected_tools": []map[string]any{
+			{"tool_name": "mock.echo:other", "why": "sibling agent shouldn't be able to expand"},
+		},
+		"reason": "cross-agent expansion attempt",
+	})
+	body = mustStatus(t, resp, http.StatusForbidden)
+	if body["code"] != "FORBIDDEN" {
+		t.Errorf("code = %v, want FORBIDDEN", body["code"])
+	}
+}
+
+// TestExpand_ConcurrentApproveAndDenyRace asserts the CAS guards on
+// UpdateTaskEnvelopeFrom (approve) and ResolveTaskPendingExpansion
+// (deny) jointly admit exactly one writer when both fire against the
+// same pending row. The single existing deny test covers the typed
+// enum's correctness; this test fires them as goroutines so a future
+// refactor that splits clear-and-status into a non-atomic pair (or
+// loses the pending_scope_expansion CAS) regresses loudly.
+func TestExpand_ConcurrentApproveAndDenyRace(t *testing.T) {
+	adapter := newMockAdapter("mock.echo", "echo", "other")
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "automation")
+	sc.activateService(t, env, "mock.echo")
+
+	taskID := sc.createApprovedTask(t, env, "mock.echo", "echo", true)
+
+	resp := env.do("POST", fmt.Sprintf("/api/tasks/%s/expand", taskID), sc.AgentToken, map[string]any{
+		"expected_tools": []map[string]any{
+			{"tool_name": "mock.echo:other", "why": "Need other action"},
+		},
+		"reason": "race-test",
+	})
+	mustStatus(t, resp, http.StatusAccepted)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	statusCh := make(chan int, 2)
+	go func() {
+		defer wg.Done()
+		r := sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/expand/approve", taskID), nil)
+		defer r.Body.Close()
+		statusCh <- r.StatusCode
+	}()
+	go func() {
+		defer wg.Done()
+		r := sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/expand/deny", taskID), nil)
+		defer r.Body.Close()
+		statusCh <- r.StatusCode
+	}()
+	wg.Wait()
+	close(statusCh)
+
+	var oks, conflicts int
+	for s := range statusCh {
+		switch s {
+		case http.StatusOK:
+			oks++
+		case http.StatusConflict:
+			conflicts++
+		default:
+			t.Errorf("unexpected status %d", s)
+		}
+	}
+	if oks != 1 || conflicts != 1 {
+		t.Fatalf("race outcome: oks=%d conflicts=%d, want exactly 1 each", oks, conflicts)
+	}
+
+	// Final task state must match whichever side won — either active
+	// with the merged scope OR active without it (parent scope only).
+	// Both pending_expansion and status must be coherent: a denied
+	// row returns to active with no pending JSON; an approved row is
+	// active with no pending JSON too. The crucial invariant is that
+	// pending_expansion is cleared either way.
+	resp = env.do("GET", fmt.Sprintf("/api/tasks/%s", taskID), sc.AgentToken, nil)
+	body := mustStatus(t, resp, http.StatusOK)
+	if body["status"] != "active" {
+		t.Errorf("status after race = %v, want active", body["status"])
+	}
+	if body["pending_expansion"] != nil {
+		t.Errorf("pending_expansion = %v after race; want cleared regardless of winner", body["pending_expansion"])
+	}
+}
+
+// TestExpand_StaleApproveRejectedAfterDenyAndReExpand exercises the
+// pending-snapshot CAS guard on UpdateTaskEnvelopeFrom. Sequence:
+// (1) agent expands → pending #A;
+// (2) approve handler reads task with pending #A;
+// (3) before the approve writes, a different caller denies (clearing
+//     pending);
+// (4) agent expands again → pending #B;
+// (5) the original approve from (2) finally writes — its CAS must
+//     LOSE because pending_expansion_json no longer matches snapshot
+//     #A, even though status is again 'pending_scope_expansion'.
+// Without the snapshot guard, the stale approve would grant scope
+// #A that the user already denied. The store-layer test goes
+// directly through UpdateTaskEnvelopeFrom so we exercise the SQL
+// guard (the handler always sets ExpectedPendingJSON, so the only
+// way to assert behavior at the bytes level is from the store).
+func TestExpand_StaleApproveRejectedAfterDenyAndReExpand(t *testing.T) {
+	adapter := newMockAdapter("mock.echo", "echo", "other")
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "automation")
+	sc.activateService(t, env, "mock.echo")
+
+	taskID := sc.createApprovedTask(t, env, "mock.echo", "echo", true)
+
+	// Step 1: pending #A
+	resp := env.do("POST", fmt.Sprintf("/api/tasks/%s/expand", taskID), sc.AgentToken, map[string]any{
+		"expected_tools": []map[string]any{
+			{"tool_name": "mock.echo:other", "why": "Need A"},
+		},
+		"reason": "A",
+	})
+	mustStatus(t, resp, http.StatusAccepted)
+
+	// Step 2: snapshot the task with pending #A
+	resp = env.do("GET", fmt.Sprintf("/api/tasks/%s", taskID), sc.AgentToken, nil)
+	mustStatus(t, resp, http.StatusOK)
+	snapshotA, err := env.Store.GetTask(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("snapshot A: %v", err)
+	}
+	if snapshotA.PendingExpansion == nil {
+		t.Fatalf("snapshot A has no PendingExpansion")
+	}
+	pendingA, err := json.Marshal(snapshotA.PendingExpansion)
+	if err != nil {
+		t.Fatalf("marshal pending A: %v", err)
+	}
+
+	// Step 3: deny — clears pending and restores status='active'
+	resp = sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/expand/deny", taskID), nil)
+	mustStatus(t, resp, http.StatusOK)
+
+	// Step 4: pending #B
+	resp = env.do("POST", fmt.Sprintf("/api/tasks/%s/expand", taskID), sc.AgentToken, map[string]any{
+		"expected_tools": []map[string]any{
+			{"tool_name": "mock.echo:other", "why": "Need B (different reason)"},
+		},
+		"reason": "B",
+	})
+	mustStatus(t, resp, http.StatusAccepted)
+
+	// Step 5: build envUpdate from snapshot A and attempt the stale
+	// write with the snapshot guard. CAS must LOSE because the
+	// stored pending_expansion_json now matches B's bytes, not A's.
+	envUpdate := store.TaskEnvelopeUpdate{
+		AuthorizedActions:   snapshotA.AuthorizedActions,
+		ExpectedTools:       snapshotA.ExpectedTools,
+		ExpectedEgress:      snapshotA.ExpectedEgress,
+		RequiredCredentials: snapshotA.RequiredCredentials,
+		ExpectedPendingJSON: pendingA,
+	}
+	won, err := env.Store.UpdateTaskEnvelopeFrom(
+		context.Background(),
+		taskID,
+		"pending_scope_expansion",
+		envUpdate,
+		time.Now().UTC().Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("UpdateTaskEnvelopeFrom: %v", err)
+	}
+	if won {
+		t.Fatalf("CAS won with stale snapshot — pending-snapshot guard regressed; the deny+re-expand sequence must reject the stale approve")
+	}
+
+	// Sanity: a write with the CURRENT (B) snapshot still succeeds.
+	snapshotB, err := env.Store.GetTask(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("snapshot B: %v", err)
+	}
+	pendingB, err := json.Marshal(snapshotB.PendingExpansion)
+	if err != nil {
+		t.Fatalf("marshal pending B: %v", err)
+	}
+	envUpdate.ExpectedPendingJSON = pendingB
+	won, err = env.Store.UpdateTaskEnvelopeFrom(
+		context.Background(),
+		taskID,
+		"pending_scope_expansion",
+		envUpdate,
+		time.Now().UTC().Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("UpdateTaskEnvelopeFrom with current snapshot: %v", err)
+	}
+	if !won {
+		t.Fatalf("CAS lost with the current pending snapshot; the guard should only reject stale writes")
+	}
+}
+
+// TestExpand_DerivedActionRejectedForUnsupportedAction confirms that a
+// service:action where the service exists but the adapter does not
+// support that action is rejected up front.
+func TestExpand_DerivedActionRejectedForUnsupportedAction(t *testing.T) {
+	adapter := newMockAdapter("mock.echo", "echo")
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "automation")
+	sc.activateService(t, env, "mock.echo")
+
+	taskID := sc.createApprovedTask(t, env, "mock.echo", "echo", true)
+
+	resp := env.do("POST", fmt.Sprintf("/api/tasks/%s/expand", taskID), sc.AgentToken, map[string]any{
+		"expected_tools": []map[string]any{
+			{"tool_name": "mock.echo:fictional_action", "why": "agent imagined an action"},
+		},
+		"reason": "test",
+	})
+	body := mustStatus(t, resp, http.StatusBadRequest)
+	if body["code"] != "INVALID_REQUEST" {
+		t.Errorf("code = %v, want INVALID_REQUEST", body["code"])
 	}
 }
 

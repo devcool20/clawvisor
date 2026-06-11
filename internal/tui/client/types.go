@@ -181,6 +181,17 @@ type ExpectedEgress struct {
 	CredentialAlias string         `json:"credential_alias,omitempty"`
 }
 
+// RequiredCredential mirrors the wire shape of a parent task's
+// required_credentials entry. Exposing it on the TUI Task means
+// the credential was/now diff renders symmetrically with the
+// dashboard surface — without it, the TUI couldn't tell apart a
+// credential addition from a why-revision on an existing entry.
+type RequiredCredential struct {
+	VaultItemID     string `json:"vault_item_id,omitempty"`
+	VaultItemHandle string `json:"vault_item_handle,omitempty"`
+	Why             string `json:"why"`
+}
+
 type Task struct {
 	ID                     string           `json:"id"`
 	UserID                 string           `json:"user_id"`
@@ -191,9 +202,10 @@ type Task struct {
 	Status                 string           `json:"status"`
 	AuthorizedActions      []TaskAction     `json:"authorized_actions"`
 	PlannedCalls           []PlannedCall    `json:"planned_calls,omitempty"`
-	ExpectedTools          []ExpectedTool   `json:"expected_tools,omitempty"`
-	ExpectedEgress         []ExpectedEgress `json:"expected_egress,omitempty"`
-	IntentVerificationMode string           `json:"intent_verification_mode,omitempty"`
+	ExpectedTools          []ExpectedTool       `json:"expected_tools,omitempty"`
+	ExpectedEgress         []ExpectedEgress     `json:"expected_egress,omitempty"`
+	RequiredCredentials    []RequiredCredential `json:"required_credentials,omitempty"`
+	IntentVerificationMode string               `json:"intent_verification_mode,omitempty"`
 	ExpectedUse            string           `json:"expected_use,omitempty"`
 	SchemaVersion          int              `json:"schema_version,omitempty"`
 	CallbackURL            string           `json:"callback_url,omitempty"`
@@ -202,17 +214,34 @@ type Task struct {
 	ExpiresAt              *time.Time       `json:"expires_at,omitempty"`
 	ExpiresInSeconds       int              `json:"expires_in_seconds"`
 	RequestCount           int              `json:"request_count"`
-	PendingAction          *TaskAction      `json:"pending_action,omitempty"`
-	PendingReason          string           `json:"pending_reason,omitempty"`
-	RiskLevel              string           `json:"risk_level,omitempty"`
-	RiskDetails            json.RawMessage  `json:"risk_details,omitempty"`
+	PendingExpansion       *PendingTaskExpansion `json:"pending_expansion,omitempty"`
+	PendingDerivedActions  []TaskAction          `json:"pending_derived_actions,omitempty"`
+	RiskLevel              string                `json:"risk_level,omitempty"`
+	RiskDetails            json.RawMessage       `json:"risk_details,omitempty"`
+}
+
+// PendingTaskExpansion mirrors store.PendingTaskExpansion for the TUI
+// client. The envelope fields are raw JSON so the TUI can decode
+// them lazily into ExpectedTool / ExpectedEgress / RequiredCredential
+// when rendering — display surfaces are read-only.
+type PendingTaskExpansion struct {
+	ExpectedTools       json.RawMessage `json:"expected_tools,omitempty"`
+	ExpectedEgress      json.RawMessage `json:"expected_egress,omitempty"`
+	RequiredCredentials json.RawMessage `json:"required_credentials,omitempty"`
+	Reason              string          `json:"reason,omitempty"`
 }
 
 type TaskAction struct {
-	Service     string `json:"service"`
-	Action      string `json:"action"`
-	AutoExecute bool   `json:"auto_execute"`
-	ExpectedUse string `json:"expected_use,omitempty"`
+	Service            string `json:"service"`
+	Action             string `json:"action"`
+	AutoExecute        bool   `json:"auto_execute"`
+	ExpectedUse        string `json:"expected_use,omitempty"`
+	ExpansionRationale string `json:"expansion_rationale,omitempty"`
+	// WildcardCovered is true on response-only PendingDerivedActions
+	// entries synthesized for an addition whose service:action is
+	// already authorized by a same-service wildcard on the parent.
+	// AutoExecute / Verification reflect the wildcard's disposition.
+	WildcardCovered bool `json:"wildcard_covered,omitempty"`
 }
 
 type RiskAssessment struct {

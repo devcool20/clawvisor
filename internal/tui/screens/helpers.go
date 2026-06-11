@@ -3,6 +3,7 @@ package screens
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -60,22 +61,296 @@ func formatTaskDetail(t *client.Task) string {
 				auto = "auto"
 			}
 			b.WriteString(fmt.Sprintf("  %s/%s (%s)", a.Service, a.Action, auto))
-			if a.ExpectedUse != "" {
-				b.WriteString("  — " + a.ExpectedUse)
+			// Fall back to the expansion rationale when no create-time
+			// expected_use was supplied. Without this, a derived
+			// authorized_action (materialized from an expansion's
+			// ExpectedTool) renders blank even though the agent
+			// declared a per-entry why on expand.
+			if note := a.ExpectedUse; note != "" {
+				b.WriteString("  — " + note)
+			} else if a.ExpansionRationale != "" {
+				b.WriteString("  — " + a.ExpansionRationale)
 			}
 			b.WriteString("\n")
 		}
 	}
 
-	if t.PendingAction != nil {
+	if t.PendingExpansion != nil {
 		b.WriteString("\n" + tui.StyleAmber.Render("Pending Expansion") + "\n")
-		b.WriteString(fmt.Sprintf("  %s/%s\n", t.PendingAction.Service, t.PendingAction.Action))
-		if t.PendingReason != "" {
-			b.WriteString("  Reason: " + t.PendingReason + "\n")
-		}
+		writePendingExpansionSummary(&b, t)
 	}
 
 	return b.String()
+}
+
+// writePendingExpansionSummary renders a multi-line view of an in-flight
+// expansion: each requested addition (tool / egress / credential) as a
+// bullet, marked as a NEW entry or a REPLACE-by-name against the parent
+// envelope (with a was/now diff for replacements so the reviewer sees
+// what is genuinely changing, not just the new value). Derived gateway
+// scopes (tool_name shaped as service:action) carry an auto-execute
+// marker from the server's pre-computed PendingDerivedActions.
+//
+// Decode errors leave the relevant section out rather than panicking —
+// display surfaces are read-only and an unrenderable pending row should
+// still let the rest of the task details be inspected.
+func writePendingExpansionSummary(b *strings.Builder, t *client.Task) {
+	if t == nil || t.PendingExpansion == nil {
+		return
+	}
+	pending := t.PendingExpansion
+
+	// Parent envelope: case-insensitive key → prior why. Used to detect
+	// replacements vs. new entries client-side.
+	parentToolWhy := indexParentToolsByName(t.ExpectedTools)
+	parentEgressWhy := indexParentEgressByHost(t.ExpectedEgress)
+	parentCredWhy := indexParentCredentialsByKey(t.RequiredCredentials)
+
+	// Derived gateway scopes (server-computed). Match by service:action
+	// so we can stamp an "auto-execute" / "needs approval" marker next
+	// to each derived ExpectedTool entry.
+	derivedByKey := make(map[string]client.TaskAction, len(t.PendingDerivedActions))
+	for _, a := range t.PendingDerivedActions {
+		derivedByKey[strings.ToLower(a.Service+":"+a.Action)] = a
+	}
+	// Parent same-service wildcards. The server's
+	// mergeAuthorizedActionsFromExpansion DROPS specific derivations
+	// when a wildcard already covers them — so the derived map above
+	// won't have them. Without this lookup, the TUI would show a
+	// "needs per-call approval" pill on an action the user
+	// already auto-approved through the wildcard.
+	parentWildcards := make(map[string]client.TaskAction)
+	for _, a := range t.AuthorizedActions {
+		if a.Action == "*" {
+			parentWildcards[strings.ToLower(strings.TrimSpace(a.Service))] = a
+		}
+	}
+
+	if len(pending.ExpectedTools) > 0 {
+		var tools []client.ExpectedTool
+		if json.Unmarshal(pending.ExpectedTools, &tools) == nil {
+			for _, tool := range tools {
+				match := matchingParentTool(parentToolWhy, tool)
+				prefix := "  + "
+				if match != nil {
+					prefix = "  ~ "
+				}
+				line := prefix + tool.ToolName
+				if marker := autoExecuteMarker(tool.ToolName, derivedByKey, parentWildcards); marker != "" {
+					line += "  " + marker
+				}
+				b.WriteString(line + "\n")
+				if match != nil && match.Why != tool.Why {
+					b.WriteString("      was: " + match.Why + "\n")
+					b.WriteString("      now: " + tool.Why + "\n")
+				} else if tool.Why != "" {
+					b.WriteString("      " + tool.Why + "\n")
+				}
+			}
+		}
+	}
+	if len(pending.ExpectedEgress) > 0 {
+		var egress []client.ExpectedEgress
+		if json.Unmarshal(pending.ExpectedEgress, &egress) == nil {
+			for _, e := range egress {
+				match := matchingParentEgress(parentEgressWhy, e)
+				prefix := "  + "
+				if match != nil {
+					prefix = "  ~ "
+				}
+				b.WriteString(prefix + e.Host + "\n")
+				if match != nil && match.Why != e.Why {
+					b.WriteString("      was: " + match.Why + "\n")
+					b.WriteString("      now: " + e.Why + "\n")
+				} else if e.Why != "" {
+					b.WriteString("      " + e.Why + "\n")
+				}
+			}
+		}
+	}
+	if len(pending.RequiredCredentials) > 0 {
+		var creds []client.RequiredCredential
+		if json.Unmarshal(pending.RequiredCredentials, &creds) == nil {
+			for _, c := range creds {
+				id := c.VaultItemID
+				if id == "" {
+					id = c.VaultItemHandle
+				}
+				key := credentialKey(c)
+				prefix := "  + "
+				prior, replaced := parentCredWhy[key]
+				if replaced {
+					prefix = "  ~ "
+				}
+				b.WriteString(prefix + id + "\n")
+				if replaced && prior != c.Why {
+					b.WriteString("      was: " + prior + "\n")
+					b.WriteString("      now: " + c.Why + "\n")
+				} else if c.Why != "" {
+					b.WriteString("      " + c.Why + "\n")
+				}
+			}
+		}
+	}
+	if pending.Reason != "" {
+		b.WriteString("  Reason: " + pending.Reason + "\n")
+	}
+}
+
+// indexParentToolsByName builds a case-insensitive lookup from tool
+// name to the parent's full entries. The map value is a SLICE because
+// the structural-collision fix lets the parent carry multiple entries
+// with the same tool_name when they differ in input_shape /
+// input_regex — the renderer needs to find a STRUCTURALLY-MATCHING
+// parent entry to label correctly. A simple name → why map would
+// mislabel a structurally-new addition as a replacement.
+func indexParentToolsByName(parent []client.ExpectedTool) map[string][]client.ExpectedTool {
+	out := make(map[string][]client.ExpectedTool, len(parent))
+	for _, t := range parent {
+		key := strings.ToLower(strings.TrimSpace(t.ToolName))
+		if key == "" {
+			continue
+		}
+		out[key] = append(out[key], t)
+	}
+	return out
+}
+
+func indexParentEgressByHost(parent []client.ExpectedEgress) map[string][]client.ExpectedEgress {
+	out := make(map[string][]client.ExpectedEgress, len(parent))
+	for _, e := range parent {
+		key := strings.ToLower(strings.TrimSpace(e.Host))
+		if key == "" {
+			continue
+		}
+		out[key] = append(out[key], e)
+	}
+	return out
+}
+
+// matchingParentTool mirrors internal/runtime/tasks.expectedToolStructurallyMatches
+// so the dashboard / TUI replacement label agrees with what the
+// server's merger actually persists. An addition that names the
+// same tool with DIFFERENT InputShape/InputRegex lands as a new
+// row server-side; the renderer must label it as "+" (added), not
+// "~" (replaced).
+func matchingParentTool(index map[string][]client.ExpectedTool, addition client.ExpectedTool) *client.ExpectedTool {
+	candidates := index[strings.ToLower(strings.TrimSpace(addition.ToolName))]
+	for i := range candidates {
+		parent := candidates[i]
+		if addition.InputRegex != "" && addition.InputRegex != parent.InputRegex {
+			continue
+		}
+		if addition.InputShape != nil && !reflect.DeepEqual(addition.InputShape, parent.InputShape) {
+			continue
+		}
+		return &candidates[i]
+	}
+	return nil
+}
+
+// matchingParentEgress mirrors internal/runtime/tasks.expectedEgressStructurallyMatches.
+// Method is case-insensitive; all other structural fields use exact /
+// deep equality so a same-host addition with a different Method or
+// Path is rendered as a new endpoint rather than a why-update.
+func matchingParentEgress(index map[string][]client.ExpectedEgress, addition client.ExpectedEgress) *client.ExpectedEgress {
+	candidates := index[strings.ToLower(strings.TrimSpace(addition.Host))]
+	for i := range candidates {
+		parent := candidates[i]
+		if addition.Method != "" && !strings.EqualFold(addition.Method, parent.Method) {
+			continue
+		}
+		if addition.Path != "" && addition.Path != parent.Path {
+			continue
+		}
+		if addition.PathRegex != "" && addition.PathRegex != parent.PathRegex {
+			continue
+		}
+		if addition.CredentialAlias != "" && addition.CredentialAlias != parent.CredentialAlias {
+			continue
+		}
+		if addition.QueryShape != nil && !reflect.DeepEqual(addition.QueryShape, parent.QueryShape) {
+			continue
+		}
+		if addition.BodyShape != nil && !reflect.DeepEqual(addition.BodyShape, parent.BodyShape) {
+			continue
+		}
+		if addition.Headers != nil && !reflect.DeepEqual(addition.Headers, parent.Headers) {
+			continue
+		}
+		return &candidates[i]
+	}
+	return nil
+}
+
+// indexParentCredentialsByKey is the credential analogue of
+// indexParentToolsByName: kind-scoped (id vs handle) so a value
+// collision across kinds doesn't masquerade as a replace. Mirrors the
+// envelope merger's canonical key.
+func indexParentCredentialsByKey(parent []client.RequiredCredential) map[string]string {
+	out := make(map[string]string, len(parent))
+	for _, c := range parent {
+		key := credentialKey(c)
+		if key == "" {
+			continue
+		}
+		out[key] = c.Why
+	}
+	return out
+}
+
+// credentialKey mirrors the envelope merger's requiredCredentialKey
+// shape (kind:value, lowercased). Keeping the lookup key in lockstep
+// with the server's dedup keeps the dashboard / TUI was/now diff
+// labels exactly aligned with what the merge persists.
+func credentialKey(c client.RequiredCredential) string {
+	if id := strings.ToLower(strings.TrimSpace(c.VaultItemID)); id != "" {
+		return "id:" + id
+	}
+	if handle := strings.ToLower(strings.TrimSpace(c.VaultItemHandle)); handle != "" {
+		return "handle:" + handle
+	}
+	return ""
+}
+
+// autoExecuteMarker returns the auto-execute disposition tag for a tool
+// entry that maps to a derived gateway scope. Local-only tools (no
+// service:action shape) return "" so the renderer omits the marker.
+//
+// Lookup order: PendingDerivedActions first (the specific entry that
+// would be granted), then parent same-service wildcards (the merger
+// drops specific derivation when a wildcard covers them — see
+// mergeAuthorizedActionsFromExpansion). Without the wildcard
+// fallback, an action the user already auto-approved through a
+// wildcard would render here as "needs per-call approval", which is
+// misleading.
+func autoExecuteMarker(toolName string, derived map[string]client.TaskAction, parentWildcards map[string]client.TaskAction) string {
+	// idx is the colon's position inside the trimmed string, so the
+	// "colon is the last rune" guard must compare against the trimmed
+	// length too. An earlier version of this function compared idx
+	// against len(toolName) (the untrimmed length), which off-by-Ns
+	// past the trimmed terminator and silently let trailing-colon
+	// inputs like "github:" slip past the guard with an empty action.
+	trimmed := strings.TrimSpace(toolName)
+	idx := strings.LastIndex(trimmed, ":")
+	if idx <= 0 || idx == len(trimmed)-1 {
+		return ""
+	}
+	key := strings.ToLower(trimmed)
+	if a, ok := derived[key]; ok {
+		if a.AutoExecute {
+			return tui.StyleGreen.Render("[auto-execute]")
+		}
+		return tui.StyleAmber.Render("[needs per-call approval]")
+	}
+	service := strings.ToLower(strings.TrimSpace(trimmed[:idx]))
+	if a, covered := parentWildcards[service]; covered {
+		if a.AutoExecute {
+			return tui.StyleGreen.Render("[covered by wildcard · auto-execute]")
+		}
+		return tui.StyleAmber.Render("[covered by wildcard · per-call]")
+	}
+	return ""
 }
 
 func riskBadge(level string) string {

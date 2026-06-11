@@ -226,29 +226,41 @@ func (n *Notifier) SendTaskApprovalRequest(ctx context.Context, req notify.TaskA
 }
 
 func (n *Notifier) SendScopeExpansionRequest(ctx context.Context, req notify.ScopeExpansionRequest) (string, error) {
-	summary := req.NewAction.Service + "/" + req.NewAction.Action
-	body := fmt.Sprintf("%s wants to expand task scope: %s", req.AgentName, req.Reason)
+	// Shared with Telegram via the pkg/notify renderer so both
+	// surfaces agree on the +/~ vocabulary; CapExpansionBody bounds
+	// the runaway-reason case against the ~4KB APNs/FCM payload
+	// limit.
+	summary := notify.RenderExpansionSummary(req)
+	body := notify.CapExpansionBody(fmt.Sprintf("%s wants to expand task scope: %s", req.AgentName, req.Reason))
+	data := map[string]string{
+		"target_id":      req.TaskID,
+		"type":           "scope_expansion",
+		"daemon_url":     n.daemonURL,
+		"purpose":        req.Purpose,
+		"action_summary": summary,
+	}
+	if req.RiskLevel != "" {
+		data["risk_level"] = req.RiskLevel
+	}
+	attrs := map[string]string{
+		"targetID":      req.TaskID,
+		"daemonURL":     n.daemonURL,
+		"requestType":   "scope_expansion",
+		"category":      "SCOPE_EXPANSION",
+		"purpose":       req.Purpose,
+		"actionSummary": summary,
+	}
+	if req.RiskLevel != "" {
+		attrs["riskLevel"] = req.RiskLevel
+	}
 	return n.sendToDevices(ctx, req.UserID, pushPayload{
 		Category: "SCOPE_EXPANSION",
 		Title:    "Scope Expansion Request",
 		Body:     body,
-		Data: map[string]string{
-			"target_id":      req.TaskID,
-			"type":           "scope_expansion",
-			"daemon_url":     n.daemonURL,
-			"purpose":        req.Purpose,
-			"action_summary": summary,
-		},
+		Data:     data,
 		LiveActivity: &liveActivityPayload{
 			AttributesType: "ApprovalActivityAttributes",
-			Attributes: map[string]string{
-				"targetID":      req.TaskID,
-				"daemonURL":     n.daemonURL,
-				"requestType":   "scope_expansion",
-				"category":      "SCOPE_EXPANSION",
-				"purpose":       req.Purpose,
-				"actionSummary": summary,
-			},
+			Attributes:     attrs,
 			ContentState: map[string]any{
 				"status":        "pending",
 				"resultMessage": nil,

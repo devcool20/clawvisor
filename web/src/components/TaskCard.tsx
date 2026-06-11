@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, type Task, type TaskAction, type AuditEntry, type RiskAssessment, type ApprovalRationale, type ScopeOverride, type PlannedCall, type ExpectedTool, type ExpectedEgress, type TaskCostSummary } from '../api/client'
+import { api, type Task, type TaskAction, type AuditEntry, type RiskAssessment, type ApprovalRationale, type ScopeOverride, type PlannedCall, type ExpectedTool, type ExpectedEgress, type RequiredCredential, type TaskCostSummary, type PendingTaskExpansion } from '../api/client'
 import { format } from 'date-fns'
 import { serviceName, actionName } from '../lib/services'
 import { isLocalHost } from '../lib/env'
@@ -410,7 +410,14 @@ export default function TaskCard({
       {/* ── Pending scope expansion body ── */}
       {needsExpansion && !result && (
         <>
-          {showRisk && <RiskPanel risk={riskDetails} level={riskLevel} />}
+          {/* RiskPanel here renders the create-time assessment — the
+              expansion's own reassessment lands server-side and is
+              surfaced as task.risk_level once approved. Until the
+              follow-up "expansion risk baseline" PR ships, the
+              panel is labelled as the original task's risk to keep
+              the reviewer from reading it as a verdict on the new
+              scope. */}
+          {showRisk && <RiskPanel risk={riskDetails} level={riskLevel} label="Original task risk" />}
           <div className="px-5 pb-3">
             <button
               onClick={() => setScopesOpenInExpansion(o => !o)}
@@ -425,25 +432,24 @@ export default function TaskCard({
               <ScopeGroupTables autoActions={autoActions} manualActions={manualActions} />
             </div>
           )}
-          {task.pending_action && (
+          {task.pending_expansion && (
             <div className="px-4 pb-3">
               <div className="bg-surface-0 border rounded overflow-hidden" style={{ borderColor: 'var(--color-warning-border-light)' }}>
                 <div className="px-3 py-1.5 border-b flex items-center gap-1.5" style={{ background: 'var(--color-warning-tint)', borderColor: 'var(--color-warning-border-subtle)' }}>
                   <span className="w-1.5 h-1.5 rounded-full bg-warning" />
                   <span className="text-[10px] font-medium text-warning uppercase tracking-wider">New scope requested</span>
                 </div>
-                <table className="w-full text-sm">
-                  <tbody>
-                    <tr>
-                      <td className="px-3 py-2 font-mono text-text-primary w-40">{serviceName(task.pending_action.service)} · {actionName(task.pending_action.action)}</td>
-                      <td className="px-3 py-2 text-sm text-text-secondary">{task.pending_reason ?? ''}</td>
-                    </tr>
-                  </tbody>
-                </table>
-                {task.pending_action.auto_execute && (
-                  <div className="px-3 py-1.5 border-t border-border-subtle flex items-center gap-1.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-success" />
-                    <span className="text-[10px] font-mono text-success">auto-execute</span>
+                <PendingExpansionEntries
+                  pending={task.pending_expansion}
+                  parentTools={task.expected_tools ?? []}
+                  parentEgress={task.expected_egress ?? []}
+                  parentCredentials={task.required_credentials ?? []}
+                  parentActions={task.authorized_actions ?? []}
+                  derivedActions={task.pending_derived_actions ?? []}
+                />
+                {task.pending_expansion.reason && (
+                  <div className="px-3 py-2 border-t border-border-subtle text-sm text-text-secondary">
+                    <span className="text-text-tertiary">Reason: </span>{task.pending_expansion.reason}
                   </div>
                 )}
               </div>
@@ -639,8 +645,8 @@ function GroupedScopes({
                           </button>
                         )}
                       </div>
-                      {a.expected_use && (
-                        <div className="text-[12px] text-text-secondary mt-0.5">{a.expected_use}</div>
+                      {(a.expected_use || a.expansion_rationale) && (
+                        <div className="text-[12px] text-text-secondary mt-0.5">{a.expected_use || a.expansion_rationale}</div>
                       )}
                     </div>
                     <ScopePill
@@ -766,8 +772,8 @@ function PlannedValue({ value }: { value: unknown }) {
 // ── Scope group tables (used only for needsExpansion approved-scopes view) ───
 
 function ScopeGroupTables({ autoActions, manualActions }: {
-  autoActions: { service: string; action: string; expected_use?: string }[]
-  manualActions: { service: string; action: string; expected_use?: string }[]
+  autoActions: { service: string; action: string; expected_use?: string; expansion_rationale?: string }[]
+  manualActions: { service: string; action: string; expected_use?: string; expansion_rationale?: string }[]
 }) {
   return (
     <>
@@ -782,7 +788,7 @@ function ScopeGroupTables({ autoActions, manualActions }: {
               {autoActions.map((a, i) => (
                 <tr key={`${a.service}|${a.action}`} className={i < autoActions.length - 1 ? 'border-b border-border-subtle' : ''}>
                   <td className="px-3 py-2 font-mono text-text-primary w-40">{serviceName(a.service)} · {actionName(a.action)}</td>
-                  <td className="px-3 py-2 text-sm text-text-secondary">{a.expected_use ?? ''}</td>
+                  <td className="px-3 py-2 text-sm text-text-secondary">{a.expected_use ?? a.expansion_rationale ?? ''}</td>
                 </tr>
               ))}
             </tbody>
@@ -800,7 +806,7 @@ function ScopeGroupTables({ autoActions, manualActions }: {
               {manualActions.map((a, i) => (
                 <tr key={`${a.service}|${a.action}`} className={i < manualActions.length - 1 ? 'border-b border-border-subtle' : ''}>
                   <td className="px-3 py-2 font-mono text-text-primary w-40">{serviceName(a.service)} · {actionName(a.action)}</td>
-                  <td className="px-3 py-2 text-sm text-text-secondary">{a.expected_use ?? ''}</td>
+                  <td className="px-3 py-2 text-sm text-text-secondary">{a.expected_use ?? a.expansion_rationale ?? ''}</td>
                 </tr>
               ))}
             </tbody>
@@ -808,6 +814,257 @@ function ScopeGroupTables({ autoActions, manualActions }: {
         </div>
       )}
     </>
+  )
+}
+
+// PendingExpansionEntries renders the bullet-list view of a pending
+// scope expansion — what tools / egress / credentials the agent is
+// asking for, each with the why it provided. Each tool / egress entry
+// is marked as a NEW addition or a REPLACEMENT of an existing entry's
+// why (with the was/now diff visible), so the reviewer sees what is
+// actually changing rather than just the new value. Derived gateway
+// scopes (tool_name shaped as service:action) carry an auto-execute
+// disposition pill computed server-side via PendingDerivedActions —
+// the dashboard never needs the hardcoded-approval table locally.
+function PendingExpansionEntries({
+  pending,
+  parentTools,
+  parentEgress,
+  parentCredentials,
+  parentActions,
+  derivedActions,
+}: {
+  pending: PendingTaskExpansion
+  parentTools: ExpectedTool[]
+  parentEgress: ExpectedEgress[]
+  parentCredentials: RequiredCredential[]
+  parentActions: TaskAction[]
+  derivedActions: TaskAction[]
+}) {
+  const tools = pending.expected_tools ?? []
+  const egress = pending.expected_egress ?? []
+  const creds = pending.required_credentials ?? []
+  if (tools.length === 0 && egress.length === 0 && creds.length === 0) {
+    return null
+  }
+
+  // Case-insensitive lookup maps so we can flag replacements client-side
+  // without re-running the server's merge logic. Values are ARRAYS:
+  // the structural-collision fix lets the server keep multiple parent
+  // entries with the same name when InputRegex/Method/Path/etc. differ,
+  // and we need to find a structurally-matching parent to label
+  // correctly. A simple name → entry map would mislabel a
+  // structurally-new addition as a replacement.
+  const parentToolsByKey = new Map<string, ExpectedTool[]>()
+  for (const t of parentTools) {
+    const key = (t.tool_name ?? '').trim().toLowerCase()
+    if (!key) continue
+    const list = parentToolsByKey.get(key) ?? []
+    list.push(t)
+    parentToolsByKey.set(key, list)
+  }
+  const parentEgressByKey = new Map<string, ExpectedEgress[]>()
+  for (const e of parentEgress) {
+    const key = (e.host ?? '').trim().toLowerCase()
+    if (!key) continue
+    const list = parentEgressByKey.get(key) ?? []
+    list.push(e)
+    parentEgressByKey.set(key, list)
+  }
+  // Deep-equality on the optional shape maps (input_shape, query_shape,
+  // body_shape, headers). Mirrors reflect.DeepEqual on the Go side so
+  // structural compatibility is computed identically on both surfaces.
+  const deepEqual = (a: unknown, b: unknown): boolean => {
+    if (a === b) return true
+    // Strict equality on the null/undefined fall-through so null and
+    // undefined are NOT treated as equal — they're semantically
+    // different (server returns null for an explicitly-cleared field
+    // vs. undefined for a never-set field).
+    if (a == null || b == null) return a === b
+    if (typeof a !== 'object' || typeof b !== 'object') return false
+    if (Array.isArray(a) || Array.isArray(b)) {
+      if (!Array.isArray(a) || !Array.isArray(b)) return false
+      if (a.length !== b.length) return false
+      for (let i = 0; i < a.length; i++) if (!deepEqual(a[i], b[i])) return false
+      return true
+    }
+    const ka = Object.keys(a as object)
+    const kb = Object.keys(b as object)
+    if (ka.length !== kb.length) return false
+    for (const k of ka) {
+      if (!deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) return false
+    }
+    return true
+  }
+  // Structural-match helpers mirror internal/runtime/tasks.expectedTool/EgressStructurallyMatches.
+  // An addition that names the same tool/host but with a DIFFERENT
+  // non-empty structural field lands as a NEW row server-side; the
+  // renderer must label it '+' rather than '~'.
+  const matchingParentTool = (addition: ExpectedTool): ExpectedTool | undefined => {
+    const candidates = parentToolsByKey.get((addition.tool_name ?? '').trim().toLowerCase())
+    if (!candidates) return undefined
+    return candidates.find(parent => {
+      if (addition.input_regex && addition.input_regex !== parent.input_regex) return false
+      if (addition.input_shape && !deepEqual(addition.input_shape, parent.input_shape)) return false
+      return true
+    })
+  }
+  const matchingParentEgress = (addition: ExpectedEgress): ExpectedEgress | undefined => {
+    const candidates = parentEgressByKey.get((addition.host ?? '').trim().toLowerCase())
+    if (!candidates) return undefined
+    return candidates.find(parent => {
+      if (addition.method && addition.method.toUpperCase() !== (parent.method ?? '').toUpperCase()) return false
+      if (addition.path && addition.path !== parent.path) return false
+      if (addition.path_regex && addition.path_regex !== parent.path_regex) return false
+      if (addition.credential_alias && addition.credential_alias !== parent.credential_alias) return false
+      if (addition.query_shape && !deepEqual(addition.query_shape, parent.query_shape)) return false
+      if (addition.body_shape && !deepEqual(addition.body_shape, parent.body_shape)) return false
+      if (addition.headers && !deepEqual(addition.headers, parent.headers)) return false
+      return true
+    })
+  }
+  // Credentials are kind-scoped (id vs handle) so a value collision
+  // across kinds doesn't masquerade as a replace — mirrors the
+  // server's requiredCredentialKey dedup. Without this, the dashboard
+  // and TUI would silently disagree with what the merge persists on
+  // approve.
+  const credentialKey = (c: RequiredCredential | { vault_item_id?: string; vault_item_handle?: string }): string => {
+    const id = (c.vault_item_id ?? '').trim().toLowerCase()
+    if (id) return `id:${id}`
+    const handle = (c.vault_item_handle ?? '').trim().toLowerCase()
+    if (handle) return `handle:${handle}`
+    return ''
+  }
+  const parentCredWhy = new Map<string, string>()
+  for (const c of parentCredentials) {
+    const key = credentialKey(c)
+    if (key) parentCredWhy.set(key, c.why ?? '')
+  }
+  const derivedByKey = new Map<string, TaskAction>()
+  for (const a of derivedActions) {
+    derivedByKey.set(`${a.service}:${a.action}`.toLowerCase(), a)
+  }
+  // Parent same-service wildcards: mergeAuthorizedActionsFromExpansion
+  // drops specific derivation when a wildcard covers it, so the
+  // derivedByKey map above won't have the entry. Without this map,
+  // the dashboard renders no badge at all on wildcard-covered actions
+  // — leaving the reviewer guessing about the effective disposition.
+  const parentWildcardByService = new Map<string, TaskAction>()
+  for (const a of parentActions) {
+    if (a.action === '*') parentWildcardByService.set(a.service.trim().toLowerCase(), a)
+  }
+
+  const autoExecuteBadge = (toolName: string) => {
+    // Mirror the Go helper (internal/tui/screens/helpers.go autoExecuteMarker):
+    // both the colon search and the trailing-colon guard must reference
+    // the same trimmed string. Comparing idx (from trimmed) against
+    // toolName.length-1 (untrimmed) would let "github:\t" slip past
+    // the guard and look up a malformed key.
+    const trimmed = toolName.trim()
+    const idx = trimmed.lastIndexOf(':')
+    if (idx <= 0 || idx === trimmed.length - 1) return null
+    const action = derivedByKey.get(trimmed.toLowerCase())
+    if (action) {
+      if (action.auto_execute) {
+        return (
+          <span className="ml-2 inline-flex items-center gap-1 text-[10px] font-mono text-success">
+            <span className="w-1 h-1 rounded-full bg-success" />auto-execute
+          </span>
+        )
+      }
+      return (
+        <span className="ml-2 inline-flex items-center gap-1 text-[10px] font-mono text-warning">
+          <span className="w-1 h-1 rounded-full bg-warning" />needs per-call approval
+        </span>
+      )
+    }
+    const service = trimmed.slice(0, idx).trim().toLowerCase()
+    const wildcard = parentWildcardByService.get(service)
+    if (wildcard) {
+      const disposition = wildcard.auto_execute ? 'auto-execute' : 'per-call approval'
+      const colorClass = wildcard.auto_execute ? 'text-success' : 'text-warning'
+      const dotClass = wildcard.auto_execute ? 'bg-success' : 'bg-warning'
+      return (
+        <span className={`ml-2 inline-flex items-center gap-1 text-[10px] font-mono ${colorClass}`}>
+          <span className={`w-1 h-1 rounded-full ${dotClass}`} />covered by wildcard · {disposition}
+        </span>
+      )
+    }
+    return null
+  }
+
+  return (
+    <table className="w-full text-sm">
+      <tbody>
+        {tools.map((t, i) => {
+          const match = matchingParentTool(t)
+          const priorWhy = match?.why
+          const replaced = match !== undefined
+          return (
+            <tr key={`tool-${t.tool_name}-${i}`} className="border-b border-border-subtle last:border-b-0">
+              <td className="px-3 py-2 font-mono text-text-primary w-48 align-top">
+                <span className="text-text-tertiary text-xs">{replaced ? 'tool ~' : 'tool +'}</span> {t.tool_name}
+                {autoExecuteBadge(t.tool_name ?? '')}
+              </td>
+              <td className="px-3 py-2 text-sm text-text-secondary">
+                {replaced && priorWhy !== t.why ? (
+                  <>
+                    <div><span className="text-text-tertiary">was:</span> {priorWhy}</div>
+                    <div><span className="text-text-tertiary">now:</span> {t.why}</div>
+                  </>
+                ) : (
+                  t.why
+                )}
+              </td>
+            </tr>
+          )
+        })}
+        {egress.map((e, i) => {
+          const match = matchingParentEgress(e)
+          const priorWhy = match?.why
+          const replaced = match !== undefined
+          return (
+            <tr key={`egress-${e.host}-${i}`} className="border-b border-border-subtle last:border-b-0">
+              <td className="px-3 py-2 font-mono text-text-primary w-48 align-top">
+                <span className="text-text-tertiary text-xs">{replaced ? 'egress ~' : 'egress +'}</span> {e.host}
+              </td>
+              <td className="px-3 py-2 text-sm text-text-secondary">
+                {replaced && priorWhy !== e.why ? (
+                  <>
+                    <div><span className="text-text-tertiary">was:</span> {priorWhy}</div>
+                    <div><span className="text-text-tertiary">now:</span> {e.why}</div>
+                  </>
+                ) : (
+                  e.why
+                )}
+              </td>
+            </tr>
+          )
+        })}
+        {creds.map((c, i) => {
+          const id = c.vault_item_id || c.vault_item_handle || ''
+          const priorWhy = parentCredWhy.get(credentialKey(c))
+          const replaced = priorWhy !== undefined
+          return (
+            <tr key={`cred-${id}-${i}`} className="border-b border-border-subtle last:border-b-0">
+              <td className="px-3 py-2 font-mono text-text-primary w-48 align-top">
+                <span className="text-text-tertiary text-xs">{replaced ? 'cred ~' : 'cred +'}</span> {id}
+              </td>
+              <td className="px-3 py-2 text-sm text-text-secondary">
+                {replaced && priorWhy !== c.why ? (
+                  <>
+                    <div><span className="text-text-tertiary">was:</span> {priorWhy}</div>
+                    <div><span className="text-text-tertiary">now:</span> {c.why}</div>
+                  </>
+                ) : (
+                  c.why
+                )}
+              </td>
+            </tr>
+          )
+        })}
+      </tbody>
+    </table>
   )
 }
 
@@ -949,10 +1206,11 @@ const RISK_PANEL_COLORS: Record<string, {
   critical: { bg: 'rgba(239, 68, 68, 0.06)', border: 'rgba(239, 68, 68, 0.25)', headerBorder: 'rgba(239, 68, 68, 0.15)', color: 'rgb(var(--color-danger))', conflictBorder: 'rgba(239, 68, 68, 0.1)' },
 }
 
-function RiskPanel({ risk, level }: { risk: RiskAssessment; level: string }) {
+function RiskPanel({ risk, level, label }: { risk: RiskAssessment; level: string; label?: string }) {
   const colors = RISK_PANEL_COLORS[level] ?? RISK_PANEL_COLORS.medium
   const hasConflicts = risk.conflicts && risk.conflicts.length > 0
   const hasFactors = risk.factors && risk.factors.length > 0
+  const headerLabel = label ?? 'Risk assessment'
 
   return (
     <div className="px-4 pb-3">
@@ -962,7 +1220,7 @@ function RiskPanel({ risk, level }: { risk: RiskAssessment; level: string }) {
             ? <svg className="w-3 h-3" style={{ color: colors.color }} fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg>
             : <svg className="w-3 h-3" style={{ color: colors.color }} fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
           }
-          <span className="text-[10px] font-medium uppercase tracking-wider" style={{ color: colors.color }}>Risk assessment &middot; {level}</span>
+          <span className="text-[10px] font-medium uppercase tracking-wider" style={{ color: colors.color }}>{headerLabel} &middot; {level}</span>
         </div>
         <div className="px-3 py-2.5 space-y-2">
           <p className="text-sm text-text-secondary">{risk.explanation}</p>

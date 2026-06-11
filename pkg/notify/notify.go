@@ -8,6 +8,64 @@ import (
 	"github.com/clawvisor/clawvisor/pkg/store"
 )
 
+// ExpansionTool / ExpansionEgress / ExpansionCredential are notify-local
+// DTOs that mirror the runtime envelope's per-item shape without
+// importing from internal/. Per AGENTS.md the pkg/ surface is the
+// public/shared interface boundary, so notify cannot reach into
+// internal/runtime/tasks. The handler translates from
+// internal/runtime/tasks types into these at the boundary.
+type ExpansionTool struct {
+	ToolName string
+	Why      string
+	// GatewayAction reports whether tool_name parses as service:action
+	// and would materialize as an AuthorizedAction on approve. When
+	// true, AutoExecute reflects the effective disposition the user
+	// would grant. Local-harness tools (Bash, Edit, …) set
+	// GatewayAction=false and the AutoExecute value is meaningless.
+	GatewayAction bool
+	AutoExecute   bool
+	// WildcardCovered reports that this gateway action is already
+	// authorized by a same-service wildcard ({service, "*"}) on the
+	// parent task — the merger drops the specific derivation in that
+	// case so the wildcard's broader scope is the source of truth.
+	// AutoExecute mirrors the wildcard's own AutoExecute. Renderers
+	// should show an explicit "covered by wildcard" indication
+	// instead of a generic per-call/auto pill; without this, the
+	// reviewer would read a "needs per-call approval" pill on an
+	// action they already auto-approved through the wildcard.
+	WildcardCovered bool
+}
+
+type ExpansionEgress struct {
+	Host string
+	Why  string
+}
+
+type ExpansionCredential struct {
+	VaultItemID     string
+	VaultItemHandle string
+	Why             string
+}
+
+// ReplacedExpansionTool / Egress / Credential carry both the prior and
+// new entries for a replace-by-name dedup so renderers can show a
+// was/now diff (the reviewer needs to see what's changing, not just
+// the new value).
+type ReplacedExpansionTool struct {
+	Prior ExpansionTool
+	New   ExpansionTool
+}
+
+type ReplacedExpansionEgress struct {
+	Prior ExpansionEgress
+	New   ExpansionEgress
+}
+
+type ReplacedExpansionCredential struct {
+	Prior ExpansionCredential
+	New   ExpansionCredential
+}
+
 // Notifier sends approval and activation requests to the user.
 type Notifier interface {
 	SendApprovalRequest(ctx context.Context, req ApprovalRequest) (messageID string, err error)
@@ -79,13 +137,35 @@ type TaskApprovalRequest struct {
 }
 
 // ScopeExpansionRequest is sent when an agent needs to expand a task's scope.
+// ScopeExpansionRequest carries the data needed to render a scope-expansion
+// approval prompt out-of-band (Telegram, push). The envelope is split into
+// genuinely-new entries vs. entries whose `why` is being replaced so the
+// user sees the full delta — see internal/runtime/tasks.EnvelopeMergeResult.
+// Replaced entries carry both Prior and New so renderers can show the
+// was/now diff; an "Updated" entry showing only the prior why hides the
+// actual scope change.
 type ScopeExpansionRequest struct {
-	TaskID     string
-	UserID     string
-	AgentName  string
-	Purpose    string
-	NewAction  store.TaskAction
-	Reason     string
+	TaskID              string
+	UserID              string
+	AgentName           string
+	Purpose             string
+	AddedTools          []ExpansionTool
+	ReplacedTools       []ReplacedExpansionTool
+	AddedEgress         []ExpansionEgress
+	ReplacedEgress      []ReplacedExpansionEgress
+	AddedCredentials    []ExpansionCredential
+	ReplacedCredentials []ReplacedExpansionCredential
+	Reason              string
+	// RiskLevel is the merged-envelope risk assessment as of the
+	// approval prompt — fresh from the reassessment ExpandApprove runs
+	// (parent risk + new scope can compose into a higher level than
+	// either alone). Empty when no assessor is configured.
+	RiskLevel string
+	// Lifetime is the parent task's lifetime ("session" / "sliding" /
+	// "standing"). Expansion preserves it, so the reviewer needs to
+	// see it on the approval prompt — broadening a standing task is
+	// higher blast radius than broadening a session.
+	Lifetime   string
 	ApproveURL string
 	DenyURL    string
 }
