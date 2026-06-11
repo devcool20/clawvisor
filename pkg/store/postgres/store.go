@@ -3740,7 +3740,7 @@ func (s *Store) UpdateConversationActivity(ctx context.Context, conversationID s
 		INSERT INTO conversations (id, last_user_message_at)
 		VALUES ($1, $2)
 		ON CONFLICT (id) DO UPDATE SET
-			last_user_message_at = EXCLUDED.last_user_message_at
+			last_user_message_at = GREATEST(conversations.last_user_message_at, EXCLUDED.last_user_message_at)
 	`, conversationID, lastUserMessageAt.UTC())
 	return err
 }

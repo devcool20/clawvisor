@@ -4276,7 +4276,10 @@ func (s *Store) UpdateConversationActivity(ctx context.Context, conversationID s
 		INSERT INTO conversations (id, last_user_message_at)
 		VALUES (?, ?)
 		ON CONFLICT (id) DO UPDATE SET
-			last_user_message_at = excluded.last_user_message_at
+			last_user_message_at = CASE
+				WHEN excluded.last_user_message_at > conversations.last_user_message_at THEN excluded.last_user_message_at
+				ELSE conversations.last_user_message_at
+			END
 	`, conversationID, lastUserMessageAt.UTC().Format(time.RFC3339))
 	return err
 }

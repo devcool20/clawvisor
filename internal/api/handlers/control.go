@@ -428,6 +428,8 @@ func (h *LLMControlHandler) WaitForApproval(w http.ResponseWriter, r *http.Reque
 				})
 				return
 			}
+			writeJSON(w, http.StatusOK, map[string]any{"status": "denied"})
+			return
 		} else {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error":   "internal_error",
@@ -481,7 +483,7 @@ func (h *LLMControlHandler) WaitForApproval(w http.ResponseWriter, r *http.Reque
 			resolvedHold := events.WaitFor(r.Context(), h.EventHub, agent.UserID, timeout, []string{"audit", "queue"}, func(c context.Context) (*llmproxy.PendingLiteApproval, bool) {
 				p, err := h.PendingApprovals.PeekByID(c, id)
 				if err != nil {
-					return nil, true
+					return nil, false
 				}
 				return p, p == nil
 			})
