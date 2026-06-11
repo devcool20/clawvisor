@@ -420,6 +420,14 @@ func (h *LLMControlHandler) WaitForApproval(w http.ResponseWriter, r *http.Reque
 		taskID = pending.PendingTaskID
 	}
 
+	if h.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error":   "store_unavailable",
+			"message": "task store is not configured",
+		})
+		return
+	}
+
 	var task *store.Task
 	if pending == nil || pending.PendingTaskID != "" {
 		task, err = h.Store.GetTask(r.Context(), taskID)
