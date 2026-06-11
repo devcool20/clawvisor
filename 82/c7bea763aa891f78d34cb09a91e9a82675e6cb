@@ -1,0 +1,12 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "82c7bea763aa891f78d34cb09a91e9a82675e6cb",
+  "prompts": {},
+  "humans": {
+    "h_19ce13e54ae879": {
+      "author": "devcool20 <sharmadivyanshu265@gmail.com>"
+    }
+  }
+}
