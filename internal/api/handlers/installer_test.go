@@ -403,6 +403,17 @@ func TestInstallerHermesRender(t *testing.T) {
 		`[ -n "$OPENAI_API_KEY" ]`,
 		"*anthropic.com*",
 		"*openai.com*",
+		// Re-install signal: if Hermes's existing base_url points at a
+		// Clawvisor instance, the trailing path tells us which provider
+		// was picked last time.
+		"*/api/v1*",
+		"*/api|*/api/",
+		// HARD CONSTRAINT: the helper must ask the user and wait for a
+		// reply. The earlier shape of this skill let helpers default
+		// silently — we have a real bug report from the field on that.
+		"HARD CONSTRAINT: you must not pick `$PROVIDER` yourself",
+		"DO NOT decide silently",
+		"Wait for the user's reply before going further",
 		// Case block derives every per-provider variable at runtime.
 		`case "$PROVIDER" in`,
 		"PROVIDER_LABEL='Anthropic'",
@@ -490,6 +501,16 @@ func TestInstallerOpenClawRender(t *testing.T) {
 		`jq -r '.models.providers // {} | keys[]?'`,
 		"anthropic*|claude*",
 		"openai*|gpt*",
+		// Re-install signal: existing `clawvisor` provider's `api` field
+		// tells us what the user picked last time.
+		"EXISTING_CV_API=$(jq -r '.models.providers.clawvisor.api",
+		"anthropic-messages)                  DETECTED=",
+		"openai-completions|openai-responses) DETECTED=",
+		// HARD CONSTRAINT: ask the user, don't pick silently. Lock this
+		// against regression — we got a real bug report from the field.
+		"HARD CONSTRAINT: you must not pick `$PROVIDER` yourself",
+		"DO NOT decide silently",
+		"Wait for the user's reply before going further",
 		// Case block (shared with Hermes via providerCaseBlock). OPENCLAW_API
 		// is the on-disk `api` field value (distinct from the
 		// --custom-compatibility flag value that onboard takes).

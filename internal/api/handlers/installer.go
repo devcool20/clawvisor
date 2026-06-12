@@ -664,13 +664,17 @@ func sectionDetectProviderHermes(step int) string {
 	fmt.Fprintf(&b, "# Env vars — presence only, never value\n")
 	fmt.Fprintf(&b, "[ -n \"$ANTHROPIC_API_KEY\" ] && DETECTED=\"$DETECTED anthropic\"\n")
 	fmt.Fprintf(&b, "[ -n \"$OPENAI_API_KEY\" ]   && DETECTED=\"$DETECTED openai\"\n")
-	fmt.Fprintf(&b, "# Hermes config — extract just base_url, infer provider from host\n")
+	fmt.Fprintf(&b, "# Hermes config — extract just base_url, infer provider from host. The\n")
+	fmt.Fprintf(&b, "# *_/api/v1 vs *_/api path is the re-install signal: if base_url points\n")
+	fmt.Fprintf(&b, "# at Clawvisor itself (or localhost:25297 / host.docker.internal:25297),\n")
+	fmt.Fprintf(&b, "# the trailing path tells us which provider was picked last time.\n")
 	fmt.Fprintf(&b, "if [ -f ~/.hermes/config.yaml ]; then\n")
 	fmt.Fprintf(&b, "  BASE=$(python3 -c \"import yaml; d=yaml.safe_load(open('$HOME/.hermes/config.yaml')); print((d.get('model') or {}).get('base_url') or '')\" 2>/dev/null || true)\n")
 	fmt.Fprintf(&b, "  case \"$BASE\" in\n")
-	fmt.Fprintf(&b, "    *anthropic.com*) DETECTED=\"$DETECTED anthropic\" ;;\n")
-	fmt.Fprintf(&b, "    *openai.com*)    DETECTED=\"$DETECTED openai\" ;;\n")
-	fmt.Fprintf(&b, "    *clawvisor*)     echo 'Hermes already points at Clawvisor — looks like a re-install' ;;\n")
+	fmt.Fprintf(&b, "    *anthropic.com*)      DETECTED=\"$DETECTED anthropic\" ;;\n")
+	fmt.Fprintf(&b, "    *openai.com*)         DETECTED=\"$DETECTED openai\" ;;\n")
+	fmt.Fprintf(&b, "    */api/v1*)            DETECTED=\"$DETECTED openai\" ;;\n")
+	fmt.Fprintf(&b, "    */api|*/api/)         DETECTED=\"$DETECTED anthropic\" ;;\n")
 	fmt.Fprintf(&b, "  esac\n")
 	fmt.Fprintf(&b, "fi\n")
 	fmt.Fprintf(&b, "UNIQ=$(printf '%%s\\n' $DETECTED | sort -u | tr '\\n' ' ' | sed 's/ $//')\n")
@@ -706,6 +710,13 @@ func sectionDetectProviderOpenClaw(step int) string {
 	fmt.Fprintf(&b, "      openai*|gpt*)       DETECTED=\"$DETECTED openai\" ;;\n")
 	fmt.Fprintf(&b, "    esac\n")
 	fmt.Fprintf(&b, "  done\n")
+	fmt.Fprintf(&b, "  # Re-install signal: an existing `clawvisor` provider entry's `api`\n")
+	fmt.Fprintf(&b, "  # field tells us which upstream the user picked last time.\n")
+	fmt.Fprintf(&b, "  EXISTING_CV_API=$(jq -r '.models.providers.clawvisor.api // empty' ~/.openclaw/openclaw.json 2>/dev/null)\n")
+	fmt.Fprintf(&b, "  case \"$EXISTING_CV_API\" in\n")
+	fmt.Fprintf(&b, "    anthropic-messages)                  DETECTED=\"$DETECTED anthropic\" ;;\n")
+	fmt.Fprintf(&b, "    openai-completions|openai-responses) DETECTED=\"$DETECTED openai\" ;;\n")
+	fmt.Fprintf(&b, "  esac\n")
 	fmt.Fprintf(&b, "fi\n")
 	fmt.Fprintf(&b, "UNIQ=$(printf '%%s\\n' $DETECTED | sort -u | tr '\\n' ' ' | sed 's/ $//')\n")
 	fmt.Fprintf(&b, "echo \"detected: ${UNIQ:-none}\"\n")
@@ -715,24 +726,45 @@ func sectionDetectProviderOpenClaw(step int) string {
 }
 
 // sectionDetectProviderAskAndCase is the trailing portion shared by both
-// Hermes and OpenClaw detect steps: surface what was detected, ask the
-// user (single / multiple / none), set $PROVIDER, and emit the case
-// block that derives every other per-provider variable.
+// Hermes and OpenClaw detect steps: surface what the probe found, ask the
+// user, wait for their answer, then emit the case block that derives
+// every per-provider variable.
+//
+// The "ask the user" framing is centered as a HARD CONSTRAINT — helpers
+// reading natural-language instructions tend to interpret "ask if you
+// can't tell" as "decide for them and announce it." We've seen exactly
+// that failure in the field (helper picked Anthropic silently because
+// the detect step returned no signal). The phrasing here forbids that
+// path explicitly: the only acceptable behavior is to ask and wait.
 func sectionDetectProviderAskAndCase(harness string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Now ask the user — pick the branch matching `$UNIQ`:\n\n")
-	fmt.Fprintf(&b, "- **One provider detected** (e.g. `anthropic`): confirm with the user:\n")
-	fmt.Fprintf(&b, "  > I see %s is set up for `<provider>`. Vault a `<provider>` key in\n", harness)
-	fmt.Fprintf(&b, "  > Clawvisor so the proxy can route there?\n\n")
-	fmt.Fprintf(&b, "- **Multiple detected** (`anthropic openai`): ask which to route:\n")
+	fmt.Fprintf(&b, "### Ask the user which provider — DO NOT decide silently\n\n")
+	fmt.Fprintf(&b, "**HARD CONSTRAINT: you must not pick `$PROVIDER` yourself. Ask the user\n")
+	fmt.Fprintf(&b, "the question below and wait for their reply before continuing.** No\n")
+	fmt.Fprintf(&b, "defaulting to Anthropic because Claude Code is running this skill, no\n")
+	fmt.Fprintf(&b, "defaulting to OpenAI because the user mentioned GPT in passing — your\n")
+	fmt.Fprintf(&b, "context window is not the source of truth here, the user is. Surface\n")
+	fmt.Fprintf(&b, "what the probe found in chat (`detected: ...` line), then ask one of\n")
+	fmt.Fprintf(&b, "these questions verbatim (or close), picking the form that matches\n")
+	fmt.Fprintf(&b, "`$UNIQ`:\n\n")
+	fmt.Fprintf(&b, "- **Single match** (`$UNIQ` is exactly `anthropic` or exactly `openai`):\n")
+	fmt.Fprintf(&b, "  > %s appears set up for `<detected>`. Vault a `<detected>` key in\n", harness)
+	fmt.Fprintf(&b, "  > Clawvisor so the proxy can route there — or would you rather use\n")
+	fmt.Fprintf(&b, "  > the other one (`<other>`)?\n\n")
+	fmt.Fprintf(&b, "- **Multiple matches** (`$UNIQ` contains both `anthropic` and `openai`):\n")
 	fmt.Fprintf(&b, "  > %s has both `anthropic` and `openai` configured. Which one should\n", harness)
 	fmt.Fprintf(&b, "  > I route through Clawvisor?\n\n")
-	fmt.Fprintf(&b, "- **None detected** (`UNIQ` empty): ask the user to pick:\n")
+	fmt.Fprintf(&b, "- **No match** (`$UNIQ` empty):\n")
 	fmt.Fprintf(&b, "  > I couldn't detect a current LLM provider for %s. Clawvisor's\n", harness)
-	fmt.Fprintf(&b, "  > proxy-lite supports `anthropic` and `openai`. Which one would you\n")
-	fmt.Fprintf(&b, "  > like to use?\n\n")
-	fmt.Fprintf(&b, "Set `$PROVIDER` to the chosen value (`anthropic` or `openai`), then derive\n")
-	fmt.Fprintf(&b, "the per-provider details all later steps consume:\n\n")
+	fmt.Fprintf(&b, "  > proxy-lite supports `anthropic` (Claude) and `openai` (GPT). Which\n")
+	fmt.Fprintf(&b, "  > one do you want to vault for this install?\n\n")
+	fmt.Fprintf(&b, "**Wait for the user's reply before going further.** If they reply with\n")
+	fmt.Fprintf(&b, "anything ambiguous (\"either is fine\", \"you pick\", silence), ask once\n")
+	fmt.Fprintf(&b, "more and surface that Clawvisor needs a definite choice — don't fill\n")
+	fmt.Fprintf(&b, "the silence by picking yourself.\n\n")
+	fmt.Fprintf(&b, "Once you have a clear answer, set `$PROVIDER` to `anthropic` or `openai`\n")
+	fmt.Fprintf(&b, "and run the case block that derives every per-provider variable later\n")
+	fmt.Fprintf(&b, "steps consume:\n\n")
 	fmt.Fprintf(&b, "```bash\n")
 	b.WriteString(providerCaseBlock)
 	fmt.Fprintf(&b, "```\n\n")
