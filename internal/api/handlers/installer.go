@@ -469,19 +469,6 @@ func sectionLocalCLIProbe(harness string, versionCommand string, authCheck strin
 	return b.String()
 }
 
-func sectionDashboardAnswers(ctx installerCtx, lines ...string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "## Dashboard answers\n\n")
-	fmt.Fprintf(&b, "The user answered setup questions in the Clawvisor dashboard before launching this skill. Follow these choices; don't ask them again unless a command fails.\n\n")
-	for _, line := range lines {
-		if line != "" {
-			fmt.Fprintf(&b, "- %s\n", line)
-		}
-	}
-	fmt.Fprintf(&b, "\n")
-	return b.String()
-}
-
 func sectionMint(harness, clawvisorURL, claim, userID string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## 2. Mint a connection request\n\n")
@@ -595,6 +582,83 @@ func sectionSelfUninstall(harness, skillRemovePath string, step int) string {
 func helperInstallerCleanupCommands() string {
 	return `rm -f ~/.claude/commands/clawvisor-install.md
 rm -rf ~/.codex/skills/clawvisor-install`
+}
+
+// helperSetupCleanupCommands removes the one-paste setup skill the dashboard
+// dropped on the helper's disk. Mirrors helperInstallerCleanupCommands but
+// targets the `clawvisor-setup` path the new one-paste flow writes to (see
+// ONE_PASTE_SPECS in the dashboard). The setup skill is one-shot
+// scaffolding — once setup completes it removes itself; the user can
+// re-trigger via the dashboard if they want another install.
+func helperSetupCleanupCommands() string {
+	return `rm -f ~/.claude/commands/clawvisor-setup.md
+rm -rf ~/.codex/skills/clawvisor-setup`
+}
+
+// upstreamKeyPrefix returns the canonical leading characters for the
+// provider's API keys. Used by the env-detect probe in sectionVaultUpstreamKey
+// to confirm the env var holds a plausibly-shaped key without revealing the
+// rest of the value.
+func upstreamKeyPrefix(provider string) string {
+	if provider == "openai" {
+		return "sk-"
+	}
+	return "sk-ant-"
+}
+
+// sectionEnsureVaultedKey is the swap-mode-only equivalent of
+// sectionVaultUpstreamKey. Hermes and OpenClaw have no passthrough path —
+// every call must swap in a vaulted upstream key — so this step runs
+// unconditionally and short-circuits if Clawvisor already has a key for
+// the chosen provider (e.g. vaulted during a prior install of Claude Code,
+// Codex, or another Hermes/OpenClaw agent).
+//
+// Flow:
+//
+//	1. GET /api/runtime/llm-credentials?agent_id=<id> with the freshly-minted
+//	   agent token. Accept either user-scope OR agent-scope as "already
+//	   vaulted" — the user may have saved at either scope from another
+//	   install path. If found → skip.
+//	2. Otherwise fall through to sectionVaultUpstreamKey, which env-detects
+//	   $PROVIDER_API_KEY and vaults via stdin pipe (no key in argv, no key in
+//	   transcript) with a dashboard-page fallback.
+//
+// `step` is the markdown step number this section claims (e.g. 2 in the
+// Hermes flow). Sub-steps inside sectionVaultUpstreamKey are rendered as
+// `<step>.a`, etc.
+func sectionEnsureVaultedKey(step int, provider string) string {
+	var b strings.Builder
+	providerLabel := installerProviderDisplayName(provider)
+	envVar := providerKeyEnv(provider)
+	keyPrefix := upstreamKeyPrefix(provider)
+	dashboardPath := "/dashboard/keys/" + provider
+
+	fmt.Fprintf(&b, "## %d. Ensure a %s key is vaulted\n\n", step, providerLabel)
+	fmt.Fprintf(&b, "The target harness has no passthrough auth — every model call swaps in\n")
+	fmt.Fprintf(&b, "a vaulted upstream key on the Clawvisor side. First check whether the\n")
+	fmt.Fprintf(&b, "user already has one for this provider; only vault a fresh key if not.\n\n")
+	fmt.Fprintf(&b, "Accept either a user-scope or an agent-scope credential — the user may\n")
+	fmt.Fprintf(&b, "have saved either way during a prior install (e.g. Claude Code, or\n")
+	fmt.Fprintf(&b, "another %s agent).\n\n", providerLabel)
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "AGENT_ID=$(jq -r .agent_id \"$TOKEN_FILE\")\n")
+	fmt.Fprintf(&b, "EXISTING=$(curl -sS -H \"Authorization: Bearer $TOKEN\" \\\n")
+	fmt.Fprintf(&b, "  \"$CLAWVISOR_APP_URL/api/runtime/llm-credentials?agent_id=$AGENT_ID\")\n")
+	fmt.Fprintf(&b, "if echo \"$EXISTING\" | jq -e '.credentials[] | select(.provider==\"%s\" and (.stored==true or .agent_stored==true))' >/dev/null 2>&1; then\n", provider)
+	fmt.Fprintf(&b, "  echo 'existing %s key found — skipping vault'\n", providerLabel)
+	fmt.Fprintf(&b, "  KEY_VAULTED=1\n")
+	fmt.Fprintf(&b, "else\n")
+	fmt.Fprintf(&b, "  KEY_VAULTED=0\n")
+	fmt.Fprintf(&b, "fi\n")
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "If `KEY_VAULTED=1`, skip the sub-steps below and continue to the next\n")
+	fmt.Fprintf(&b, "section. Otherwise vault one now.\n\n")
+	preamble := fmt.Sprintf("No existing %s key is vaulted for this user, so we need to add one\nbefore the target harness can route. We try the live shell environment\nfirst; if `%s` is set, the value pipes directly from the shell into\nClawvisor's vault without ever materializing in your conversation context.\n\n", providerLabel, envVar)
+	b.WriteString(sectionVaultUpstreamKeyWithPreamble(
+		fmt.Sprintf("### %d.a. Vault a %s API key", step, providerLabel),
+		preamble, provider, providerLabel, envVar, keyPrefix, dashboardPath,
+	))
+	return b.String()
 }
 
 // ── Shared helpers for the one-paste setup skill (Claude Code, Codex) ────────
@@ -712,12 +776,20 @@ func sectionClaimedConnect(harness, appURL, llmURL, claim, agentName string) str
 // transcript." Helpful-by-default agents will grep ~/.zshrc if not told
 // otherwise; the explicit DO NOT list closes that hole.
 func sectionVaultUpstreamKey(heading, provider, providerLabel, envVar, keyPrefix, dashboardPath string) string {
+	preamble := fmt.Sprintf("The passthrough smoke test failed with an upstream auth error — the user\nhas no working login session and no `%s` in env. Either they fix that\nand re-run the install, or we vault a %s key here for the proxy to\nsubstitute on every call. This step does the second.\n\n", envVar, providerLabel)
+	return sectionVaultUpstreamKeyWithPreamble(heading, preamble, provider, providerLabel, envVar, keyPrefix, dashboardPath)
+}
+
+// sectionVaultUpstreamKeyWithPreamble is the shared body of the env-detect +
+// stdin-pipe + dashboard-fallback vault flow. sectionVaultUpstreamKey wraps it
+// with the Claude Code / Codex "passthrough smoke test failed" framing; the
+// Hermes / OpenClaw entry point (sectionEnsureVaultedKey) supplies its own
+// preamble because those harnesses have no passthrough mode and vault runs
+// unconditionally when no existing credential is found.
+func sectionVaultUpstreamKeyWithPreamble(heading, preamble, provider, providerLabel, envVar, keyPrefix, dashboardPath string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n\n", heading)
-	fmt.Fprintf(&b, "The passthrough smoke test failed with an upstream auth error — the user\n")
-	fmt.Fprintf(&b, "has no working login session and no `%s` in env. Either they fix that\n", envVar)
-	fmt.Fprintf(&b, "and re-run the install, or we vault a %s key here for the proxy to\n", providerLabel)
-	fmt.Fprintf(&b, "substitute on every call. This step does the second.\n\n")
+	b.WriteString(preamble)
 	fmt.Fprintf(&b, "We try to detect a key in the live shell environment first; if present,\n")
 	fmt.Fprintf(&b, "the value pipes directly from the shell into Clawvisor's vault without\n")
 	fmt.Fprintf(&b, "ever materializing in your conversation context.\n\n")
@@ -1705,499 +1777,295 @@ func renderHermesInstaller(ctx installerCtx) string {
 	basePath := providerBasePath(ctx.LLMProvider)
 	baseEnv := providerBaseEnv(ctx.LLMProvider)
 	keyEnv := providerKeyEnv(ctx.LLMProvider)
-	b.WriteString(installerFrontmatter("Hermes"))
+	llmHost := dockerHostURL(ctx.LLMURL)
+	b.WriteString(setupFrontmatter("Hermes"))
 	fmt.Fprintf(&b, "# Connect Hermes to Clawvisor\n\n")
-	fmt.Fprintf(&b, "You are walking the user through connecting Hermes (Nous Research) to a\n")
-	fmt.Fprintf(&b, "running Clawvisor instance at `%s`. One-shot — do, verify, offer to\n", ctx.AppURL)
-	fmt.Fprintf(&b, "remove yourself.\n\n")
+	fmt.Fprintf(&b, "You are running a one-shot setup skill. The dashboard pre-baked the\n")
+	fmt.Fprintf(&b, "Clawvisor URL, a single-use claim code, and the agent name into this file.\n")
+	fmt.Fprintf(&b, "The dashboard already approved the connection — no second click is needed.\n\n")
 	fmt.Fprintf(&b, "Hermes runs in **swap mode**: Hermes presents the Clawvisor agent token as\n")
-	fmt.Fprintf(&b, "`%s`; Clawvisor swaps in the user's\n", keyEnv)
-	fmt.Fprintf(&b, "*vaulted upstream key* on each call. The dashboard step before this skill\n")
-	fmt.Fprintf(&b, "collects the user's upstream %s API key.\n\n", providerName)
-	fmt.Fprintf(&b, "The agent token has **already been minted** by the dashboard's bootstrap\n")
-	fmt.Fprintf(&b, "script and saved to `~/.clawvisor/agents/%s.json`. Do not re-mint;\n", ctx.AgentName)
-	fmt.Fprintf(&b, "the configure step below reads the token from disk.\n\n")
-	fmt.Fprintf(&b, "Set the endpoints (control plane vs. LLM proxy — separate hosts in\n")
-	fmt.Fprintf(&b, "split deployments):\n\n```bash\nexport CLAWVISOR_APP_URL=%s\nexport CLAWVISOR_LLM_URL=%s\n```\n\n", ctx.AppURL, ctx.LLMURL)
+	fmt.Fprintf(&b, "`%s`; Clawvisor swaps in the user's vaulted upstream %s key on each\n", keyEnv, providerName)
+	fmt.Fprintf(&b, "call. This skill detects whether the user already has a vaulted upstream\n")
+	fmt.Fprintf(&b, "%s key and only walks them through vaulting if not.\n\n", providerName)
 
-	b.WriteString(sectionDashboardAnswers(ctx,
-		"LLM provider: "+providerName,
-		"Hermes configuration mode: "+ctx.HermesConfig,
-		"Hermes running mode: "+ctx.HermesMode))
+	// Step 1: auto-approved claim connect → token saved to $TOKEN_FILE.
+	b.WriteString(sectionClaimedConnect("hermes", ctx.AppURL, ctx.LLMURL, ctx.Claim, ctx.AgentName))
 
-	if ctx.HermesMode == "remote" {
-		b.WriteString(sectionHermesRemoteProbe())
-	} else {
-		b.WriteString(sectionHermesLocalProbe(ctx.HermesMode))
+	// Step 2: detect existing vaulted credential; vault one if absent.
+	b.WriteString(sectionEnsureVaultedKey(2, ctx.LLMProvider))
+
+	// Step 3: probe Hermes deployment (helper picks mode at runtime).
+	fmt.Fprintf(&b, "## 3. Probe the Hermes deployment\n\n")
+	fmt.Fprintf(&b, "Figure out where Hermes runs on this user's machine — the rest of the\n")
+	fmt.Fprintf(&b, "skill branches on the answer. Use shell commands first; ask the user only\n")
+	fmt.Fprintf(&b, "when the machine can't tell you.\n\n")
+	fmt.Fprintf(&b, "Use `docker ps` (not `docker compose ps`) for the container check — the\n")
+	fmt.Fprintf(&b, "compose form only sees containers from the current working directory's\n")
+	fmt.Fprintf(&b, "compose project, so if you're in `~/` or anywhere outside the user's\n")
+	fmt.Fprintf(&b, "compose dir it false-negatives on running containers.\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "command -v hermes >/dev/null 2>&1 && echo 'host hermes present'\n")
+	fmt.Fprintf(&b, "docker ps --format '{{.Names}}\\t{{.Image}}' 2>/dev/null | grep -i hermes\n")
+	fmt.Fprintf(&b, "test -f ~/.hermes/config.yaml && echo 'config file exists'\n")
+	fmt.Fprintf(&b, "echo \"$SHELL\"\n")
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "Pick one of three modes and remember it as `$HERMES_MODE`:\n\n")
+	fmt.Fprintf(&b, "- **host** — `hermes` is on `$PATH` on this machine.\n")
+	fmt.Fprintf(&b, "- **docker** — `docker ps` matched a running container. Capture its\n")
+	fmt.Fprintf(&b, "  exact name (first column) as `$HERMES_CONTAINER` — the rest of the\n")
+	fmt.Fprintf(&b, "  skill uses `docker exec \"$HERMES_CONTAINER\"` to run commands inside\n")
+	fmt.Fprintf(&b, "  the already-running container, which works regardless of the helper's\n")
+	fmt.Fprintf(&b, "  current directory.\n")
+	fmt.Fprintf(&b, "- **remote** — neither of the above; ask the user for an SSH host\n")
+	fmt.Fprintf(&b, "  (`user@example.com`) and store it as `$HERMES_REMOTE`. If they decline,\n")
+	fmt.Fprintf(&b, "  STOP and surface what the probe found — don't guess.\n\n")
+	fmt.Fprintf(&b, "Surface what you picked and why in chat so the user can correct you.\n\n")
+
+	// Step 4: preflight — prove the harness can reach Clawvisor from its own
+	// execution context. Covers all three modes because the helper picked at
+	// runtime.
+	fmt.Fprintf(&b, "## 4. Preflight: confirm Hermes can reach Clawvisor\n\n")
+	fmt.Fprintf(&b, "A curl from this helper's shell only proves *the helper* can reach\n")
+	fmt.Fprintf(&b, "Clawvisor — Hermes may run in a different network namespace (Docker\n")
+	fmt.Fprintf(&b, "container, remote host). Run the variant matching `$HERMES_MODE`.\n\n")
+	fmt.Fprintf(&b, "**If `$HERMES_MODE=host`:**\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "curl -fsSL -H \"X-Clawvisor-Agent-Token: $TOKEN\" \\\n")
+	fmt.Fprintf(&b, "  \"$CLAWVISOR_LLM_URL/api/skill/catalog\" >/dev/null && echo OK\n")
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "**If `$HERMES_MODE=docker`:**\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "docker exec -e CLAWVISOR_TOKEN=\"$TOKEN\" \"$HERMES_CONTAINER\" sh -c '\n")
+	fmt.Fprintf(&b, "  curl -fsSL -H \"X-Clawvisor-Agent-Token: $CLAWVISOR_TOKEN\" \\\n")
+	fmt.Fprintf(&b, "    \"%s/api/skill/catalog\" >/dev/null && echo OK\n", llmHost)
+	fmt.Fprintf(&b, "'\n")
+	fmt.Fprintf(&b, "```\n\n")
+	if strings.Contains(llmHost, "host.docker.internal") {
+		fmt.Fprintf(&b, "If `OK` doesn't appear: on Linux `host.docker.internal` doesn't resolve\n")
+		fmt.Fprintf(&b, "by default — add `--add-host=host.docker.internal:host-gateway`, or\n")
+		fmt.Fprintf(&b, "ensure Clawvisor is bound to `0.0.0.0` (not `127.0.0.1`).\n\n")
 	}
+	fmt.Fprintf(&b, "**If `$HERMES_MODE=remote`:**\n\n")
+	fmt.Fprintf(&b, "Define a remote-reachable base URL once (the dashboard rendered\n")
+	fmt.Fprintf(&b, "`%s`; if that's localhost, replace it with a relay, public, VPN, or\n", ctx.LLMURL)
+	fmt.Fprintf(&b, "LAN URL the remote host can reach):\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "export HERMES_CLAWVISOR_URL='<remote-reachable Clawvisor URL>'\n")
+	fmt.Fprintf(&b, "ssh \"$HERMES_REMOTE\" \"curl -fsSL \\\n")
+	fmt.Fprintf(&b, "  -H 'X-Clawvisor-Agent-Token: $TOKEN' \\\n")
+	fmt.Fprintf(&b, "  '$HERMES_CLAWVISOR_URL/api/skill/catalog' >/dev/null && echo OK\"\n")
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "Don't proceed past this step until preflight returns `OK`. Wrong URL\n")
+	fmt.Fprintf(&b, "now means Hermes can't reach Clawvisor after configure bakes the URL in.\n\n")
 
-	b.WriteString(sectionHermesPreflight(ctx.HermesMode, ctx.LLMURL, ctx.AgentName))
+	// Step 5: configure. Ask user env vs file; emit per-mode snippets.
+	fmt.Fprintf(&b, "## 5. Configure Hermes\n\n")
+	fmt.Fprintf(&b, "Ask the user once:\n\n")
+	fmt.Fprintf(&b, "> Should I configure Hermes via **environment variables on each launch**\n")
+	fmt.Fprintf(&b, "> (recommended — clean, no persistent state) or via a **persistent\n")
+	fmt.Fprintf(&b, "> `~/.hermes/config.yaml`** (set-and-forget)? Default is env.\n\n")
+	fmt.Fprintf(&b, "Remember the answer as `$HERMES_CONFIG` (`env` or `file`).\n\n")
+	fmt.Fprintf(&b, "### 5.a. Env-var snippets (when `$HERMES_CONFIG=env`)\n\n")
+	fmt.Fprintf(&b, "**host:**\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "%s=%s%s \\\n", baseEnv, ctx.LLMURL, basePath)
+	fmt.Fprintf(&b, "%s=\"$TOKEN\" \\\n", keyEnv)
+	fmt.Fprintf(&b, "hermes chat\n")
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "Optional ergonomic alias (`hermes-cv`) — append to the user's shell rc:\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "case \"$SHELL\" in\n")
+	fmt.Fprintf(&b, "  */zsh)  RC=~/.zshrc ;;\n")
+	fmt.Fprintf(&b, "  */bash) RC=~/.bashrc ;;\n")
+	fmt.Fprintf(&b, "  *)      RC=\"\"; echo \"unknown shell: $SHELL — append manually\" ;;\n")
+	fmt.Fprintf(&b, "esac\n")
+	fmt.Fprintf(&b, "if [ -n \"$RC\" ]; then\n")
+	fmt.Fprintf(&b, "  CONTENT=$(cat <<EOF\n")
+	fmt.Fprintf(&b, "hermes-cv() {\n")
+	fmt.Fprintf(&b, "  %s=%s%s \\\\\n", baseEnv, ctx.LLMURL, basePath)
+	fmt.Fprintf(&b, "  %s=\\$(jq -r .token \\$HOME/.clawvisor/agents/%s.json) \\\\\n", keyEnv, ctx.AgentName)
+	fmt.Fprintf(&b, "  hermes \"\\$@\"\n")
+	fmt.Fprintf(&b, "}\n")
+	fmt.Fprintf(&b, "EOF\n")
+	fmt.Fprintf(&b, "  )\n")
+	b.WriteString(recordTextDiff("hermes_cv", `"$RC"`))
+	fmt.Fprintf(&b, "fi\n")
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "**docker:**\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "docker exec -it \\\n")
+	fmt.Fprintf(&b, "  -e %s=\"%s%s\" \\\n", baseEnv, llmHost, basePath)
+	fmt.Fprintf(&b, "  -e %s=\"$TOKEN\" \\\n", keyEnv)
+	fmt.Fprintf(&b, "  \"$HERMES_CONTAINER\" hermes chat\n")
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "**remote:**\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "ssh \"$HERMES_REMOTE\" \"%s='$HERMES_CLAWVISOR_URL%s' %s='$TOKEN' hermes chat\"\n", baseEnv, basePath, keyEnv)
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "### 5.b. Config-file snippets (when `$HERMES_CONFIG=file`)\n\n")
+	fmt.Fprintf(&b, "The config bakes the current token in. If the user re-runs setup, the\n")
+	fmt.Fprintf(&b, "token rotates and the file must be re-written.\n\n")
+	fmt.Fprintf(&b, "**host:**\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "mkdir -p ~/.hermes && cat > ~/.hermes/config.yaml <<EOF\n")
+	fmt.Fprintf(&b, "model:\n")
+	fmt.Fprintf(&b, "  provider: custom\n")
+	fmt.Fprintf(&b, "  base_url: \"%s%s\"\n", ctx.LLMURL, basePath)
+	fmt.Fprintf(&b, "  api_key: \"$TOKEN\"\n")
+	fmt.Fprintf(&b, "EOF\n")
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "**docker:** same content, but write the host's `~/.hermes/config.yaml`\n")
+	fmt.Fprintf(&b, "(must be mounted into the container, commonly at `/root/.hermes`) with\n")
+	fmt.Fprintf(&b, "`base_url: \"%s%s\"`.\n\n", llmHost, basePath)
+	fmt.Fprintf(&b, "**remote:**\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "ssh \"$HERMES_REMOTE\" \"mkdir -p ~/.hermes && cat > ~/.hermes/config.yaml\" <<EOF\n")
+	fmt.Fprintf(&b, "model:\n")
+	fmt.Fprintf(&b, "  provider: custom\n")
+	fmt.Fprintf(&b, "  base_url: \"$HERMES_CLAWVISOR_URL%s\"\n", basePath)
+	fmt.Fprintf(&b, "  api_key: \"$TOKEN\"\n")
+	fmt.Fprintf(&b, "EOF\n")
+	fmt.Fprintf(&b, "```\n\n")
 
-	// Step 3: Configure (mode-aware).
-	fmt.Fprintf(&b, "## 3. Configure Hermes\n\n")
-	if ctx.HermesConfig == "file" {
-		fmt.Fprintf(&b, "The user chose the persistent config-file path. Prefer the snippet that\n")
-		fmt.Fprintf(&b, "writes `~/.hermes/config.yaml`; the env-var snippet is here as a fallback.\n\n")
-	} else {
-		fmt.Fprintf(&b, "The user chose the env-var launch path. Prefer the env-var snippet; the\n")
-		fmt.Fprintf(&b, "config-file snippet is here as a fallback for set-and-forget setups.\n\n")
-	}
-
-	switch ctx.HermesMode {
-	case "docker":
-		basePathHost := dockerHostURL(ctx.LLMURL) + basePath
-		fmt.Fprintf(&b, "**Env-var (recommended) — pass the token into the container at run time:**\n\n")
-		fmt.Fprintf(&b, "```bash\n")
-		fmt.Fprintf(&b, "TOKEN=$(jq -r .token ~/.clawvisor/agents/%s.json)\n", ctx.AgentName)
-		fmt.Fprintf(&b, "docker compose run --rm \\\n")
-		fmt.Fprintf(&b, "  -e %s=\"%s\" \\\n", baseEnv, basePathHost)
-		fmt.Fprintf(&b, "  -e %s=\"$TOKEN\" \\\n", keyEnv)
-		fmt.Fprintf(&b, "  hermes hermes chat\n")
-		fmt.Fprintf(&b, "```\n\n")
-		fmt.Fprintf(&b, "Replace `hermes` (the compose service name) with whatever the probe in\n")
-		fmt.Fprintf(&b, "step 1 found.\n\n")
-		fmt.Fprintf(&b, "**Config file (persistent) — write to a host path mounted into the container:**\n\n")
-		fmt.Fprintf(&b, "```bash\n")
-		fmt.Fprintf(&b, "TOKEN=$(jq -r .token ~/.clawvisor/agents/%s.json)\n", ctx.AgentName)
-		fmt.Fprintf(&b, "mkdir -p ~/.hermes && cat > ~/.hermes/config.yaml <<EOF\n")
-		fmt.Fprintf(&b, "model:\n")
-		fmt.Fprintf(&b, "  provider: custom\n")
-		fmt.Fprintf(&b, "  base_url: \"%s\"\n", basePathHost)
-		fmt.Fprintf(&b, "  api_key: \"$TOKEN\"\n")
-		fmt.Fprintf(&b, "EOF\n")
-		fmt.Fprintf(&b, "```\n\n")
-		fmt.Fprintf(&b, "Make sure `~/.hermes` is mounted into the container at the path Hermes\n")
-		fmt.Fprintf(&b, "reads from (commonly `/root/.hermes`) via a `volumes:` entry in\n")
-		fmt.Fprintf(&b, "docker-compose.yaml. The probe in step 1 should have surfaced the existing\n")
-		fmt.Fprintf(&b, "mount.\n\n")
-	case "remote":
-		fmt.Fprintf(&b, "Reuse `$HERMES_REMOTE` from the probe and `$HERMES_CLAWVISOR_URL` from\n")
-		fmt.Fprintf(&b, "the preflight (already proved reachable from `$HERMES_REMOTE`). The\n")
-		fmt.Fprintf(&b, "launch wrapper appends `%s` for the %s base URL.\n\n", basePath, providerName)
-		fmt.Fprintf(&b, "```bash\n")
-		fmt.Fprintf(&b, "TOKEN=$(jq -r .token ~/.clawvisor/agents/%s.json)\n", ctx.AgentName)
-		fmt.Fprintf(&b, "```\n\n")
-		fmt.Fprintf(&b, "**Env-var (recommended) — wrap each launch with the SSH call:**\n\n")
-		fmt.Fprintf(&b, "```bash\n")
-		fmt.Fprintf(&b, "ssh \"$HERMES_REMOTE\" \"%s='$HERMES_CLAWVISOR_URL%s' %s='$TOKEN' hermes chat\"\n", baseEnv, basePath, keyEnv)
-		fmt.Fprintf(&b, "```\n\n")
-		fmt.Fprintf(&b, "**Config file (persistent) — write to the remote's `~/.hermes/config.yaml`:**\n\n")
-		fmt.Fprintf(&b, "```bash\n")
-		fmt.Fprintf(&b, "ssh \"$HERMES_REMOTE\" \"mkdir -p ~/.hermes && cat > ~/.hermes/config.yaml\" <<EOF\n")
-		fmt.Fprintf(&b, "model:\n")
-		fmt.Fprintf(&b, "  provider: custom\n")
-		fmt.Fprintf(&b, "  base_url: \"$HERMES_CLAWVISOR_URL%s\"\n", basePath)
-		fmt.Fprintf(&b, "  api_key: \"$TOKEN\"\n")
-		fmt.Fprintf(&b, "EOF\n")
-		fmt.Fprintf(&b, "```\n\n")
-		fmt.Fprintf(&b, "Re-bootstrapping rotates the token; if you took the config-file path the\n")
-		fmt.Fprintf(&b, "user must re-run this snippet after each rotation.\n\n")
-	default: // host
-		fmt.Fprintf(&b, "**Env-var (recommended):**\n\n")
-		fmt.Fprintf(&b, "```bash\n")
-		fmt.Fprintf(&b, "%s=%s%s \\\n", baseEnv, ctx.LLMURL, basePath)
-		fmt.Fprintf(&b, "%s=$(jq -r .token ~/.clawvisor/agents/%s.json) \\\n", keyEnv, ctx.AgentName)
-		fmt.Fprintf(&b, "hermes chat\n")
-		fmt.Fprintf(&b, "```\n\n")
-		fmt.Fprintf(&b, "**Config file (persistent):**\n\n")
-		fmt.Fprintf(&b, "```bash\n")
-		fmt.Fprintf(&b, "mkdir -p ~/.hermes && cat > ~/.hermes/config.yaml <<EOF\n")
-		fmt.Fprintf(&b, "model:\n")
-		fmt.Fprintf(&b, "  provider: custom\n")
-		fmt.Fprintf(&b, "  base_url: \"%s%s\"\n", ctx.LLMURL, basePath)
-		fmt.Fprintf(&b, "  api_key: \"$(jq -r .token ~/.clawvisor/agents/%s.json)\"\n", ctx.AgentName)
-		fmt.Fprintf(&b, "EOF\n")
-		fmt.Fprintf(&b, "```\n\n")
-		fmt.Fprintf(&b, "The config-file path bakes the current token into the file; re-bootstrapping\n")
-		fmt.Fprintf(&b, "the same agent rotates the token and the user must re-run this snippet.\n\n")
-	}
-
-	// Step 4: shell alias — only really useful on the host (the user's
-	// terminal *is* the launch environment). Skip for docker/remote where the
-	// launch wrapper is more involved than an alias.
-	if ctx.HermesMode == "host" {
-		fmt.Fprintf(&b, "## 4. Offer a shell alias\n\n")
-		fmt.Fprintf(&b, "If they went the env-var route, a shell function keeps it ergonomic:\n\n")
-		fmt.Fprintf(&b, "```bash\n")
-		fmt.Fprintf(&b, "cat >> ~/.zshrc <<'EOF'\n")
-		fmt.Fprintf(&b, "hermes-cv() {\n")
-		fmt.Fprintf(&b, "  %s=%s%s \\\n", baseEnv, ctx.LLMURL, basePath)
-		fmt.Fprintf(&b, "  %s=$(jq -r .token ~/.clawvisor/agents/%s.json) \\\n", keyEnv, ctx.AgentName)
-		fmt.Fprintf(&b, "  hermes \"$@\"\n")
-		fmt.Fprintf(&b, "}\n")
-		fmt.Fprintf(&b, "EOF\n")
-		fmt.Fprintf(&b, "```\n\n")
-		fmt.Fprintf(&b, "Hermes doesn't ship a documented bypass-prompts flag — skip the YOLO\n")
-		fmt.Fprintf(&b, "question unless the user volunteers one they know about.\n\n")
-	}
-
-	// Renumber the trailing sections: with the alias step skipped for
-	// docker/remote the uninstall/self-uninstall sections move up.
-	uninstallStep := 5
-	selfUninstallStep := 6
-	if ctx.HermesMode != "host" {
-		uninstallStep = 4
-		selfUninstallStep = 5
-	}
-
+	// Step 6: uninstall reference doc.
 	b.WriteString(sectionUninstallDoc("hermes", `1. Remove the `+"`model:`"+` block from `+"`~/.hermes/config.yaml`"+` (or unset `+"`"+baseEnv+"`"+`/`+"`"+keyEnv+"`"+` if you used env vars).
-2. Remove the alias from your shell rc file if you added one.
+2. Remove the `+"`hermes-cv`"+` function from your shell rc if you added one (diff record in `+"`~/.clawvisor/diffs/"+ctx.AgentName+"/hermes_cv.json`"+`).
 3. Delete the token file: `+"`rm ~/.clawvisor/agents/"+ctx.AgentName+".json`"+`.
 4. Revoke the agent in the Clawvisor dashboard under Agents → `+ctx.AgentName+` → Delete.
 5. Optional: remove the user-level `+providerName+` key from Clawvisor credentials if no other agents use it.
-`, uninstallStep))
+`, 6))
 
-	b.WriteString(sectionSelfUninstall("hermes", helperInstallerCleanupCommands(), selfUninstallStep))
+	// Step 7: self-uninstall — remove this setup skill from the helper.
+	b.WriteString(sectionSelfUninstall("hermes", helperSetupCleanupCommands(), 7))
 
 	return b.String()
 }
 
-func sectionHermesLocalProbe(mode string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "## 1. Probe the Hermes deployment\n\n")
-	fmt.Fprintf(&b, "Before configuring, learn how Hermes runs on this machine. Use shell\n")
-	fmt.Fprintf(&b, "commands when the machine knows; ask the user when it doesn't. The\n")
-	fmt.Fprintf(&b, "answers from the dashboard are a starting hint, not the source of truth.\n\n")
-	fmt.Fprintf(&b, "Determine:\n\n")
-	if mode == "docker" {
-		fmt.Fprintf(&b, "- **Compose context** — confirm the compose service name for hermes\n")
-		fmt.Fprintf(&b, "  (commonly `hermes`), the compose project directory, and any existing\n")
-		fmt.Fprintf(&b, "  volume mount that exposes the host's `~/.hermes` to the container.\n")
-		fmt.Fprintf(&b, "- **Host fallback** — if it turns out hermes runs directly on the host,\n")
-		fmt.Fprintf(&b, "  use the host commands in step 3.\n")
-	} else {
-		fmt.Fprintf(&b, "- **Host command** — confirm `hermes` is on `$PATH` on this machine.\n")
-		fmt.Fprintf(&b, "- **Docker fallback** — if hermes is actually containerized (look for\n")
-		fmt.Fprintf(&b, "  `docker compose ps` entries or images named `hermes*`), use the\n")
-		fmt.Fprintf(&b, "  Docker snippet in step 3 instead.\n")
-	}
-	fmt.Fprintf(&b, "- **Existing config** — if `~/.hermes/config.yaml` already exists, surface\n")
-	fmt.Fprintf(&b, "  its `model:` block to the user so they can confirm what we're replacing.\n")
-	fmt.Fprintf(&b, "- **Shell** — zsh, bash, or fish, only if you'll save a convenience alias.\n\n")
-	// The dashboard's bootstrap script already minted the connection request
-	// (carrying its own install_context from the dashboard answers), so
-	// there's no second mint call this skill could attach a probed
-	// install_context to. Surface what you learned in chat; don't bother
-	// building a JSON object.
-	return b.String()
-}
-
-func sectionHermesRemoteProbe() string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "## 1. Confirm remote Hermes access\n\n")
-	fmt.Fprintf(&b, "The user selected **remote host** in the dashboard. Do **not** probe the\n")
-	fmt.Fprintf(&b, "local machine for hermes; that would inspect the helper agent's machine,\n")
-	fmt.Fprintf(&b, "not the Hermes host.\n\n")
-	fmt.Fprintf(&b, "Ask the user for the remote access details and keep them in shell\n")
-	fmt.Fprintf(&b, "variables for the commands below:\n\n")
-	fmt.Fprintf(&b, "```bash\n")
-	fmt.Fprintf(&b, "export HERMES_REMOTE='<ssh host, for example user@example.com>'\n")
-	fmt.Fprintf(&b, "```\n\n")
-	fmt.Fprintf(&b, "If SSH is unavailable, do not invent local commands. Give the user the\n")
-	fmt.Fprintf(&b, "remote commands from later steps to run on the Hermes host and ask them\n")
-	fmt.Fprintf(&b, "to paste back any output or errors.\n\n")
-	fmt.Fprintf(&b, "Verify how hermes is run on the remote host:\n\n")
-	fmt.Fprintf(&b, "```bash\n")
-	fmt.Fprintf(&b, "ssh \"$HERMES_REMOTE\" 'uname -s; command -v hermes || true; docker compose ps 2>/dev/null | grep -i hermes || true; test -f ~/.hermes/config.yaml && echo \"config exists\"'\n")
-	fmt.Fprintf(&b, "```\n\n")
-	fmt.Fprintf(&b, "Surface the install mode (remote), the OS, and the launch shape to the\n")
-	fmt.Fprintf(&b, "user in chat. The dashboard's bootstrap script already minted the\n")
-	fmt.Fprintf(&b, "connection request — there's no second mint call this skill could\n")
-	fmt.Fprintf(&b, "attach an install_context to.\n\n")
-	return b.String()
-}
-
-// sectionHermesPreflight mirrors sectionOpenClawPreflight — proves Hermes can
-// reach Clawvisor from the environment Hermes actually runs in, before step 3
-// writes the URL into Hermes's launch wrapper or config.yaml.
-func sectionHermesPreflight(mode, clawvisorURL, agentName string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "## 2. Preflight: confirm Hermes can reach Clawvisor\n\n")
-	fmt.Fprintf(&b, "Before writing Hermes's launch wrapper or `config.yaml`, prove Hermes\n")
-	fmt.Fprintf(&b, "can actually reach Clawvisor *from the environment Hermes runs in*.\n")
-	fmt.Fprintf(&b, "A curl from this helper's shell only proves the helper can reach\n")
-	fmt.Fprintf(&b, "Clawvisor — that may be a different machine (Docker container, remote\n")
-	fmt.Fprintf(&b, "host) than where Hermes will run.\n\n")
-
-	if mode == "remote" {
-		fmt.Fprintf(&b, "Remote Hermes — define the base Clawvisor URL once here (step 3\n")
-		fmt.Fprintf(&b, "reuses it for the launch wrapper / `config.yaml`), then SSH into the\n")
-		fmt.Fprintf(&b, "host and curl `/api/skill/catalog`:\n\n")
-		fmt.Fprintf(&b, "```bash\n")
-		fmt.Fprintf(&b, "# The dashboard rendered `%s`; if that's localhost replace it with a\n", clawvisorURL)
-		fmt.Fprintf(&b, "# relay, public, VPN, or LAN URL reachable from `$HERMES_REMOTE`.\n")
-		fmt.Fprintf(&b, "# This is the *base* URL (no `/api` or `/api/v1` path); step 3 appends\n")
-		fmt.Fprintf(&b, "# the right per-provider suffix when writing Hermes's config.\n")
-		fmt.Fprintf(&b, "export HERMES_CLAWVISOR_URL='<remote-reachable Clawvisor URL>'\n")
-		fmt.Fprintf(&b, "TOKEN=$(jq -r .token ~/.clawvisor/agents/%s.json)\n", agentName)
-		fmt.Fprintf(&b, "ssh \"$HERMES_REMOTE\" \"curl -fsSL \\\n")
-		fmt.Fprintf(&b, "  -H 'X-Clawvisor-Agent-Token: $TOKEN' \\\n")
-		fmt.Fprintf(&b, "  '$HERMES_CLAWVISOR_URL/api/skill/catalog' >/dev/null && echo OK\"\n")
-		fmt.Fprintf(&b, "```\n\n")
-		fmt.Fprintf(&b, "If `OK` doesn't appear, the remote host can't reach Clawvisor at that\n")
-		fmt.Fprintf(&b, "URL. Pick a different `$HERMES_CLAWVISOR_URL` (relay, public, VPN, or\n")
-		fmt.Fprintf(&b, "LAN URL reachable from `$HERMES_REMOTE`) and try again — don't proceed\n")
-		fmt.Fprintf(&b, "to step 3 until this returns `OK`.\n\n")
-		return b.String()
-	}
-
-	fmt.Fprintf(&b, "If Hermes runs directly on this host, a curl from this shell tests\n")
-	fmt.Fprintf(&b, "the same URL Hermes will use:\n\n")
-	fmt.Fprintf(&b, "```bash\n")
-	fmt.Fprintf(&b, "TOKEN=$(jq -r .token ~/.clawvisor/agents/%s.json) && \\\n", agentName)
-	fmt.Fprintf(&b, "  curl -fsSL -H \"X-Clawvisor-Agent-Token: $TOKEN\" \\\n")
-	fmt.Fprintf(&b, "    \"%s/api/skill/catalog\" >/dev/null && echo OK\n", clawvisorURL)
-	fmt.Fprintf(&b, "```\n\n")
-	fmt.Fprintf(&b, "If Hermes runs in Docker on this host — or step 1 found a compose\n")
-	fmt.Fprintf(&b, "context — run the curl inside the same compose context so the URL is\n")
-	fmt.Fprintf(&b, "resolved from inside the container (replace `hermes` with the service\n")
-	fmt.Fprintf(&b, "name the probe found):\n\n")
-	fmt.Fprintf(&b, "```bash\n")
-	fmt.Fprintf(&b, "TOKEN=$(jq -r .token ~/.clawvisor/agents/%s.json)\n", agentName)
-	fmt.Fprintf(&b, "docker compose run --rm \\\n")
-	fmt.Fprintf(&b, "  -e CLAWVISOR_TOKEN=\"$TOKEN\" \\\n")
-	fmt.Fprintf(&b, "  hermes sh -c '\n")
-	fmt.Fprintf(&b, "    curl -fsSL -H \"X-Clawvisor-Agent-Token: $CLAWVISOR_TOKEN\" \\\n")
-	fmt.Fprintf(&b, "      \"%s/api/skill/catalog\" >/dev/null && echo OK\n", dockerHostURL(clawvisorURL))
-	fmt.Fprintf(&b, "  '\n")
-	fmt.Fprintf(&b, "```\n\n")
-	if strings.Contains(dockerHostURL(clawvisorURL), "host.docker.internal") {
-		fmt.Fprintf(&b, "If `OK` doesn't appear from the container: on Linux\n")
-		fmt.Fprintf(&b, "`host.docker.internal` doesn't resolve by default — add\n")
-		fmt.Fprintf(&b, "`--add-host=host.docker.internal:host-gateway` to the docker command,\n")
-		fmt.Fprintf(&b, "or check that Clawvisor is bound to `0.0.0.0` (not `127.0.0.1`) so the\n")
-		fmt.Fprintf(&b, "container can reach it. Fix and re-run before step 3.\n\n")
-	} else {
-		fmt.Fprintf(&b, "If `OK` doesn't appear from the container, the container can't reach\n")
-		fmt.Fprintf(&b, "`%s` — check firewall / network policies, or pick a URL the\n", dockerHostURL(clawvisorURL))
-		fmt.Fprintf(&b, "container can reach (`Server.PublicURL` / lite-proxy public URL in\n")
-		fmt.Fprintf(&b, "Clawvisor settings) and reload. Fix and re-run before step 3.\n\n")
-	}
-	return b.String()
-}
 
 func renderOpenClawInstaller(ctx installerCtx) string {
 	var b strings.Builder
 	providerName := installerProviderDisplayName(ctx.LLMProvider)
-	b.WriteString(installerFrontmatter("OpenClaw"))
-	fmt.Fprintf(&b, "# Connect OpenClaw to Clawvisor\n\n")
-	fmt.Fprintf(&b, "You are walking the user through connecting an OpenClaw instance to a\n")
-	fmt.Fprintf(&b, "running Clawvisor at `%s`. The setup is intentionally simple: point\n", ctx.AppURL)
-	fmt.Fprintf(&b, "OpenClaw's LLM base URL at Clawvisor's %s-compatible endpoint and\n", providerName)
-	fmt.Fprintf(&b, "use the minted Clawvisor agent token as the custom API key. This skill is\n")
-	fmt.Fprintf(&b, "one-shot. The dashboard step before this skill collects the user's upstream\n")
-	fmt.Fprintf(&b, "%s API key so Clawvisor can forward OpenClaw's model calls.\n\n", providerName)
-	fmt.Fprintf(&b, "The agent token has **already been minted** by the dashboard's bootstrap\n")
-	fmt.Fprintf(&b, "script and saved to `~/.clawvisor/agents/%s.json`. Do not re-mint;\n", ctx.AgentName)
-	fmt.Fprintf(&b, "the configure step below reads the token from disk.\n\n")
-	fmt.Fprintf(&b, "Set the endpoints (control plane vs. LLM proxy — separate hosts in\n")
-	fmt.Fprintf(&b, "split deployments):\n\n```bash\nexport CLAWVISOR_APP_URL=%s\nexport CLAWVISOR_LLM_URL=%s\n```\n\n", ctx.AppURL, ctx.LLMURL)
-	b.WriteString(sectionDashboardAnswers(ctx, "LLM provider: "+providerName, "OpenClaw running mode: "+ctx.OpenClawMode))
-
-	if ctx.OpenClawMode == "remote" {
-		b.WriteString(sectionOpenClawRemoteProbe(ctx.LLMProvider))
-	} else {
-		b.WriteString(sectionOpenClawLocalProbe(ctx.OpenClawMode, ctx.LLMProvider))
-	}
-
-	b.WriteString(sectionOpenClawPreflight(ctx.OpenClawMode, ctx.LLMURL, ctx.AgentName))
-
-	if ctx.OpenClawMode == "remote" {
-		b.WriteString(sectionOpenClawRemoteConfigure(ctx.LLMURL, ctx.LLMProvider, ctx.AgentName))
-	} else {
-		b.WriteString(sectionOpenClawLocalConfigure(ctx.LLMURL, ctx.LLMProvider, ctx.AgentName))
-	}
-
-	b.WriteString(sectionUninstallDoc("openclaw", `1. Re-run OpenClaw onboarding and choose your previous non-Clawvisor provider/base URL.
-2. Delete the token file: `+"`rm ~/.clawvisor/agents/"+ctx.AgentName+".json`"+`.
-3. Revoke the agent in the Clawvisor dashboard under Agents → `+ctx.AgentName+` → Delete.
-`, 4))
-
-	b.WriteString(sectionSelfUninstall("openclaw", helperInstallerCleanupCommands(), 5))
-
-	return b.String()
-}
-
-func sectionOpenClawLocalProbe(mode, provider string) string {
-	var b strings.Builder
-	model := providerDefaultModel(provider)
-	providerName := installerProviderDisplayName(provider)
-	fmt.Fprintf(&b, "## 1. Confirm how to run OpenClaw onboarding\n\n")
-	fmt.Fprintf(&b, "Do not install extra OpenClaw components. Only determine how the user runs\n")
-	fmt.Fprintf(&b, "OpenClaw's existing onboarding command.\n\n")
-	fmt.Fprintf(&b, "Determine:\n\n")
-	if mode == "docker" {
-		fmt.Fprintf(&b, "- **Docker command** — confirm the compose service/working directory for `openclaw-cli`.\n")
-	} else {
-		fmt.Fprintf(&b, "- **Host command** — confirm `openclaw-cli` is available on this machine.\n")
-		fmt.Fprintf(&b, "- **Docker fallback** — if OpenClaw is actually containerized, use the Docker command in Step 4 instead.\n")
-	}
-	fmt.Fprintf(&b, "- **Model id** — default to `%s` unless the user prefers another Clawvisor-routed %s model.\n", model, providerName)
-	fmt.Fprintf(&b, "- **Shell** — zsh, bash, or fish, only if you need to save a convenience command.\n\n")
-	// The dashboard's bootstrap script already minted the connection request
-	// carrying its own install_context (harness + mode). Don't assemble a
-	// second JSON object here — there's no second mint call this skill could
-	// attach it to.
-	return b.String()
-}
-
-func sectionOpenClawRemoteProbe(provider string) string {
-	var b strings.Builder
-	model := providerDefaultModel(provider)
-	fmt.Fprintf(&b, "## 1. Confirm remote OpenClaw access\n\n")
-	fmt.Fprintf(&b, "The user selected **remote host** in the dashboard. Do **not** probe the\n")
-	fmt.Fprintf(&b, "local machine for OpenClaw files or Docker containers;\n")
-	fmt.Fprintf(&b, "that would inspect the helper agent's machine, not the OpenClaw host.\n\n")
-	fmt.Fprintf(&b, "Ask the user for the remote access details you need, then keep them in\n")
-	fmt.Fprintf(&b, "shell variables for the commands below:\n\n")
-	fmt.Fprintf(&b, "```bash\n")
-	fmt.Fprintf(&b, "export OPENCLAW_REMOTE='<ssh host, for example user@example.com>'\n")
-	fmt.Fprintf(&b, "export OPENCLAW_WORKSPACE='~/.openclaw/workspace'\n")
-	fmt.Fprintf(&b, "```\n\n")
-	fmt.Fprintf(&b, "If SSH is unavailable, do not invent local commands. Give the user the\n")
-	fmt.Fprintf(&b, "remote commands from later steps to run on the OpenClaw host and ask them\n")
-	fmt.Fprintf(&b, "to paste back any output or errors.\n\n")
-	fmt.Fprintf(&b, "Verify only how onboarding is run on the remote host:\n\n")
-	fmt.Fprintf(&b, "```bash\n")
-	fmt.Fprintf(&b, "ssh \"$OPENCLAW_REMOTE\" 'uname -s; command -v openclaw-cli || true; docker compose ps 2>/dev/null || true'\n")
-	fmt.Fprintf(&b, "```\n\n")
-	fmt.Fprintf(&b, "Surface the remote host, OS, and how onboarding runs (host CLI vs Docker)\n")
-	fmt.Fprintf(&b, "to the user in chat — they need to see what you found before step 3 SSHes\n")
-	fmt.Fprintf(&b, "in. The dashboard's bootstrap script already minted the connection\n")
-	fmt.Fprintf(&b, "request, so there's no install_context to assemble here. The model\n")
-	fmt.Fprintf(&b, "default for this provider is `%s`.\n\n", model)
-	return b.String()
-}
-
-// sectionOpenClawPreflight emits a connectivity check that runs from
-// OpenClaw's actual execution context, before the onboard command bakes
-// the Clawvisor URL into OpenClaw's config. The helper-side `curl` that
-// the shared smoke-test section uses only proves *the helper* can reach
-// Clawvisor — in docker or remote mode OpenClaw runs on a different
-// machine, so a passing helper-side curl gives a false green light and we
-// end up onboarding against a URL OpenClaw can't resolve.
-//
-// Modes:
-//
-//   - host: helper and OpenClaw share the network namespace, so a local
-//     curl against the configured Clawvisor URL is exactly what OpenClaw
-//     will see.
-//   - docker (or host-mode that turns out to be containerized): run a
-//     one-shot `docker compose run --rm` curl inside the same compose
-//     context OpenClaw uses, hitting host.docker.internal.
-//   - remote: SSH to $OPENCLAW_REMOTE (set during the probe step) and
-//     curl using the $OPENCLAW_CLAWVISOR_BASE_URL the user picked.
-//
-// For non-remote modes both the host and docker variants are emitted so
-// the helper can pick based on the probe results in step 1 — the
-// dashboard's openclaw_mode answer is just a hint, the probe is the
-// source of truth.
-func sectionOpenClawPreflight(mode, clawvisorURL, agentName string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "## 2. Preflight: confirm OpenClaw can reach Clawvisor\n\n")
-	fmt.Fprintf(&b, "Before running OpenClaw's onboarding command, prove OpenClaw can\n")
-	fmt.Fprintf(&b, "actually reach Clawvisor *from the environment OpenClaw runs in*. A\n")
-	fmt.Fprintf(&b, "curl from this helper's shell only confirms the helper can reach\n")
-	fmt.Fprintf(&b, "Clawvisor — that may be a different machine (Docker container, remote\n")
-	fmt.Fprintf(&b, "host) than where OpenClaw will run, and the onboard command in step 3\n")
-	fmt.Fprintf(&b, "bakes the URL into OpenClaw's config either way.\n\n")
-
-	if mode == "remote" {
-		fmt.Fprintf(&b, "Remote OpenClaw — define the base Clawvisor URL once here (step 3\n")
-		fmt.Fprintf(&b, "reuses it for `openclaw-cli onboard`), then SSH into the host and\n")
-		fmt.Fprintf(&b, "curl `/api/skill/catalog` from there:\n\n")
-		fmt.Fprintf(&b, "```bash\n")
-		fmt.Fprintf(&b, "# The dashboard rendered `%s`; if that's localhost replace it with a\n", clawvisorURL)
-		fmt.Fprintf(&b, "# relay, public, VPN, or LAN URL reachable from `$OPENCLAW_REMOTE`.\n")
-		fmt.Fprintf(&b, "# This is the *base* URL (no `/api/v1` path); the onboard step in 3\n")
-		fmt.Fprintf(&b, "# appends `/api/v1` for OpenClaw's custom-provider config.\n")
-		fmt.Fprintf(&b, "export OPENCLAW_CLAWVISOR_URL='<remote-reachable Clawvisor URL>'\n")
-		fmt.Fprintf(&b, "TOKEN=$(jq -r .token ~/.clawvisor/agents/%s.json)\n", agentName)
-		fmt.Fprintf(&b, "ssh \"$OPENCLAW_REMOTE\" \"curl -fsSL \\\n")
-		fmt.Fprintf(&b, "  -H 'X-Clawvisor-Agent-Token: $TOKEN' \\\n")
-		fmt.Fprintf(&b, "  '$OPENCLAW_CLAWVISOR_URL/api/skill/catalog' >/dev/null && echo OK\"\n")
-		fmt.Fprintf(&b, "```\n\n")
-		fmt.Fprintf(&b, "If `OK` doesn't appear, the remote host can't reach Clawvisor at that\n")
-		fmt.Fprintf(&b, "URL. Pick a different `$OPENCLAW_CLAWVISOR_URL` (relay, public, VPN, or\n")
-		fmt.Fprintf(&b, "LAN URL reachable from `$OPENCLAW_REMOTE`) and try again — don't proceed\n")
-		fmt.Fprintf(&b, "to step 3 until this returns `OK`.\n\n")
-		return b.String()
-	}
-
-	fmt.Fprintf(&b, "If OpenClaw runs directly on this host, a curl from this shell tests\n")
-	fmt.Fprintf(&b, "the same URL OpenClaw will use:\n\n")
-	fmt.Fprintf(&b, "```bash\n")
-	fmt.Fprintf(&b, "TOKEN=$(jq -r .token ~/.clawvisor/agents/%s.json) && \\\n", agentName)
-	fmt.Fprintf(&b, "  curl -fsSL -H \"X-Clawvisor-Agent-Token: $TOKEN\" \\\n")
-	fmt.Fprintf(&b, "    \"%s/api/skill/catalog\" >/dev/null && echo OK\n", clawvisorURL)
-	fmt.Fprintf(&b, "```\n\n")
-	fmt.Fprintf(&b, "If OpenClaw runs in Docker on this host — or step 1 found a compose\n")
-	fmt.Fprintf(&b, "context — run the curl inside the same compose context so the URL is\n")
-	fmt.Fprintf(&b, "resolved from inside the container (replace `openclaw-cli` with the\n")
-	fmt.Fprintf(&b, "service name the probe found):\n\n")
-	fmt.Fprintf(&b, "```bash\n")
-	fmt.Fprintf(&b, "TOKEN=$(jq -r .token ~/.clawvisor/agents/%s.json)\n", agentName)
-	fmt.Fprintf(&b, "docker compose run --rm \\\n")
-	fmt.Fprintf(&b, "  -e CLAWVISOR_TOKEN=\"$TOKEN\" \\\n")
-	fmt.Fprintf(&b, "  openclaw-cli sh -c '\n")
-	fmt.Fprintf(&b, "    curl -fsSL -H \"X-Clawvisor-Agent-Token: $CLAWVISOR_TOKEN\" \\\n")
-	fmt.Fprintf(&b, "      \"%s/api/skill/catalog\" >/dev/null && echo OK\n", dockerHostURL(clawvisorURL))
-	fmt.Fprintf(&b, "  '\n")
-	fmt.Fprintf(&b, "```\n\n")
-	if strings.Contains(dockerHostURL(clawvisorURL), "host.docker.internal") {
-		fmt.Fprintf(&b, "If `OK` doesn't appear from the container: on Linux\n")
-		fmt.Fprintf(&b, "`host.docker.internal` doesn't resolve by default — add\n")
-		fmt.Fprintf(&b, "`--add-host=host.docker.internal:host-gateway` to the docker command,\n")
-		fmt.Fprintf(&b, "or check that Clawvisor is bound to `0.0.0.0` (not `127.0.0.1`) so the\n")
-		fmt.Fprintf(&b, "container can reach it. Fix and re-run before step 3.\n\n")
-	} else {
-		fmt.Fprintf(&b, "If `OK` doesn't appear from the container, the container can't reach\n")
-		fmt.Fprintf(&b, "`%s` — check firewall / network policies, or pick a URL the\n", dockerHostURL(clawvisorURL))
-		fmt.Fprintf(&b, "container can reach (`Server.PublicURL` / lite-proxy public URL in\n")
-		fmt.Fprintf(&b, "Clawvisor settings) and reload. Fix and re-run before step 3.\n\n")
-	}
-	return b.String()
-}
-
-func sectionOpenClawLocalConfigure(clawvisorURL, provider, agentName string) string {
-	var b strings.Builder
 	basePath := "/api/v1"
-	model := providerDefaultModel(provider)
-	contextWindow := providerDefaultContextWindow(provider)
+	model := providerDefaultModel(ctx.LLMProvider)
+	contextWindow := providerDefaultContextWindow(ctx.LLMProvider)
 	maxTokens := openClawDefaultMaxTokens()
-	fmt.Fprintf(&b, "## 3. Point OpenClaw at Clawvisor\n\n")
-	fmt.Fprintf(&b, "Read the agent token that the bootstrap script saved on disk, then run\n")
-	fmt.Fprintf(&b, "OpenClaw's onboarding command and select a custom API key provider.\n")
-	fmt.Fprintf(&b, "Use Clawvisor's %s-compatible base URL and the saved `cvis_...`\n", installerProviderDisplayName(provider))
-	fmt.Fprintf(&b, "agent token. The Docker variant below uses `%s%s`, which is the\n", dockerHostURL(clawvisorURL), basePath)
-	fmt.Fprintf(&b, "host-reachable URL for this deployment (`host.docker.internal` substituted\n")
-	fmt.Fprintf(&b, "in when the dashboard URL resolves to localhost).\n\n")
+	llmHost := dockerHostURL(ctx.LLMURL)
+	b.WriteString(setupFrontmatter("OpenClaw"))
+	fmt.Fprintf(&b, "# Connect OpenClaw to Clawvisor\n\n")
+	fmt.Fprintf(&b, "You are running a one-shot setup skill. The dashboard pre-baked the\n")
+	fmt.Fprintf(&b, "Clawvisor URL, a single-use claim code, and the agent name into this file.\n")
+	fmt.Fprintf(&b, "The dashboard already approved the connection — no second click is needed.\n\n")
+	fmt.Fprintf(&b, "OpenClaw points its LLM base URL at Clawvisor's %s-compatible endpoint\n", providerName)
+	fmt.Fprintf(&b, "and uses the minted Clawvisor agent token as the custom API key. This\n")
+	fmt.Fprintf(&b, "skill detects whether the user already has a vaulted upstream %s key\n", providerName)
+	fmt.Fprintf(&b, "and only walks them through vaulting if not.\n\n")
+
+	// Step 1: auto-approved claim connect → token saved to $TOKEN_FILE.
+	b.WriteString(sectionClaimedConnect("openclaw", ctx.AppURL, ctx.LLMURL, ctx.Claim, ctx.AgentName))
+
+	// Step 2: detect existing vaulted credential; vault one if absent.
+	b.WriteString(sectionEnsureVaultedKey(2, ctx.LLMProvider))
+
+	// Step 3: probe — helper picks mode at runtime.
+	fmt.Fprintf(&b, "## 3. Probe the OpenClaw deployment\n\n")
+	fmt.Fprintf(&b, "Figure out how the user runs OpenClaw's onboarding command. Don't install\n")
+	fmt.Fprintf(&b, "extra OpenClaw components — just learn enough to invoke the right launch\n")
+	fmt.Fprintf(&b, "form in step 5.\n\n")
+	fmt.Fprintf(&b, "Use `docker ps` (not `docker compose ps`) for the container check — the\n")
+	fmt.Fprintf(&b, "compose form only sees containers from the current working directory's\n")
+	fmt.Fprintf(&b, "compose project, so if you're in `~/` or anywhere outside the user's\n")
+	fmt.Fprintf(&b, "compose dir it false-negatives on running containers (e.g. a real\n")
+	fmt.Fprintf(&b, "`openclaw-openclaw-gateway-1` container will be missed).\n\n")
 	fmt.Fprintf(&b, "```bash\n")
-	fmt.Fprintf(&b, "TOKEN=$(jq -r .token ~/.clawvisor/agents/%s.json)\n\n", agentName)
-	fmt.Fprintf(&b, "# Host OpenClaw:\n")
+	fmt.Fprintf(&b, "command -v openclaw-cli >/dev/null 2>&1 && echo 'host openclaw-cli present'\n")
+	fmt.Fprintf(&b, "docker ps --format '{{.Names}}\\t{{.Image}}' 2>/dev/null | grep -i openclaw\n")
+	fmt.Fprintf(&b, "test -d ~/.openclaw && echo '~/.openclaw exists'\n")
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "Pick one of three modes and remember it as `$OPENCLAW_MODE`:\n\n")
+	fmt.Fprintf(&b, "- **host** — `openclaw-cli` is on `$PATH` on this machine.\n")
+	fmt.Fprintf(&b, "- **docker** — `docker ps` matched a running container. Capture its\n")
+	fmt.Fprintf(&b, "  exact name (first column) as `$OPENCLAW_CONTAINER` — the rest of the\n")
+	fmt.Fprintf(&b, "  skill uses `docker exec \"$OPENCLAW_CONTAINER\"` to run commands inside\n")
+	fmt.Fprintf(&b, "  the already-running container, which works regardless of the helper's\n")
+	fmt.Fprintf(&b, "  current directory.\n")
+	fmt.Fprintf(&b, "- **remote** — neither of the above; ask the user for an SSH host and\n")
+	fmt.Fprintf(&b, "  store it as `$OPENCLAW_REMOTE`. If they decline, STOP — don't guess.\n\n")
+	fmt.Fprintf(&b, "Surface what you picked in chat so the user can correct you.\n\n")
+
+	// Step 4: preflight — verify connectivity from OpenClaw's network namespace.
+	fmt.Fprintf(&b, "## 4. Preflight: confirm OpenClaw can reach Clawvisor\n\n")
+	fmt.Fprintf(&b, "Before `openclaw-cli onboard` bakes a Clawvisor URL into OpenClaw's\n")
+	fmt.Fprintf(&b, "config, prove the URL works from OpenClaw's own execution context.\n\n")
+	fmt.Fprintf(&b, "**If `$OPENCLAW_MODE=host`:**\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "curl -fsSL -H \"X-Clawvisor-Agent-Token: $TOKEN\" \\\n")
+	fmt.Fprintf(&b, "  \"$CLAWVISOR_LLM_URL/api/skill/catalog\" >/dev/null && echo OK\n")
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "**If `$OPENCLAW_MODE=docker`:**\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "docker exec -e CLAWVISOR_TOKEN=\"$TOKEN\" \"$OPENCLAW_CONTAINER\" sh -c '\n")
+	fmt.Fprintf(&b, "  curl -fsSL -H \"X-Clawvisor-Agent-Token: $CLAWVISOR_TOKEN\" \\\n")
+	fmt.Fprintf(&b, "    \"%s/api/skill/catalog\" >/dev/null && echo OK\n", llmHost)
+	fmt.Fprintf(&b, "'\n")
+	fmt.Fprintf(&b, "```\n\n")
+	if strings.Contains(llmHost, "host.docker.internal") {
+		fmt.Fprintf(&b, "If `OK` doesn't appear: on Linux `host.docker.internal` doesn't resolve\n")
+		fmt.Fprintf(&b, "by default — add `--add-host=host.docker.internal:host-gateway`, or\n")
+		fmt.Fprintf(&b, "ensure Clawvisor is bound to `0.0.0.0` (not `127.0.0.1`).\n\n")
+	}
+	fmt.Fprintf(&b, "**If `$OPENCLAW_MODE=remote`:**\n\n")
+	fmt.Fprintf(&b, "Define a remote-reachable base URL (the dashboard rendered `%s`; if\n", ctx.LLMURL)
+	fmt.Fprintf(&b, "that's localhost, replace it with a relay, public, VPN, or LAN URL the\n")
+	fmt.Fprintf(&b, "remote host can reach):\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "export OPENCLAW_CLAWVISOR_URL='<remote-reachable Clawvisor URL>'\n")
+	fmt.Fprintf(&b, "ssh \"$OPENCLAW_REMOTE\" \"curl -fsSL \\\n")
+	fmt.Fprintf(&b, "  -H 'X-Clawvisor-Agent-Token: $TOKEN' \\\n")
+	fmt.Fprintf(&b, "  '$OPENCLAW_CLAWVISOR_URL/api/skill/catalog' >/dev/null && echo OK\"\n")
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "Don't proceed past this step until preflight returns `OK`.\n\n")
+
+	// Step 5: configure — onboard + models.json patch.
+	fmt.Fprintf(&b, "## 5. Point OpenClaw at Clawvisor\n\n")
+	fmt.Fprintf(&b, "Run OpenClaw's onboarding command using Clawvisor's %s-compatible base\n", providerName)
+	fmt.Fprintf(&b, "URL and the agent token from `$TOKEN`. Pick the variant matching\n")
+	fmt.Fprintf(&b, "`$OPENCLAW_MODE`.\n\n")
+	fmt.Fprintf(&b, "**host:**\n\n")
+	fmt.Fprintf(&b, "```bash\n")
 	fmt.Fprintf(&b, "openclaw-cli onboard --non-interactive \\\n")
 	fmt.Fprintf(&b, "  --auth-choice custom-api-key \\\n")
-	fmt.Fprintf(&b, "  --custom-base-url \"%s%s\" \\\n", clawvisorURL, basePath)
+	fmt.Fprintf(&b, "  --custom-base-url \"%s%s\" \\\n", ctx.LLMURL, basePath)
 	fmt.Fprintf(&b, "  --custom-model-id \"%s\" \\\n", model)
 	fmt.Fprintf(&b, "  --custom-api-key \"$TOKEN\" \\\n")
-	fmt.Fprintf(&b, "  --custom-compatibility %s --accept-risk\n\n", provider)
-	fmt.Fprintf(&b, "# Docker OpenClaw, when Clawvisor is running on the host:\n")
-	fmt.Fprintf(&b, "docker compose run --rm openclaw-cli onboard --non-interactive \\\n")
+	fmt.Fprintf(&b, "  --custom-compatibility %s --accept-risk\n", ctx.LLMProvider)
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "**docker:**\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "docker exec \"$OPENCLAW_CONTAINER\" openclaw-cli onboard --non-interactive \\\n")
 	fmt.Fprintf(&b, "  --auth-choice custom-api-key \\\n")
-	fmt.Fprintf(&b, "  --custom-base-url \"%s%s\" \\\n", dockerHostURL(clawvisorURL), basePath)
+	fmt.Fprintf(&b, "  --custom-base-url \"%s%s\" \\\n", llmHost, basePath)
 	fmt.Fprintf(&b, "  --custom-model-id \"%s\" \\\n", model)
 	fmt.Fprintf(&b, "  --custom-api-key \"$TOKEN\" \\\n")
-	fmt.Fprintf(&b, "  --custom-compatibility %s --accept-risk\n", provider)
+	fmt.Fprintf(&b, "  --custom-compatibility %s --accept-risk\n", ctx.LLMProvider)
+	fmt.Fprintf(&b, "```\n\n")
+	fmt.Fprintf(&b, "**remote:**\n\n")
+	fmt.Fprintf(&b, "```bash\n")
+	fmt.Fprintf(&b, "ssh \"$OPENCLAW_REMOTE\" \"openclaw-cli onboard --non-interactive \\\n")
+	fmt.Fprintf(&b, "  --auth-choice custom-api-key \\\n")
+	fmt.Fprintf(&b, "  --custom-base-url '$OPENCLAW_CLAWVISOR_URL%s' \\\n", basePath)
+	fmt.Fprintf(&b, "  --custom-model-id '%s' \\\n", model)
+	fmt.Fprintf(&b, "  --custom-api-key '$TOKEN' \\\n")
+	fmt.Fprintf(&b, "  --custom-compatibility %s --accept-risk\"\n", ctx.LLMProvider)
 	fmt.Fprintf(&b, "```\n\n")
 	fmt.Fprintf(&b, "Then patch OpenClaw's custom-provider model metadata so it does not keep\n")
-	fmt.Fprintf(&b, "the low fallback context window written by some OpenClaw versions. Run the\n")
-	fmt.Fprintf(&b, "patch in the same environment that owns OpenClaw's `models.json` (host for\n")
-	fmt.Fprintf(&b, "host installs; the OpenClaw container/volume for Docker installs). If you\n")
+	fmt.Fprintf(&b, "the low fallback context window written by some OpenClaw versions. If you\n")
 	fmt.Fprintf(&b, "changed the model ID above, set `OPENCLAW_MODEL_CONTEXT_WINDOW` to that\n")
-	fmt.Fprintf(&b, "model's native maximum before running the patch. Clawvisor uses 200K as a\n")
-	fmt.Fprintf(&b, "reasonable floor for modern models, with higher values only for known model\n")
-	fmt.Fprintf(&b, "IDs. For Claude Sonnet 4's 1M beta context, only set `1000000` if the user's\n")
+	fmt.Fprintf(&b, "model's native maximum. Clawvisor uses 200K as the conservative floor for\n")
+	fmt.Fprintf(&b, "modern models, with higher values only for known model IDs.\n")
+	fmt.Fprintf(&b, "For Claude Sonnet 4's 1M beta context, only set `1000000` if the user's\n")
 	fmt.Fprintf(&b, "Anthropic org and request headers support it.\n\n")
+	fmt.Fprintf(&b, "**host/docker** (patch runs on the host that owns OpenClaw's\n")
+	fmt.Fprintf(&b, "`models.json`):\n\n")
 	fmt.Fprintf(&b, "```bash\n")
 	fmt.Fprintf(&b, "OPENCLAW_MODEL_ID=%q\n", model)
 	fmt.Fprintf(&b, "OPENCLAW_MODEL_CONTEXT_WINDOW=%d\n", contextWindow)
@@ -2221,54 +2089,8 @@ func sectionOpenClawLocalConfigure(clawvisorURL, provider, agentName string) str
 	fmt.Fprintf(&b, "    error(\"No OpenClaw provider registry found\")\n")
 	fmt.Fprintf(&b, "  end\n")
 	fmt.Fprintf(&b, "' \"$OPENCLAW_MODELS_JSON\" > \"$tmp\" && mv \"$tmp\" \"$OPENCLAW_MODELS_JSON\"\n")
-	fmt.Fprintf(&b, "jq -e --arg model \"$OPENCLAW_MODEL_ID\" \\\n")
-	fmt.Fprintf(&b, "  --argjson contextWindow \"$OPENCLAW_MODEL_CONTEXT_WINDOW\" \\\n")
-	fmt.Fprintf(&b, "  --argjson maxTokens \"$OPENCLAW_MAX_TOKENS\" '\n")
-	fmt.Fprintf(&b, "  (if .models.providers then .models.providers elif .providers then .providers else {} end)\n")
-	fmt.Fprintf(&b, "  | to_entries\n")
-	fmt.Fprintf(&b, "  | any(.[]; any(.value.models[]?; .id == $model and .contextWindow == $contextWindow and .maxTokens == $maxTokens))\n")
-	fmt.Fprintf(&b, "' \"$OPENCLAW_MODELS_JSON\" >/dev/null\n")
 	fmt.Fprintf(&b, "```\n\n")
-	fmt.Fprintf(&b, "If Clawvisor is not on the host, replace the base URL with the URL that\n")
-	fmt.Fprintf(&b, "the OpenClaw process can reach. The important part is `%s`.\n\n", basePath)
-	return b.String()
-}
-
-func sectionOpenClawRemoteConfigure(clawvisorURL, provider, agentName string) string {
-	var b strings.Builder
-	basePath := "/api/v1"
-	model := providerDefaultModel(provider)
-	contextWindow := providerDefaultContextWindow(provider)
-	maxTokens := openClawDefaultMaxTokens()
-	fmt.Fprintf(&b, "## 3. Point remote OpenClaw at Clawvisor\n\n")
-	fmt.Fprintf(&b, "Read the agent token that the bootstrap script saved on disk and reuse\n")
-	fmt.Fprintf(&b, "`$OPENCLAW_CLAWVISOR_URL` from step 2 (the preflight already proved this\n")
-	fmt.Fprintf(&b, "URL is reachable from `$OPENCLAW_REMOTE`). The onboard commands append\n")
-	fmt.Fprintf(&b, "`%s` because OpenClaw's custom-provider config wants the full LLM base URL.\n\n", basePath)
-	fmt.Fprintf(&b, "```bash\n")
-	fmt.Fprintf(&b, "TOKEN=$(jq -r .token ~/.clawvisor/agents/%s.json)\n\n", agentName)
-	fmt.Fprintf(&b, "# Remote host OpenClaw:\n")
-	fmt.Fprintf(&b, "ssh \"$OPENCLAW_REMOTE\" \"openclaw-cli onboard --non-interactive \\\n")
-	fmt.Fprintf(&b, "  --auth-choice custom-api-key \\\n")
-	fmt.Fprintf(&b, "  --custom-base-url '$OPENCLAW_CLAWVISOR_URL%s' \\\n", basePath)
-	fmt.Fprintf(&b, "  --custom-model-id '%s' \\\n", model)
-	fmt.Fprintf(&b, "  --custom-api-key '$TOKEN' \\\n")
-	fmt.Fprintf(&b, "  --custom-compatibility %s --accept-risk\"\n\n", provider)
-	fmt.Fprintf(&b, "# Remote Docker OpenClaw, if OpenClaw is containerized on that host:\n")
-	fmt.Fprintf(&b, "ssh \"$OPENCLAW_REMOTE\" \"docker compose run --rm openclaw-cli onboard --non-interactive \\\n")
-	fmt.Fprintf(&b, "  --auth-choice custom-api-key \\\n")
-	fmt.Fprintf(&b, "  --custom-base-url '$OPENCLAW_CLAWVISOR_URL%s' \\\n", basePath)
-	fmt.Fprintf(&b, "  --custom-model-id '%s' \\\n", model)
-	fmt.Fprintf(&b, "  --custom-api-key '$TOKEN' \\\n")
-	fmt.Fprintf(&b, "  --custom-compatibility %s --accept-risk\"\n", provider)
-	fmt.Fprintf(&b, "```\n\n")
-	fmt.Fprintf(&b, "Then patch the remote OpenClaw custom-provider model metadata so it does\n")
-	fmt.Fprintf(&b, "not keep the low fallback context window written by some OpenClaw versions.\n")
-	fmt.Fprintf(&b, "If you changed the model ID above, set `OPENCLAW_MODEL_CONTEXT_WINDOW` to\n")
-	fmt.Fprintf(&b, "that model's native maximum before running the patch. Clawvisor uses 200K\n")
-	fmt.Fprintf(&b, "as a reasonable floor for modern models, with higher values only for known\n")
-	fmt.Fprintf(&b, "model IDs. For Claude Sonnet 4's 1M beta context, only set `1000000` if the\n")
-	fmt.Fprintf(&b, "user's Anthropic org and request headers support it.\n\n")
+	fmt.Fprintf(&b, "**remote** (run the same patch over SSH):\n\n")
 	fmt.Fprintf(&b, "```bash\n")
 	fmt.Fprintf(&b, "ssh \"$OPENCLAW_REMOTE\" 'OPENCLAW_MODEL_ID=%q OPENCLAW_MODEL_CONTEXT_WINDOW=%d OPENCLAW_MAX_TOKENS=%d sh -s' <<'REMOTE_OPENCLAW_PATCH'\n", model, contextWindow, maxTokens)
 	fmt.Fprintf(&b, "set -eu\n")
@@ -2291,16 +2113,19 @@ func sectionOpenClawRemoteConfigure(clawvisorURL, provider, agentName string) st
 	fmt.Fprintf(&b, "    error(\"No OpenClaw provider registry found\")\n")
 	fmt.Fprintf(&b, "  end\n")
 	fmt.Fprintf(&b, "' \"$OPENCLAW_MODELS_JSON\" > \"$tmp\" && mv \"$tmp\" \"$OPENCLAW_MODELS_JSON\"\n")
-	fmt.Fprintf(&b, "jq -e --arg model \"$OPENCLAW_MODEL_ID\" \\\n")
-	fmt.Fprintf(&b, "  --argjson contextWindow \"$OPENCLAW_MODEL_CONTEXT_WINDOW\" \\\n")
-	fmt.Fprintf(&b, "  --argjson maxTokens \"$OPENCLAW_MAX_TOKENS\" '\n")
-	fmt.Fprintf(&b, "  (if .models.providers then .models.providers elif .providers then .providers else {} end)\n")
-	fmt.Fprintf(&b, "  | to_entries\n")
-	fmt.Fprintf(&b, "  | any(.[]; any(.value.models[]?; .id == $model and .contextWindow == $contextWindow and .maxTokens == $maxTokens))\n")
-	fmt.Fprintf(&b, "' \"$OPENCLAW_MODELS_JSON\" >/dev/null\n")
 	fmt.Fprintf(&b, "REMOTE_OPENCLAW_PATCH\n")
 	fmt.Fprintf(&b, "```\n\n")
-	fmt.Fprintf(&b, "The important invariant is that OpenClaw's model requests go to Clawvisor\n")
-	fmt.Fprintf(&b, "and use the minted `cvis_...` token.\n\n")
+
+	// Step 6: uninstall reference doc.
+	b.WriteString(sectionUninstallDoc("openclaw", `1. Re-run OpenClaw onboarding and choose your previous non-Clawvisor provider/base URL.
+2. Delete the token file: `+"`rm ~/.clawvisor/agents/"+ctx.AgentName+".json`"+`.
+3. Revoke the agent in the Clawvisor dashboard under Agents → `+ctx.AgentName+` → Delete.
+4. Optional: remove the user-level `+providerName+` key from Clawvisor credentials if no other agents use it.
+`, 6))
+
+	// Step 7: self-uninstall — remove this setup skill from the helper.
+	b.WriteString(sectionSelfUninstall("openclaw", helperSetupCleanupCommands(), 7))
+
 	return b.String()
 }
+
