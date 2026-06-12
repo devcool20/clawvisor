@@ -408,6 +408,12 @@ func TestInstallerHermesRender(t *testing.T) {
 		// was picked last time.
 		"*/api/v1*",
 		"*/api|*/api/",
+		// model.default name pattern — actively-used model is the
+		// strongest single hint.
+		`DEFAULT=$(python3 -c "import yaml`,
+		`(d.get('model') or {}).get('default')`,
+		"anthropic/*|*claude*",
+		"openai/*|*gpt*|*o1-*|*o3-*|*o4-*",
 		// HARD CONSTRAINT: the helper must ask the user and wait for a
 		// reply. The earlier shape of this skill let helpers default
 		// silently — we have a real bug report from the field on that.
@@ -501,11 +507,16 @@ func TestInstallerOpenClawRender(t *testing.T) {
 		`jq -r '.models.providers // {} | keys[]?'`,
 		"anthropic*|claude*",
 		"openai*|gpt*",
-		// Re-install signal: existing `clawvisor` provider's `api` field
-		// tells us what the user picked last time.
-		"EXISTING_CV_API=$(jq -r '.models.providers.clawvisor.api",
+		// Strongest signal: scan EVERY provider's `api` field so a
+		// non-default-named provider (`custom-host-docker-internal-25297`,
+		// `local-llm`, etc.) still gives a wire-protocol hit.
+		`for api in $(jq -r '.models.providers // {} | to_entries[]?.value.api`,
 		"anthropic-messages)                  DETECTED=",
 		"openai-completions|openai-responses) DETECTED=",
+		// Default model — strongest hint of what's actively used.
+		`DEFAULT_MODEL=$(jq -r '.models.default`,
+		`DEFAULT_PROVIDER="${DEFAULT_MODEL%%/*}"`,
+		`DEFAULT_API=$(jq -r --arg p "$DEFAULT_PROVIDER" '.models.providers[$p].api`,
 		// HARD CONSTRAINT: ask the user, don't pick silently. Lock this
 		// against regression — we got a real bug report from the field.
 		"HARD CONSTRAINT: you must not pick `$PROVIDER` yourself",
