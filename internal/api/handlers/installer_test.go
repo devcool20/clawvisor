@@ -395,8 +395,9 @@ func TestInstallerHermesRender(t *testing.T) {
 		// Step 2: detect provider — read env + ~/.hermes/config.yaml safely
 		// (python extracts only base_url, never the api_key).
 		"## 2. Detect the upstream LLM provider",
-		"python3 -c \"import re, os",
-		"model\\s*:\\s*\\r?\\n",
+		"python3 - <<'EOF'",
+		"import os, re",
+		"print(d.get('model', {}).get('base_url', ''))",
 		"DO NOT `cat`, `grep`, `head`, or `tail`",
 		// Detection branches by signal (env + config base_url host).
 		`[ -n "$ANTHROPIC_API_KEY" ]`,
@@ -410,8 +411,7 @@ func TestInstallerHermesRender(t *testing.T) {
 		"*/api|*/api/",
 		// model.default name pattern — actively-used model is the
 		// strongest single hint.
-		`DEFAULT=$(python3 -c "import re, os`,
-		`default\s*:\s*(.*)`,
+		"print(d.get('model', {}).get('default', ''))",
 		"anthropic/*|*claude*",
 		"openai/*|*gpt*|*o1-*|*o3-*|*o4-*",
 		// HARD CONSTRAINT: the helper must ask the user and wait for a

@@ -668,7 +668,7 @@ func sectionDetectProviderHermes(step int) string {
 	fmt.Fprintf(&b, "  # base_url path / host — `*/api/v1*` and `*/api` catch re-install\n")
 	fmt.Fprintf(&b, "  # cases where base_url points at a Clawvisor instance and the\n")
 	fmt.Fprintf(&b, "  # trailing path tells us which provider was picked last time.\n")
-	fmt.Fprintf(&b, `  BASE=$(python3 -c "import re, os; fn = os.path.expanduser('~/.hermes/config.yaml'); c = open(fn).read() if os.path.exists(fn) else ''; m = re.search(r'(?m)^model\s*:\s*\r?\n((?:[ \t]+.*\r?\n?)*)', c); sub = m.group(1) if m else ''; b = re.search(r'(?m)^[ \t]+base_url\s*:\s*(.*)', sub) if sub else None; print(b.group(1).strip().strip('\'').strip('\"')) if b else None" 2>/dev/null || true)`+"\n")
+	fmt.Fprintf(&b, "  BASE=$(%s)\n", hermesYamlParserPython("base_url"))
 	fmt.Fprintf(&b, "  case \"$BASE\" in\n")
 	fmt.Fprintf(&b, "    *anthropic.com*)      DETECTED=\"$DETECTED anthropic\" ;;\n")
 	fmt.Fprintf(&b, "    *openai.com*)         DETECTED=\"$DETECTED openai\" ;;\n")
@@ -677,7 +677,7 @@ func sectionDetectProviderHermes(step int) string {
 	fmt.Fprintf(&b, "  esac\n")
 	fmt.Fprintf(&b, "  # model.default name pattern — strongest hint of what's *actively*\n")
 	fmt.Fprintf(&b, "  # used, since base_url alone doesn't say which model is selected.\n")
-	fmt.Fprintf(&b, `  DEFAULT=$(python3 -c "import re, os; fn = os.path.expanduser('~/.hermes/config.yaml'); c = open(fn).read() if os.path.exists(fn) else ''; m = re.search(r'(?m)^model\s*:\s*\r?\n((?:[ \t]+.*\r?\n?)*)', c); sub = m.group(1) if m else ''; b = re.search(r'(?m)^[ \t]+default\s*:\s*(.*)', sub) if sub else None; print(b.group(1).strip().strip('\'').strip('\"')) if b else None" 2>/dev/null || true)`+"\n")
+	fmt.Fprintf(&b, "  DEFAULT=$(%s)\n", hermesYamlParserPython("default"))
 	fmt.Fprintf(&b, "  case \"$DEFAULT\" in\n")
 	fmt.Fprintf(&b, "    anthropic/*|*claude*)            DETECTED=\"$DETECTED anthropic\" ;;\n")
 	fmt.Fprintf(&b, "    openai/*|*gpt*|*o1-*|*o3-*|*o4-*) DETECTED=\"$DETECTED openai\" ;;\n")
@@ -688,6 +688,30 @@ func sectionDetectProviderHermes(step int) string {
 	fmt.Fprintf(&b, "```\n\n")
 	b.WriteString(sectionDetectProviderAskAndCase("Hermes"))
 	return b.String()
+}
+
+func hermesYamlParserPython(field string) string {
+	return `python3 - <<'EOF' 2>/dev/null || true
+import os, re
+fn = os.path.expanduser('~/.hermes/config.yaml')
+if os.path.exists(fn):
+    d = {}
+    st, ind = [d], [-1]
+    for l in open(fn):
+        l = re.sub(r'#.*', '', l)
+        if ':' not in l: continue
+        indent = len(l) - len(l.lstrip())
+        k, v = l.strip().split(':', 1)
+        k, v = k.strip(), v.strip().strip('\'"')
+        while ind and indent <= ind[-1]: st.pop(); ind.pop()
+        if not v:
+            nm = {}
+            st[-1][k] = nm
+            st.append(nm)
+            ind.append(indent)
+        else: st[-1][k] = v
+    print(d.get('model', {}).get('` + field + `', ''))
+EOF`
 }
 
 // sectionDetectProviderOpenClaw emits the provider-detection step for the
@@ -2132,10 +2156,10 @@ func renderHermesInstaller(ctx installerCtx) string {
 	fmt.Fprintf(&b, "```\n\n")
 	fmt.Fprintf(&b, "**remote:**\n\n")
 	fmt.Fprintf(&b, "```bash\n")
-	fmt.Fprintf(&b, "ssh \"$HERMES_REMOTE\" 'mkdir -p ~/.hermes && cat > ~/.hermes/.token.tmp' <<EOF\n")
+	fmt.Fprintf(&b, "ssh \"$HERMES_REMOTE\" 'mkdir -p ~/.hermes && umask 077 && cat > ~/.hermes/.token.tmp && (sleep 15; rm -f ~/.hermes/.token.tmp) >/dev/null 2>&1 &' <<EOF\n")
 	fmt.Fprintf(&b, "$TOKEN\n")
 	fmt.Fprintf(&b, "EOF\n")
-	fmt.Fprintf(&b, `ssh -t "$HERMES_REMOTE" "export $BASE_ENV='$HERMES_CLAWVISOR_URL$BASE_PATH' $KEY_ENV=\$(cat ~/.hermes/.token.tmp) && rm -f ~/.hermes/.token.tmp && hermes chat"`+"\n")
+	fmt.Fprintf(&b, `ssh -t "$HERMES_REMOTE" "token=\$(cat ~/.hermes/.token.tmp); rm -f ~/.hermes/.token.tmp; export $BASE_ENV='$HERMES_CLAWVISOR_URL$BASE_PATH' $KEY_ENV=\"\$token\" && hermes chat"`+"\n")
 	fmt.Fprintf(&b, "```\n\n")
 	fmt.Fprintf(&b, "### 6.b. Config-file snippets (when `$HERMES_CONFIG=file`)\n\n")
 	fmt.Fprintf(&b, "Hermes's docs are explicit: secrets go in `~/.hermes/.env`, everything\n")

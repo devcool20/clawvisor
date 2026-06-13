@@ -148,12 +148,12 @@ func stripAnthropicSyntheticApprovalHistory(body []byte, lookup ReconstructionLo
 				// reconstructed tool_use_id.
 				swapped, swapChanged, swapErr := replaceToolResultsForReconstruction(content, orphanedToolUseIDs, pendingReconstruction)
 				if swapErr == nil && swapChanged {
-					modified = true
 					newMsg, err := jsonsurgery.SetField(msg, "content", swapped)
 					if err == nil {
 						msg = newMsg
+						modified = true
+						applied = true
 					}
-					applied = true
 				}
 			} else {
 				// Text-only path: the original substituted turn
@@ -165,12 +165,12 @@ func stripAnthropicSyntheticApprovalHistory(body []byte, lookup ReconstructionLo
 				// tool_use→tool_result adjacency holds.
 				wrapped, wrapChanged, wrapErr := wrapUserContentAsToolResult(content, pendingReconstruction)
 				if wrapErr == nil && wrapChanged {
-					modified = true
 					newMsg, err := jsonsurgery.SetField(msg, "content", wrapped)
 					if err == nil {
 						msg = newMsg
+						modified = true
+						applied = true
 					}
-					applied = true
 				}
 			}
 			if applied {
@@ -180,9 +180,9 @@ func stripAnthropicSyntheticApprovalHistory(body []byte, lookup ReconstructionLo
 		} else if role == "user" && len(orphanedToolUseIDs) > 0 {
 			cleaned, dropped, changed, err := stripToolResultsByID(content, orphanedToolUseIDs)
 			if err == nil && changed {
-				orphanedToolUseIDs = nil
-				modified = true
 				if dropped {
+					orphanedToolUseIDs = nil
+					modified = true
 					// User message had only the orphan tool_result
 					// (and maybe blank text). Drop the whole turn.
 					continue
@@ -190,6 +190,8 @@ func stripAnthropicSyntheticApprovalHistory(body []byte, lookup ReconstructionLo
 				newMsg, err := jsonsurgery.SetField(msg, "content", cleaned)
 				if err == nil {
 					msg = newMsg
+					orphanedToolUseIDs = nil
+					modified = true
 				}
 			}
 		}
