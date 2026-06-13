@@ -51,8 +51,12 @@ actions:
         location: query
       to:
         type: string
-        aliases: [time_max]
         transform: "endOfDay(to)"
+        map_to: timeMax
+        location: query
+      time_max:
+        type: string
+        transform: "rfc3339(time_max)"
         map_to: timeMax
         location: query
       q: { type: string, location: query }

@@ -141,6 +141,7 @@ func stripAnthropicSyntheticApprovalHistory(body []byte, lookup ReconstructionLo
 			}
 		}
 		if role == "user" && pendingReconstruction != nil {
+			applied := false
 			if len(orphanedToolUseIDs) > 0 {
 				// AskUserQuestion path: replace the orphan
 				// tool_result block with one paired to the
@@ -152,6 +153,7 @@ func stripAnthropicSyntheticApprovalHistory(body []byte, lookup ReconstructionLo
 					if err == nil {
 						msg = newMsg
 					}
+					applied = true
 				}
 			} else {
 				// Text-only path: the original substituted turn
@@ -168,14 +170,17 @@ func stripAnthropicSyntheticApprovalHistory(body []byte, lookup ReconstructionLo
 					if err == nil {
 						msg = newMsg
 					}
+					applied = true
 				}
 			}
-			orphanedToolUseIDs = nil
-			pendingReconstruction = nil
+			if applied {
+				orphanedToolUseIDs = nil
+				pendingReconstruction = nil
+			}
 		} else if role == "user" && len(orphanedToolUseIDs) > 0 {
 			cleaned, dropped, changed, err := stripToolResultsByID(content, orphanedToolUseIDs)
-			orphanedToolUseIDs = nil
 			if err == nil && changed {
+				orphanedToolUseIDs = nil
 				modified = true
 				if dropped {
 					// User message had only the orphan tool_result
