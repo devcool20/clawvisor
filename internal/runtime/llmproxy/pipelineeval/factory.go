@@ -53,11 +53,12 @@ var Factory llmproxy.ToolUseEvaluatorFactory = func(
 		cfg.AuthorizationContext,
 		cfg.ApprovalContext,
 		cfg.RewriteContext,
+		cfg.RoutingContext,
 		provider,
 		emit,
 	)
 
-	authBundle := buildAuthorizationResolver(cfg.AgentContext, cfg.AuditContext, cfg.AuthorizationContext, cfg.ApprovalContext, cfg.RewriteContext, provider)
+	authBundle := buildAuthorizationResolver(cfg.AgentContext, cfg.AuditContext, cfg.AuthorizationContext, cfg.ApprovalContext, cfg.RewriteContext, cfg.RoutingContext, provider)
 
 	chain := policies.ComposeToolUseEvaluatorChain(policies.ToolUseChainConfig{
 		Control:       buildControlResolver(req, cfg.AgentContext, cfg.AuditContext, cfg.ApprovalContext, cfg.RewriteContext, cfg.RoutingContext, provider, emit),
@@ -347,7 +348,14 @@ func buildControlResolver(
 					}
 					audit.Trace.Emit(payload)
 				}
-				// Expansion intercept runs first: it matches a
+				// Scope-drift one-off intercept runs first: its path
+				// (/api/control/scope-drifts/<id>/one-off) doesn't
+				// collide with the task / expand prefixes, so order
+				// here is by specificity rather than necessity.
+				if convV, claimed := llmproxy.MaybeInterceptScopeDriftOneOff(req, interceptCfg, auditFn, traceFn, provider, tu, call); claimed {
+					return conversationToPipelineVerdict(convV), true
+				}
+				// Expansion intercept runs next: it matches a
 				// strict-prefix path (.../tasks/<id>/expand) so it
 				// can't claim a creation POST (.../tasks). If it
 				// passes, the creation intercept gets its turn; if
@@ -531,6 +539,7 @@ func buildCredentialedTaskScope(
 	auth llmproxy.AuthorizationContext,
 	approval llmproxy.ApprovalContext,
 	rewrite llmproxy.RewriteContext,
+	routing llmproxy.RoutingContext,
 	provider conversation.Provider,
 	emit func(conversation.AuditEvent),
 ) credentialedTaskScopeBundle {
@@ -538,6 +547,12 @@ func buildCredentialedTaskScope(
 		return credentialedTaskScopeBundle{}
 	}
 	approvalCleanupCfg := llmproxy.PostprocessConfig{ApprovalContext: approval}
+	// Coordinator owns the scope-drift integration both branches below
+	// route through (modern decision mint + retry pre-clear consume).
+	// Nil-tolerant: when ScopeDrifts isn't wired, every method short-
+	// circuits and the closures below fall through to their legacy
+	// paths unchanged.
+	drifts := newScopeDriftCoordinator(agent, auditCtx, auth, routing, provider)
 
 	// planModernPath builds the per-tool-use credentialedPlan for the
 	// modern decision-engine path. Returns (plan, true) when the tool_use
@@ -618,6 +633,27 @@ func buildCredentialedTaskScope(
 				TaskID: matchedTaskID,
 			}
 		case runtimedecision.VerdictNeedsApproval:
+			// Scope drift: when the block is "no covering task scope",
+			// redirect the agent to the continuation menu instead of
+			// parking a user-facing approval prompt. Layer 2 hardcoded
+			// approvals keep the existing user-prompt path.
+			if mint := drifts.MintForCredentialed(ctx, tu, plan.Verdict, plan.Resolved, matchedTaskID, dec); mint.OK {
+				audit("block", "scope_drift_minted", "drift_id="+mint.DriftID+"; "+dec.Reason, matchedTaskID)
+				return policies.TaskScopeDecision{
+					Kind:                   policies.TaskScopeDecisionHold,
+					Allowed:                false,
+					Reason:                 "Clawvisor: no active task scope covers " + plan.Resolved.ServiceID + "." + plan.Resolved.ActionID + " — " + dec.Reason,
+					SubstituteText:         mint.MenuText,
+					ContinueWithToolResult: mint.MenuText,
+					TaskID:                 matchedTaskID,
+				}
+			} else if mint.Err != nil {
+				// Registry write failed — fall through to the legacy
+				// approval-hold path rather than emit a menu with no
+				// usable drift_id. The audit row records the mint
+				// failure so operators can investigate.
+				audit("block", "scope_drift_mint_failed", mint.Err.Error(), matchedTaskID)
+			}
 			var approvalID string
 			if approval.PendingApprovals != nil {
 				held, herr := approval.PendingApprovals.Hold(ctx, llmproxy.PendingLiteApproval{
@@ -678,6 +714,17 @@ func buildCredentialedTaskScope(
 				TaskID:           taskID,
 			})
 		}
+		// Scope-drift pre-clear: if the agent is retrying a tool_use the
+		// user just approved (via expand / new_task / one_off), consume
+		// the one-shot pre-clear so the retry passes scope check once
+		// without re-running the full EvaluateAuthorization path. A
+		// second retry of the same call lands back on the normal scope
+		// path and either passes (if a covering task was created) or
+		// mints a fresh drift.
+		if driftID, hit := drifts.ConsumePreClear(ctx, tu, v); hit {
+			audit("allow", "scope_drift_pre_clear", "drift_id="+driftID, "")
+			return policies.TaskScopeDecision{Kind: policies.TaskScopeDecisionAllow, Allowed: true}
+		}
 		if auth.CandidateTasks != nil || auth.ToolRules != nil || auth.EgressRules != nil {
 			if cached, ok := cache[tu.ID]; ok {
 				return applyModernDecision(ctx, tu, cached.Plan, cached.Outcome.Decision, cached.Outcome.Err, audit)
@@ -706,6 +753,38 @@ func buildCredentialedTaskScope(
 			}
 			dec := auth.TaskScope.Check(ctx, agent.AgentUserID, agent.AgentID, resolved.ServiceID, resolved.ActionID)
 			if !dec.Allowed {
+				// Route the legacy denial through the scope-drift menu
+				// ONLY when the reason is a genuine scope miss
+				// (needs_new_task / no_active_task). The other
+				// non-Allowed reasons reported by StoreTaskScopeChecker
+				// (task_store_unavailable, no_task_store_configured,
+				// no_agent_context, unresolved_action,
+				// unknown_classification) describe backend / config /
+				// programmer errors — minting a drift for those would
+				// let an agent ride out a degraded backend by picking
+				// an option, landing a pre-clear, and bypassing the
+				// (still broken) scope check on retry. Hard-block
+				// those instead so an operator sees them.
+				if isLegacyScopeDriftReason(dec.Reason) {
+					syntheticDec := runtimedecision.AuthorizationDecision{
+						Kind:   runtimedecision.VerdictNeedsApproval,
+						Source: runtimedecision.SourceTaskScopeMissing,
+						Reason: dec.Reason,
+					}
+					if mint := drifts.MintForCredentialed(ctx, tu, v, resolved, dec.TaskID, syntheticDec); mint.OK {
+						audit("block", "scope_drift_minted", "drift_id="+mint.DriftID+"; "+dec.Reason+" (legacy)", dec.TaskID)
+						return policies.TaskScopeDecision{
+							Kind:                   policies.TaskScopeDecisionHold,
+							Allowed:                false,
+							Reason:                 "Clawvisor: no active task scope covers " + resolved.ServiceID + "." + resolved.ActionID + " — " + dec.Reason,
+							SubstituteText:         mint.MenuText,
+							ContinueWithToolResult: mint.MenuText,
+							TaskID:                 dec.TaskID,
+						}
+					} else if mint.Err != nil {
+						audit("block", "scope_drift_mint_failed", mint.Err.Error()+" (legacy)", dec.TaskID)
+					}
+				}
 				audit("block", "task_scope_denied", dec.Reason, "")
 				return policies.TaskScopeDecision{
 					Kind:   policies.TaskScopeDecisionHold,
@@ -791,17 +870,23 @@ func buildAuthorizationResolver(
 	auth llmproxy.AuthorizationContext,
 	approval llmproxy.ApprovalContext,
 	rewrite llmproxy.RewriteContext,
+	routing llmproxy.RoutingContext,
 	provider conversation.Provider,
 ) authorizationResolverBundle {
 	if rewrite.Inspector == nil {
 		return authorizationResolverBundle{}
 	}
 	intentVerifier := intentverify.DecisionVerifierFor(auth.IntentVerifier)
+	// One coordinator shared between Hold (mint side) and resolve
+	// (pre-clear consume side) so an approved one-off and its retry
+	// land against the same registry view.
+	drifts := newScopeDriftCoordinator(agent, audit, auth, routing, provider)
 	holdHandler := &authorizationHoldHandler{
 		agent:    agent,
 		audit:    audit,
 		approval: approval,
 		provider: provider,
+		drifts:   drifts,
 	}
 	slideTask := func(ctx context.Context, task *store.Task) {
 		if rewrite.Store == nil || task == nil {
@@ -845,8 +930,26 @@ func buildAuthorizationResolver(
 	// before the orchestrator starts iterating.
 	cache := make(map[string]runtimedecision.AuthorizationOutcome)
 
-	resolve := func(_ context.Context, tu conversation.ToolUse, _ inspector.Verdict) *policies.AuthorizationInputs {
+	resolve := func(ctx context.Context, tu conversation.ToolUse, v inspector.Verdict) *policies.AuthorizationInputs {
 		inputs := planFor(tu)
+		// Scope-drift pre-clear (trigger-miss path): if the agent is
+		// retrying a tool_use after a user-approved one-off (or any
+		// approval that landed a pre-clear), let it through once
+		// without re-running EvaluateAuthorization. Without this the
+		// authorization engine sees the same task_scope_missing source
+		// and mints another drift, looping the agent through the menu.
+		// We precompute a VerdictAllow so AuthorizationPolicy emits its
+		// normal allow audit; the Reason carries the drift_id for
+		// operator correlation.
+		if driftID, hit := drifts.ConsumePreClearForTriggerMiss(ctx, tu, v); hit {
+			allow := runtimedecision.AuthorizationDecision{
+				Kind:   runtimedecision.VerdictAllow,
+				Source: runtimedecision.SourceTaskScope,
+				Reason: "scope-drift pre-clear consumed (drift_id=" + driftID + ")",
+			}
+			inputs.Precomputed = &allow
+			return inputs
+		}
 		if out, ok := cache[tu.ID]; ok {
 			if out.Err != nil {
 				inputs.PrecomputedErr = out.Err
@@ -956,17 +1059,34 @@ func runIntentVerify(ctx context.Context, verifier llmproxy.IntentVerifier, dec 
 }
 
 // authorizationHoldHandler implements policies.AuthorizationHoldHandler
-// for AuthorizationPolicy's approval flow. Commits the hold via
-// PendingApprovals.Hold, renders the approval prompt with the
-// resulting approval ID, and cleans up any evicted inline task.
+// for AuthorizationPolicy's approval flow. On a scope-drift source
+// the coordinator mints a drift and the handler returns
+// ContinueWithToolResult so the policy surfaces the agent-facing menu
+// instead of parking a user hold. Otherwise commits the hold via
+// PendingApprovals.Hold, renders the approval prompt, and cleans up
+// any evicted inline task.
 type authorizationHoldHandler struct {
 	agent    llmproxy.AgentContext
 	audit    llmproxy.AuditContext
 	approval llmproxy.ApprovalContext
 	provider conversation.Provider
+	drifts   *scopeDriftCoordinator
 }
 
 func (h *authorizationHoldHandler) Hold(ctx context.Context, req policies.AuthorizationHoldRequest) (policies.AuthorizationHoldResult, error) {
+	// Scope-drift continuation: when the block is task_scope_missing /
+	// task_scope_ambiguous AND a registry is wired, the coordinator
+	// mints a drift and returns the menu text. Layer 2 hardcoded
+	// approvals (SourceRuleReview etc.) keep the existing user-prompt
+	// path because AppliesToSource returns false for them. On mint
+	// failure we fall through to the legacy approval-hold path rather
+	// than emit a menu with no usable drift_id.
+	if mint := h.drifts.MintForTriggerMiss(ctx, req.ToolUse, req.InspectorVerdict, req.Decision); mint.OK {
+		return policies.AuthorizationHoldResult{
+			ContinueWithToolResult: mint.MenuText,
+			SubstituteText:         mint.MenuText,
+		}, nil
+	}
 	if h.approval.PendingApprovals == nil {
 		// Fail closed in the policy.
 		return policies.AuthorizationHoldResult{Err: "approval cache not configured"}, nil
@@ -1039,4 +1159,25 @@ func buildRewriteResolver(agent llmproxy.AgentContext, rewrite llmproxy.RewriteC
 			RewriteOpts:  opts,
 		}
 	}
+}
+
+// isLegacyScopeDriftReason reports whether a TaskScope.Check denial
+// reason represents an actual missing-scope situation (vs. a
+// backend / config / programmer error). Only the actual-miss cases
+// route through the scope-drift menu; the others hard-block so an
+// operator sees them rather than letting an agent ride out a
+// degraded backend by collecting a pre-clear.
+//
+// The reason strings are the ones StoreTaskScopeChecker.Check
+// produces (see internal/runtime/llmproxy/taskscope.go) plus the
+// post-classification cases from classifyToDecision. Whitelist
+// the safe ones rather than blacklist the unsafe ones — new
+// failure modes added to the checker default to hard-block,
+// which is the right safety bias.
+func isLegacyScopeDriftReason(reason string) bool {
+	switch reason {
+	case "needs_new_task", "no_active_task":
+		return true
+	}
+	return false
 }

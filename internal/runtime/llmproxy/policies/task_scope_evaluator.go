@@ -45,9 +45,18 @@ type TaskScopeDecision struct {
 	TaskID         string
 	Reason         string
 	SubstituteText string
-	Ambiguous      bool
-	MatchedTask    *store.Task
-	MatchedAction  *store.TaskAction
+	// ContinueWithToolResult, when non-empty, signals the evaluator to
+	// serve this tool_use locally and return the text as a synthetic
+	// tool_result on a continuation turn — the model sees its blocked
+	// tool_use answered with the supplied text and emits its next turn
+	// against it, instead of the proxy parking a user-facing approval
+	// hold. Used by the scope-drift menu path; SubstituteText still
+	// populates as the harness fallback if the continuation round-trip
+	// fails.
+	ContinueWithToolResult string
+	Ambiguous              bool
+	MatchedTask            *store.Task
+	MatchedAction          *store.TaskAction
 }
 
 // TaskScopeDecisionKind disambiguates hard denials from approvable
@@ -138,6 +147,25 @@ func (e *TaskScopeEvaluator) Evaluate(ctx context.Context, _ pipeline.ReadOnlyRe
 			Reason:  dec.Reason,
 			Facts:   []pipeline.EvaluationFact{fact},
 		}, nil
+	}
+
+	// Scope-drift continuation: serve the menu locally as a synthetic
+	// tool_result instead of parking a user-facing approval hold. The
+	// orchestrator's Continue signal short-circuits coalescing — the
+	// pipeline re-enters with the menu as the model's next user-role
+	// input. SubstituteText still populates as the harness fallback if
+	// the continuation round-trip fails. The pipeline owns the wire
+	// format; we just hand it the text.
+	if dec.ContinueWithToolResult != "" {
+		if cont := pipeline.NewTextContinuation(dec.ContinueWithToolResult); cont != nil {
+			return pipeline.ToolUseVerdict{
+				Outcome:        pipeline.OutcomeDeny,
+				Reason:         dec.Reason,
+				SubstituteWith: dec.SubstituteText,
+				Continue:       cont,
+				Facts:          []pipeline.EvaluationFact{fact},
+			}, nil
+		}
 	}
 
 	// Scope check failed — hold for approval. Per-tool HoldKey so
