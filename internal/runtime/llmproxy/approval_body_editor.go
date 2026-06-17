@@ -151,14 +151,14 @@ func replaceAnthropicApprovalReply(body []byte, expectedVerb, expectedApprovalID
 		if !approvalIDMatchesExpectation(parsedID, expectedApprovalID) {
 			return body, false, nil
 		}
-		encoded, _ := json.Marshal(replacement)
+		encoded, _ := jsonsurgery.MarshalNoEscape(replacement)
 		req.Messages[i].Content = encoded
-		messages, err := json.Marshal(req.Messages)
+		messages, err := jsonsurgery.MarshalNoEscape(req.Messages)
 		if err != nil {
 			return nil, false, err
 		}
 		raw["messages"] = messages
-		out, err := json.Marshal(raw)
+		out, err := jsonsurgery.MarshalNoEscape(raw)
 		return out, err == nil, err
 	}
 	return body, false, nil
@@ -241,12 +241,12 @@ func rewriteAnthropicAskUserQuestionApprovalReply(body []byte, expectedVerb, exp
 			if assistantOK && userOK {
 				req.Messages[assistantIdx].Content = newAssistant
 				req.Messages[match.UserIdx].Content = newUser
-				messages, err := json.Marshal(req.Messages)
+				messages, err := jsonsurgery.MarshalNoEscape(req.Messages)
 				if err != nil {
 					return nil, false, err
 				}
 				raw["messages"] = messages
-				out, err := json.Marshal(raw)
+				out, err := jsonsurgery.MarshalNoEscape(raw)
 				return out, err == nil, err
 			}
 		}
@@ -262,12 +262,12 @@ func rewriteAnthropicAskUserQuestionApprovalReply(body []byte, expectedVerb, exp
 		return body, false, nil
 	}
 	req.Messages[match.UserIdx].Content = newContent
-	messages, err := json.Marshal(req.Messages)
+	messages, err := jsonsurgery.MarshalNoEscape(req.Messages)
 	if err != nil {
 		return nil, false, err
 	}
 	raw["messages"] = messages
-	out, err := json.Marshal(raw)
+	out, err := jsonsurgery.MarshalNoEscape(raw)
 	return out, err == nil, err
 }
 
@@ -295,7 +295,7 @@ func buildReconstructedAssistantContent(original *InlineApprovalOriginalCall) (j
 		"name":  original.ToolName,
 		"input": original.Input,
 	}
-	raw, err := json.Marshal([]any{block})
+	raw, err := jsonsurgery.MarshalNoEscape([]any{block})
 	if err != nil {
 		return nil, false
 	}
@@ -309,6 +309,13 @@ func buildReconstructedAssistantContent(original *InlineApprovalOriginalCall) (j
 // notice as its content. Other blocks survive unchanged. The pairing
 // keeps the assistant→user tool_use/tool_result invariant Anthropic
 // validates at request time.
+//
+// Any non-(type|tool_use_id|content) fields on the original block —
+// notably cache_control — survive the swap. The harness's deepest
+// prompt-cache breakpoint typically lands on this tool_result;
+// dropping it forces Anthropic to fall back to a system-level cache
+// that has proven not to hit in practice, busting ~15k cached tokens
+// on the immediate post-approval turn.
 func swapAnthropicToolResultForReconstructedPair(raw json.RawMessage, askToolUseID, reconstructedToolUseID, replacement string) (json.RawMessage, bool) {
 	if len(raw) == 0 || reconstructedToolUseID == "" {
 		return nil, false
@@ -319,21 +326,27 @@ func swapAnthropicToolResultForReconstructedPair(raw json.RawMessage, askToolUse
 	}
 	rewritten := false
 	for i, blk := range blocks {
-		var probe struct {
-			Type      string `json:"type"`
-			ToolUseID string `json:"tool_use_id"`
-		}
-		if err := json.Unmarshal(blk, &probe); err != nil {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(blk, &fields); err != nil {
 			continue
 		}
-		if probe.Type != "tool_result" || probe.ToolUseID != askToolUseID {
+		var typeStr, toolUseID string
+		_ = json.Unmarshal(fields["type"], &typeStr)
+		_ = json.Unmarshal(fields["tool_use_id"], &toolUseID)
+		if typeStr != "tool_result" || toolUseID != askToolUseID {
 			continue
 		}
-		newBlock, err := json.Marshal(map[string]any{
-			"type":        "tool_result",
-			"tool_use_id": reconstructedToolUseID,
-			"content":     replacement,
-		})
+		newToolUseID, err := jsonsurgery.MarshalNoEscape(reconstructedToolUseID)
+		if err != nil {
+			continue
+		}
+		newContent, err := jsonsurgery.MarshalNoEscape(replacement)
+		if err != nil {
+			continue
+		}
+		fields["tool_use_id"] = newToolUseID
+		fields["content"] = newContent
+		newBlock, err := jsonsurgery.MarshalNoEscape(fields)
 		if err != nil {
 			continue
 		}
@@ -343,7 +356,7 @@ func swapAnthropicToolResultForReconstructedPair(raw json.RawMessage, askToolUse
 	if !rewritten {
 		return nil, false
 	}
-	out, err := json.Marshal(blocks)
+	out, err := jsonsurgery.MarshalNoEscape(blocks)
 	if err != nil {
 		return nil, false
 	}
@@ -358,6 +371,10 @@ func swapAnthropicToolResultForReconstructedPair(raw json.RawMessage, askToolUse
 // keeps the next request's history valid after historystrip drops
 // the parent AskUserQuestion call — see
 // rewriteAnthropicAskUserQuestionApprovalReply for the rationale.
+//
+// Any cache_control field on the original block transfers to the
+// replacement text block — the harness's deepest cache breakpoint
+// often lands on this content and dropping it busts the prompt cache.
 func swapAnthropicToolResultForTextBlock(raw json.RawMessage, targetToolUseID, replacement string) (json.RawMessage, bool) {
 	if len(raw) == 0 {
 		return nil, false
@@ -368,18 +385,31 @@ func swapAnthropicToolResultForTextBlock(raw json.RawMessage, targetToolUseID, r
 	}
 	rewritten := false
 	for i, blk := range blocks {
-		var probe struct {
-			Type      string `json:"type"`
-			ToolUseID string `json:"tool_use_id"`
-		}
-		if err := json.Unmarshal(blk, &probe); err != nil {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(blk, &fields); err != nil {
 			continue
 		}
-		if probe.Type != "tool_result" || probe.ToolUseID != targetToolUseID {
+		var typeStr, toolUseID string
+		_ = json.Unmarshal(fields["type"], &typeStr)
+		_ = json.Unmarshal(fields["tool_use_id"], &toolUseID)
+		if typeStr != "tool_result" || toolUseID != targetToolUseID {
 			continue
 		}
-		textBlock := map[string]string{"type": "text", "text": replacement}
-		newBlock, err := json.Marshal(textBlock)
+		textBlock := map[string]json.RawMessage{}
+		newType, err := jsonsurgery.MarshalNoEscape("text")
+		if err != nil {
+			continue
+		}
+		newText, err := jsonsurgery.MarshalNoEscape(replacement)
+		if err != nil {
+			continue
+		}
+		textBlock["type"] = newType
+		textBlock["text"] = newText
+		if cc, ok := fields["cache_control"]; ok && len(cc) > 0 {
+			textBlock["cache_control"] = cc
+		}
+		newBlock, err := jsonsurgery.MarshalNoEscape(textBlock)
 		if err != nil {
 			continue
 		}
@@ -389,7 +419,7 @@ func swapAnthropicToolResultForTextBlock(raw json.RawMessage, targetToolUseID, r
 	if !rewritten {
 		return nil, false
 	}
-	out, err := json.Marshal(blocks)
+	out, err := jsonsurgery.MarshalNoEscape(blocks)
 	if err != nil {
 		return nil, false
 	}
@@ -432,7 +462,7 @@ func replaceOpenAIChatApprovalReply(body []byte, expectedVerb, expectedApprovalI
 		if role != "user" {
 			continue
 		}
-		contentRaw, _ := json.Marshal(req.Messages[i]["content"])
+		contentRaw, _ := jsonsurgery.MarshalNoEscape(req.Messages[i]["content"])
 		verb, parsedID := conversation.ParseApprovalReplyText(flattenOpenAITaskReplyContent(contentRaw))
 		if verb != expectedVerb {
 			return body, false, nil
@@ -441,12 +471,12 @@ func replaceOpenAIChatApprovalReply(body []byte, expectedVerb, expectedApprovalI
 			return body, false, nil
 		}
 		req.Messages[i]["content"] = replacement
-		messages, err := json.Marshal(req.Messages)
+		messages, err := jsonsurgery.MarshalNoEscape(req.Messages)
 		if err != nil {
 			return nil, false, err
 		}
 		raw["messages"] = messages
-		out, err := json.Marshal(raw)
+		out, err := jsonsurgery.MarshalNoEscape(raw)
 		return out, err == nil, err
 	}
 	return body, false, nil
@@ -472,9 +502,9 @@ func replaceOpenAIResponsesApprovalReply(body []byte, expectedVerb, expectedAppr
 		if !approvalIDMatchesExpectation(parsedID, expectedApprovalID) {
 			return body, false, nil
 		}
-		encoded, _ := json.Marshal(replacement)
+		encoded, _ := jsonsurgery.MarshalNoEscape(replacement)
 		raw["input"] = encoded
-		out, err := json.Marshal(raw)
+		out, err := jsonsurgery.MarshalNoEscape(raw)
 		return out, err == nil, err
 	}
 	var items []map[string]any
@@ -487,7 +517,7 @@ func replaceOpenAIResponsesApprovalReply(body []byte, expectedVerb, expectedAppr
 		if typ != "message" || role != "user" {
 			continue
 		}
-		contentRaw, _ := json.Marshal(items[i]["content"])
+		contentRaw, _ := jsonsurgery.MarshalNoEscape(items[i]["content"])
 		verb, parsedID := conversation.ParseApprovalReplyText(flattenOpenAITaskReplyContent(contentRaw))
 		if verb != expectedVerb {
 			return body, false, nil
@@ -496,12 +526,12 @@ func replaceOpenAIResponsesApprovalReply(body []byte, expectedVerb, expectedAppr
 			return body, false, nil
 		}
 		items[i]["content"] = []map[string]any{{"type": "input_text", "text": replacement}}
-		input, err := json.Marshal(items)
+		input, err := jsonsurgery.MarshalNoEscape(items)
 		if err != nil {
 			return nil, false, err
 		}
 		raw["input"] = input
-		out, err := json.Marshal(raw)
+		out, err := jsonsurgery.MarshalNoEscape(raw)
 		return out, err == nil, err
 	}
 	return body, false, nil
@@ -592,7 +622,7 @@ func augmentAnthropicApprovedInlineTasks(body []byte, outcomes InlineApprovalOut
 	if !changed {
 		return body, false, nil
 	}
-	newMsgsBytes, err := json.Marshal(newMessages)
+	newMsgsBytes, err := jsonsurgery.MarshalNoEscape(newMessages)
 	if err != nil {
 		return body, false, err
 	}
@@ -605,12 +635,12 @@ func augmentAnthropicApprovedInlineTasks(body []byte, outcomes InlineApprovalOut
 
 func augmentUserContent(content json.RawMessage, _ string, note string) (json.RawMessage, bool) {
 	if len(content) == 0 {
-		encoded, err := json.Marshal(note)
+		encoded, err := jsonsurgery.MarshalNoEscape(note)
 		return encoded, err == nil
 	}
 	var s string
 	if err := json.Unmarshal(content, &s); err == nil {
-		encoded, marshalErr := json.Marshal(note)
+		encoded, marshalErr := jsonsurgery.MarshalNoEscape(note)
 		return encoded, marshalErr == nil
 	}
 	var blocks []map[string]json.RawMessage
@@ -637,7 +667,7 @@ func augmentUserContent(content json.RawMessage, _ string, note string) (json.Ra
 			spliceAt = i
 		}
 		stripped := stripBareApprovalLines(text)
-		encoded, err := json.Marshal(stripped)
+		encoded, err := jsonsurgery.MarshalNoEscape(stripped)
 		if err != nil {
 			return nil, false
 		}
@@ -652,7 +682,7 @@ func augmentUserContent(content json.RawMessage, _ string, note string) (json.Ra
 	if spliceText != "" {
 		newSpliceText = spliceText + "\n\n" + note
 	}
-	encoded, err := json.Marshal(newSpliceText)
+	encoded, err := jsonsurgery.MarshalNoEscape(newSpliceText)
 	if err != nil {
 		return nil, false
 	}
@@ -670,7 +700,7 @@ func augmentUserContent(content json.RawMessage, _ string, note string) (json.Ra
 		kept = append(kept, blk)
 	}
 
-	out, err := json.Marshal(kept)
+	out, err := jsonsurgery.MarshalNoEscape(kept)
 	if err != nil {
 		return nil, false
 	}

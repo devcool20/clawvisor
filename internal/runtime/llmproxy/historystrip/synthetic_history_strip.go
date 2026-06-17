@@ -282,7 +282,7 @@ func stripAnthropicSyntheticApprovalHistory(body []byte, lookup ReconstructionLo
 		merged = append(merged, msg)
 	}
 
-	newMsgsBytes, err := json.Marshal(merged)
+	newMsgsBytes, err := jsonsurgery.MarshalNoEscape(merged)
 	if err != nil {
 		return SyntheticApprovalHistoryStripResult{Body: body}, err
 	}
@@ -336,7 +336,7 @@ func mergeAnthropicContent(c1, c2 json.RawMessage) (json.RawMessage, error) {
 
 	if err1 == nil && err2 == nil {
 		merged := s1 + "\n\n" + s2
-		return json.Marshal(merged)
+		return jsonsurgery.MarshalNoEscape(merged)
 	}
 	if err1 != nil && err2 == nil {
 		var blocks1 []json.RawMessage
@@ -344,7 +344,7 @@ func mergeAnthropicContent(c1, c2 json.RawMessage) (json.RawMessage, error) {
 			return nil, err
 		}
 		blocks1 = append(blocks1, anthropicTextBlockRaw(s2))
-		return json.Marshal(blocks1)
+		return jsonsurgery.MarshalNoEscape(blocks1)
 	}
 	if err1 == nil && err2 != nil {
 		var blocks2 []json.RawMessage
@@ -354,7 +354,7 @@ func mergeAnthropicContent(c1, c2 json.RawMessage) (json.RawMessage, error) {
 		// Use append-from-literal to sidestep CodeQL's
 		// allocation-size-overflow warning on `len(blocks2)+1`.
 		out := append([]json.RawMessage{anthropicTextBlockRaw(s1)}, blocks2...)
-		return json.Marshal(out)
+		return jsonsurgery.MarshalNoEscape(out)
 	}
 
 	var blocks1 []json.RawMessage
@@ -368,11 +368,11 @@ func mergeAnthropicContent(c1, c2 json.RawMessage) (json.RawMessage, error) {
 	}
 
 	mergedBlocks := append(blocks1, blocks2...)
-	return json.Marshal(mergedBlocks)
+	return jsonsurgery.MarshalNoEscape(mergedBlocks)
 }
 
 func anthropicTextBlockRaw(text string) json.RawMessage {
-	block, _ := json.Marshal(map[string]string{
+	block, _ := jsonsurgery.MarshalNoEscape(map[string]string{
 		"type": "text",
 		"text": text,
 	})
@@ -406,7 +406,7 @@ func buildReconstructedAssistantBlock(rec *ReconstructedPair) (json.RawMessage, 
 		"name":  rec.ToolName,
 		"input": rec.Input,
 	}
-	raw, err := json.Marshal([]any{block})
+	raw, err := jsonsurgery.MarshalNoEscape([]any{block})
 	if err != nil {
 		return nil, false
 	}
@@ -444,7 +444,7 @@ func wrapUserContentAsToolResult(raw json.RawMessage, rec *ReconstructedPair) (j
 	// string as the tool_result's content.
 	var simple string
 	if err := json.Unmarshal(raw, &simple); err == nil {
-		block, err := json.Marshal(map[string]any{
+		block, err := jsonsurgery.MarshalNoEscape(map[string]any{
 			"type":        "tool_result",
 			"tool_use_id": rec.ToolUseID,
 			"content":     simple,
@@ -452,7 +452,7 @@ func wrapUserContentAsToolResult(raw json.RawMessage, rec *ReconstructedPair) (j
 		if err != nil {
 			return raw, false, err
 		}
-		out, err := json.Marshal([]json.RawMessage{block})
+		out, err := jsonsurgery.MarshalNoEscape([]json.RawMessage{block})
 		if err != nil {
 			return raw, false, err
 		}
@@ -467,24 +467,30 @@ func wrapUserContentAsToolResult(raw json.RawMessage, rec *ReconstructedPair) (j
 	}
 	noticeIdx := -1
 	var noticeText string
+	var noticeCacheControl json.RawMessage
 	for i, blk := range blocks {
-		var probe struct {
-			Type      string `json:"type"`
-			Text      string `json:"text"`
-			ToolUseID string `json:"tool_use_id"`
-		}
-		if err := json.Unmarshal(blk, &probe); err != nil {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(blk, &fields); err != nil {
 			return raw, false, nil
 		}
-		switch probe.Type {
+		var typeStr, textStr string
+		_ = json.Unmarshal(fields["type"], &typeStr)
+		_ = json.Unmarshal(fields["text"], &textStr)
+		switch typeStr {
 		case "tool_result":
 			// Existing tool_result block — leave the message
 			// alone rather than risk a double-wrap.
 			return raw, false, nil
 		case "text":
-			if noticeIdx < 0 && ContainsInlineApprovalAugmentationMarker(probe.Text) {
+			if noticeIdx < 0 && ContainsInlineApprovalAugmentationMarker(textStr) {
 				noticeIdx = i
-				noticeText = probe.Text
+				noticeText = textStr
+				// Preserve cache_control if the harness pinned
+				// its breakpoint on the notice block (rare here
+				// but matches the tool_result path's invariant).
+				if cc, ok := fields["cache_control"]; ok && len(cc) > 0 {
+					noticeCacheControl = cc
+				}
 			}
 		default:
 			// Non-text, non-tool_result block (tool_use, image,
@@ -498,11 +504,15 @@ func wrapUserContentAsToolResult(raw json.RawMessage, rec *ReconstructedPair) (j
 		// block belongs in the tool_result. Skip rather than guess.
 		return raw, false, nil
 	}
-	toolResultBlock, err := json.Marshal(map[string]any{
+	toolResultFields := map[string]any{
 		"type":        "tool_result",
 		"tool_use_id": rec.ToolUseID,
 		"content":     noticeText,
-	})
+	}
+	if len(noticeCacheControl) > 0 {
+		toolResultFields["cache_control"] = noticeCacheControl
+	}
+	toolResultBlock, err := jsonsurgery.MarshalNoEscape(toolResultFields)
 	if err != nil {
 		return raw, false, err
 	}
@@ -516,7 +526,7 @@ func wrapUserContentAsToolResult(raw json.RawMessage, rec *ReconstructedPair) (j
 		}
 		newBlocks = append(newBlocks, blk)
 	}
-	out, err := json.Marshal(newBlocks)
+	out, err := jsonsurgery.MarshalNoEscape(newBlocks)
 	if err != nil {
 		return raw, false, err
 	}
@@ -528,6 +538,13 @@ func wrapUserContentAsToolResult(raw json.RawMessage, rec *ReconstructedPair) (j
 // stripped synthetic ids with a tool_result paired to the
 // reconstructed tool_use_id (carrying the reconstruction's
 // ResultText as content). Other blocks pass through unchanged.
+//
+// Any non-(type|tool_use_id|content) fields on the original block —
+// notably cache_control — survive the swap. The harness's deepest
+// prompt-cache breakpoint lands on this tool_result; dropping it
+// forces Anthropic to fall back to a system-level cache that has
+// proven not to hit in practice, busting ~15k cached tokens on every
+// approval turn.
 func replaceToolResultsForReconstruction(raw json.RawMessage, orphans map[string]struct{}, rec *ReconstructedPair) (json.RawMessage, bool, error) {
 	if len(raw) == 0 || rec == nil || rec.ToolUseID == "" {
 		return raw, false, nil
@@ -538,24 +555,30 @@ func replaceToolResultsForReconstruction(raw json.RawMessage, orphans map[string
 	}
 	changed := false
 	for i, blk := range blocks {
-		var probe struct {
-			Type      string `json:"type"`
-			ToolUseID string `json:"tool_use_id"`
-		}
-		if err := json.Unmarshal(blk, &probe); err != nil {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(blk, &fields); err != nil {
 			continue
 		}
-		if probe.Type != "tool_result" {
+		var typeStr, toolUseID string
+		_ = json.Unmarshal(fields["type"], &typeStr)
+		_ = json.Unmarshal(fields["tool_use_id"], &toolUseID)
+		if typeStr != "tool_result" {
 			continue
 		}
-		if _, ok := orphans[probe.ToolUseID]; !ok {
+		if _, ok := orphans[toolUseID]; !ok {
 			continue
 		}
-		newBlock, err := json.Marshal(map[string]any{
-			"type":        "tool_result",
-			"tool_use_id": rec.ToolUseID,
-			"content":     rec.ResultText,
-		})
+		newToolUseID, err := jsonsurgery.MarshalNoEscape(rec.ToolUseID)
+		if err != nil {
+			continue
+		}
+		newContent, err := jsonsurgery.MarshalNoEscape(rec.ResultText)
+		if err != nil {
+			continue
+		}
+		fields["tool_use_id"] = newToolUseID
+		fields["content"] = newContent
+		newBlock, err := jsonsurgery.MarshalNoEscape(fields)
 		if err != nil {
 			continue
 		}
@@ -565,7 +588,7 @@ func replaceToolResultsForReconstruction(raw json.RawMessage, orphans map[string
 	if !changed {
 		return raw, false, nil
 	}
-	out, err := json.Marshal(blocks)
+	out, err := jsonsurgery.MarshalNoEscape(blocks)
 	if err != nil {
 		return raw, false, err
 	}
@@ -671,7 +694,7 @@ func stripToolResultsByID(content json.RawMessage, orphans map[string]struct{}) 
 	if dropped {
 		return nil, true, true, nil
 	}
-	out, err := json.Marshal(kept)
+	out, err := jsonsurgery.MarshalNoEscape(kept)
 	if err != nil {
 		return nil, false, false, err
 	}
