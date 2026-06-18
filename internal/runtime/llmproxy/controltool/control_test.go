@@ -307,3 +307,63 @@ func TestSanitizeControlFailureCommandRedactsRawBearerButKeepsPlaceholder(t *tes
 		t.Fatalf("autovault placeholder should remain visible to the model, got %q", got)
 	}
 }
+
+// TestControlNotice_TeachesAgentAboutCompletion covers the COMPLETING
+// guidance: the synthetic /complete URL appears in the EXPAND vs NEW
+// TASK vs COMPLETE decision tree, AND a canonical curl block exists
+// near the end so the agent has an explicit example. The "don't
+// complete a task you intend to resume" framing prevents the thrash
+// failure mode where the agent closes scope between sibling sub-steps.
+func TestControlNotice_TeachesAgentAboutCompletion(t *testing.T) {
+	notice := ControlNotice("http://localhost:25297", []string{"Bash", "Edit", "Read"})
+
+	if !strings.Contains(notice, "EXPAND vs NEW TASK vs COMPLETE") {
+		t.Fatalf("decision tree heading should integrate COMPLETE as a third branch; got:\n%s", notice)
+	}
+	if !strings.Contains(notice, "https://clawvisor.local/control/tasks/<id>/complete") {
+		t.Fatalf("notice should embed the synthetic complete URL so the agent has a deterministic shape to emit; got:\n%s", notice)
+	}
+	if !strings.Contains(notice, "Do NOT complete a task you intend to resume") {
+		t.Fatalf("notice should warn against premature completion to prevent task thrashing; got:\n%s", notice)
+	}
+	if !strings.Contains(notice, "Canonical completion curl") {
+		t.Fatalf("notice should include a canonical completion curl block; got:\n%s", notice)
+	}
+	// Sanity: the rule against `cv-nonce-...` must still be present
+	// — completion shares the rewrite path, and a future careless
+	// edit to the decision tree could drop the surrounding rules.
+	if !strings.Contains(notice, "NEVER write `cv-nonce-...`") {
+		t.Fatalf("notice should still embed the cv-nonce-... prohibition rule; got:\n%s", notice)
+	}
+}
+
+// TestControlMethodForCall_CompletePathDefaultsToPOST is the regression
+// bar for the nonce-target binding on POST /control/tasks/{id}/complete.
+// Without this rule, a bare `curl https://.../complete` (no -X POST, no
+// body) would mint a GET nonce, the daemon would dispatch POST, and the
+// middleware would 403 with NONCE_TARGET_MISMATCH. The canonical curl
+// in the control notice does include -X POST so the rule only catches
+// the half-baked-shell case, but it's load-bearing for that case.
+func TestControlMethodForCall_CompletePathDefaultsToPOST(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		body []byte
+		want string
+	}{
+		{"complete with no body defaults POST", "/api/control/tasks/abc/complete", nil, "POST"},
+		{"complete with body defaults POST", "/api/control/tasks/abc/complete", []byte("{}"), "POST"},
+		{"tasks POST is unchanged", "/api/control/tasks", []byte("{}"), "POST"},
+		{"tasks GET is unchanged when no body", "/api/control/tasks", nil, "GET"},
+		{"task get-by-id is GET", "/api/control/tasks/abc", nil, "GET"},
+		{"unrelated path falls back to GET", "/api/control/skill", nil, "GET"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := controlMethodForCall(tc.path, tc.body)
+			if got != tc.want {
+				t.Errorf("controlMethodForCall(%q, body=%v) = %q, want %q", tc.path, tc.body, got, tc.want)
+			}
+		})
+	}
+}

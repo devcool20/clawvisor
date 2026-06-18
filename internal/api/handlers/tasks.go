@@ -1975,7 +1975,20 @@ func (h *TasksHandler) denyTaskInState(ctx context.Context, taskID, fromStatus s
 // Complete marks a task as finished.
 //
 // POST /api/tasks/{id}/complete
-// Auth: agent bearer token
+// POST /api/control/tasks/{id}/complete
+// Auth: agent bearer token (dashboard) or proxy-minted caller nonce (control).
+//
+// Accepts tasks in either "active" or "expired" state — an expired task
+// still owns chain-fact rows that should be cleaned up on the agent's
+// wrap-up call. The status transition is CAS-guarded by
+// UpdateTaskStatusFrom so a parallel expand / revoke / expiration sweep
+// between the preflight read and the write cannot be silently
+// overwritten. Ownership is pinned to both the task's user AND its
+// agent: the dashboard surface routes through the user's own session
+// (so agent identity is implicit), but the control plane elevates this
+// to a real per-agent boundary — another agent under the same user
+// must not be able to close out (and DROP chain facts for) a task it
+// does not own.
 func (h *TasksHandler) Complete(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	agent := middleware.AgentFromContext(ctx)
@@ -1994,17 +2007,58 @@ func (h *TasksHandler) Complete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "could not get task")
 		return
 	}
-	if task.UserID != agent.UserID {
+	if task.UserID != agent.UserID || task.AgentID != agent.ID {
 		writeError(w, http.StatusForbidden, "FORBIDDEN", "not your task")
 		return
 	}
-	if task.Status != "active" {
-		writeError(w, http.StatusConflict, "INVALID_STATE", "task is not active")
+	if task.Status != "active" && task.Status != "expired" {
+		writeError(w, http.StatusConflict, "INVALID_STATE", "task is not active or expired (status: "+task.Status+")")
 		return
 	}
 
-	if err := h.st.UpdateTaskStatus(ctx, taskID, "completed"); err != nil {
+	won, err := h.st.UpdateTaskStatusFrom(ctx, taskID, task.Status, "completed")
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "could not complete task")
+		return
+	}
+	liveStatus := ""
+	if !won {
+		// Lost the CAS — re-read the task. Two cases:
+		//
+		//   (a) The live status is still one we accept (active or
+		//       expired). The most common driver is the expiration
+		//       sweeper flipping active → expired between preflight
+		//       and the CAS write; that's a benign race we should
+		//       absorb, not surface as a 409 — the agent's call is
+		//       still valid and chain-fact cleanup still needs to
+		//       run. Retry the CAS once with the live fromStatus.
+		//   (b) The live status is non-completable (pending_scope_
+		//       expansion, revoked, denied, already completed). The
+		//       agent needs to react; 409 with the live status in
+		//       the message.
+		//
+		// The retry is bounded to a single attempt: if it also loses,
+		// fall through to the 409 branch with whatever status the
+		// re-read observed. This avoids an unbounded loop if multiple
+		// in-flight callers race.
+		live, livErr := h.st.GetTask(ctx, taskID)
+		if livErr == nil && live != nil {
+			liveStatus = live.Status
+			if live.Status == "active" || live.Status == "expired" {
+				won, err = h.st.UpdateTaskStatusFrom(ctx, taskID, live.Status, "completed")
+				if err != nil {
+					writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "could not complete task")
+					return
+				}
+			}
+		}
+	}
+	if !won {
+		msg := "task moved to a non-completable state"
+		if liveStatus != "" {
+			msg = "task moved to " + liveStatus + " before completion"
+		}
+		writeError(w, http.StatusConflict, "INVALID_STATE", msg)
 		return
 	}
 	if err := h.st.DeleteChainFactsByTask(ctx, taskID); err != nil {
