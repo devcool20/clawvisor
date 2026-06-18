@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/clawvisor/clawvisor/internal/adapters/format"
 	"github.com/clawvisor/clawvisor/internal/adapters/google/credential"
@@ -26,6 +27,11 @@ import (
 const serviceID = "google.gmail"
 
 const gmailModifyScope = "https://www.googleapis.com/auth/gmail.modify"
+
+// listMessagesMetaConcurrency is the maximum concurrent metadata requests
+// when listing messages. Gmail's metadata-read quota is generous enough to
+// leave headroom at this level.
+const listMessagesMetaConcurrency = 15
 
 // gmailScopes is the full set of scopes Gmail can use. The YAML definition is
 // the source of truth for OAuth URL generation and action gating; this list
@@ -175,22 +181,52 @@ func (a *GmailAdapter) listMessages(ctx context.Context, client *http.Client, pa
 	labels := newLabelResolver(ctx, client)
 	items := make([]msgListItem, 0, len(listResp.Messages))
 	unread := 0
-	for _, m := range listResp.Messages {
-		meta, err := fetchMessageMeta(ctx, client, m.ID)
-		if err != nil {
+
+	type fetchResult struct {
+		id   string
+		meta msgMeta
+		err  error
+	}
+
+	numMessages := len(listResp.Messages)
+	results := make([]fetchResult, numMessages)
+
+	if numMessages > 0 {
+		var g errgroup.Group
+		g.SetLimit(listMessagesMetaConcurrency)
+
+		for i, m := range listResp.Messages {
+			i, m := i, m
+			g.Go(func() error {
+				if ctx.Err() != nil {
+					results[i] = fetchResult{id: m.ID, err: ctx.Err()}
+					return nil
+				}
+				meta, err := fetchMessageMeta(ctx, client, m.ID)
+				results[i] = fetchResult{id: m.ID, meta: meta, err: err}
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return nil, fmt.Errorf("gmail list_messages: %w", err)
+		}
+	}
+
+	for _, res := range results {
+		if res.err != nil {
 			continue
 		}
 		item := msgListItem{
-			ID:       m.ID,
-			From:     format.SanitizeHeader(meta.from, format.MaxFieldLen),
-			Subject:  format.SanitizeText(meta.subject, format.MaxFieldLen),
-			Snippet:  format.SanitizeText(meta.snippet, format.MaxSnippetLen),
-			Date:     meta.date,
-			IsUnread: meta.isUnread,
-			Labels:   labels.resolve(meta.labelIDs),
+			ID:       res.id,
+			From:     format.SanitizeHeader(res.meta.from, format.MaxFieldLen),
+			Subject:  format.SanitizeText(res.meta.subject, format.MaxFieldLen),
+			Snippet:  format.SanitizeText(res.meta.snippet, format.MaxSnippetLen),
+			Date:     res.meta.date,
+			IsUnread: res.meta.isUnread,
+			Labels:   labels.resolve(res.meta.labelIDs),
 		}
 		items = append(items, item)
-		if meta.isUnread {
+		if res.meta.isUnread {
 			unread++
 		}
 	}
