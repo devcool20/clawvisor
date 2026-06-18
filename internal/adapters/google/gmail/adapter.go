@@ -207,7 +207,9 @@ func (a *GmailAdapter) listMessages(ctx context.Context, client *http.Client, pa
 				return nil
 			})
 		}
-		_ = g.Wait()
+		if err := g.Wait(); err != nil {
+			return nil, fmt.Errorf("gmail list_messages: %w", err)
+		}
 	}
 
 	for _, res := range results {
