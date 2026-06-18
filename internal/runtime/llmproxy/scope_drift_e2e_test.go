@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -767,13 +768,15 @@ func TestScopeDriftE2E_NewTaskFullStateMachine(t *testing.T) {
 //     turn carrying the Bash placeholder tool_use with the original
 //     tool_use_id, paired with a user turn whose tool_result names
 //     the same tool_use_id.
-//  3. Run RewriteScopeDriftPlaceholders.
+//  3. Dispatch through DefaultInboundRegistry().ForProvider(provider)
+//     so the test exercises the same routing path the handler uses.
 //  4. Assert the assistant turn was restored byte-for-byte (the
 //     model's original Bash command + input survives) AND the
 //     user-turn tool_result content is the menu text.
 //
-// Also asserts the substitution is consumed one-shot — a second
-// RewriteScopeDriftPlaceholders is a no-op.
+// Also asserts the substitution survives across turns — a second
+// RewriteInbound call rewrites again so the harness's stored history
+// stays correct for the full conversation.
 func TestScopeDriftE2E_InboundRewritesPlaceholder(t *testing.T) {
 	t.Parallel()
 	reg := NewMemoryScopeDriftRegistry(time.Minute)
@@ -807,17 +810,9 @@ func TestScopeDriftE2E_InboundRewritesPlaceholder(t *testing.T) {
 		`]}`)
 
 	agent := &store.Agent{ID: driftTestAgentID, UserID: driftTestUserID}
-	result, err := RewriteScopeDriftPlaceholders(context.Background(), ScopeDriftInboundRewriteRequest{
-		HTTPRequest:    httptest.NewRequest("POST", "/v1/messages", nil),
-		Provider:       conversation.ProviderAnthropic,
-		Body:           body,
-		Agent:          agent,
-		ConversationID: driftTestConvID,
-		ScopeDrifts:    reg,
-		Logger:         slog.Default(),
-	})
+	result, err := runInboundRewrite(t, conversation.ProviderAnthropic, httptest.NewRequest("POST", "/v1/messages", nil), body, agent, reg)
 	if err != nil {
-		t.Fatalf("RewriteScopeDriftPlaceholders: %v", err)
+		t.Fatalf("RewriteInbound: %v", err)
 	}
 	if !result.Rewritten {
 		t.Fatal("expected Rewritten=true")
@@ -905,17 +900,9 @@ func TestScopeDriftE2E_InboundRewritesPlaceholder(t *testing.T) {
 	// keeps the Bash placeholder in its stored history for the rest of
 	// the conversation; without persistent restoration the model would
 	// see its own past as the placeholder from turn 3 onward.
-	second, err := RewriteScopeDriftPlaceholders(context.Background(), ScopeDriftInboundRewriteRequest{
-		HTTPRequest:    httptest.NewRequest("POST", "/v1/messages", nil),
-		Provider:       conversation.ProviderAnthropic,
-		Body:           body,
-		Agent:          agent,
-		ConversationID: driftTestConvID,
-		ScopeDrifts:    reg,
-		Logger:         slog.Default(),
-	})
+	second, err := runInboundRewrite(t, conversation.ProviderAnthropic, httptest.NewRequest("POST", "/v1/messages", nil), body, agent, reg)
 	if err != nil {
-		t.Fatalf("second RewriteScopeDriftPlaceholders: %v", err)
+		t.Fatalf("second RewriteInbound: %v", err)
 	}
 	if !second.Rewritten {
 		t.Fatal("expected second rewrite to also restore the placeholder (substitutions persist across turns)")
@@ -963,17 +950,9 @@ func TestScopeDriftE2E_InboundRewritesOpenAIResponsesPlaceholder(t *testing.T) {
 
 	agent := &store.Agent{ID: driftTestAgentID, UserID: driftTestUserID}
 	httpReq := httptest.NewRequest("POST", "/v1/responses", nil)
-	result, err := RewriteScopeDriftPlaceholders(context.Background(), ScopeDriftInboundRewriteRequest{
-		HTTPRequest:    httpReq,
-		Provider:       conversation.ProviderOpenAI,
-		Body:           body,
-		Agent:          agent,
-		ConversationID: driftTestConvID,
-		ScopeDrifts:    reg,
-		Logger:         slog.Default(),
-	})
+	result, err := runInboundRewrite(t, conversation.ProviderOpenAI, httpReq, body, agent, reg)
 	if err != nil {
-		t.Fatalf("RewriteScopeDriftPlaceholders: %v", err)
+		t.Fatalf("RewriteInbound: %v", err)
 	}
 	if !result.Rewritten {
 		t.Fatalf("expected Rewritten=true; AppliedDriftIDs=%v", result.AppliedDriftIDs)
@@ -1072,17 +1051,9 @@ func TestScopeDriftE2E_InboundRewritesOpenAIResponsesPlaceholderChained(t *testi
 
 	agent := &store.Agent{ID: driftTestAgentID, UserID: driftTestUserID}
 	httpReq := httptest.NewRequest("POST", "/v1/responses", nil)
-	result, err := RewriteScopeDriftPlaceholders(context.Background(), ScopeDriftInboundRewriteRequest{
-		HTTPRequest:    httpReq,
-		Provider:       conversation.ProviderOpenAI,
-		Body:           body,
-		Agent:          agent,
-		ConversationID: driftTestConvID,
-		ScopeDrifts:    reg,
-		Logger:         slog.Default(),
-	})
+	result, err := runInboundRewrite(t, conversation.ProviderOpenAI, httpReq, body, agent, reg)
 	if err != nil {
-		t.Fatalf("RewriteScopeDriftPlaceholders: %v", err)
+		t.Fatalf("RewriteInbound: %v", err)
 	}
 	if !result.Rewritten {
 		t.Fatalf("expected Rewritten=true in chained mode; AppliedDriftIDs=%v", result.AppliedDriftIDs)
@@ -1362,9 +1333,12 @@ func TestScopeDriftE2E_NewTaskPendingCreatorFailureClosesDrift(t *testing.T) {
 	}
 }
 
-// TestScopeDriftE2E_NewTaskAutoApproveResolvesDriftSucceeded verifies that if a task is
-// auto-approved, the drift is successfully resolved immediately without human prompting.
-func TestScopeDriftE2E_NewTaskAutoApproveResolvesDriftSucceeded(t *testing.T) {
+// TestScopeDriftE2E_NewTaskAutoApproveDefersDriftOutcome verifies that
+// when a task is auto-approved the evaluator emits a verdict carrying
+// the DeferredDriftOutcome spec (postprocess realizes the SetOutcome
+// at commit time) and does NOT write the registry itself — that's the
+// verdict-purity invariant.
+func TestScopeDriftE2E_NewTaskAutoApproveDefersDriftOutcome(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	reg := NewMemoryScopeDriftRegistry(0)
@@ -1428,13 +1402,26 @@ func TestScopeDriftE2E_NewTaskAutoApproveResolvesDriftSucceeded(t *testing.T) {
 		t.Fatal("expected auto-approve verdict to set SubstituteWith with the [Clawvisor] notice")
 	}
 
-	// Verify that the drift outcome was marked as Succeeded.
+	// The verdict carries the DeferredDriftOutcome spec; the registry
+	// must NOT have been touched by the evaluator (verdict purity).
+	if verdict.DeferredDriftOutcome == nil {
+		t.Fatal("expected auto-approve verdict to carry DeferredDriftOutcome so postprocess commits SetOutcome")
+	}
+	if verdict.DeferredDriftOutcome.DriftID != drift.ID {
+		t.Fatalf("DeferredDriftOutcome.DriftID = %q, want %q", verdict.DeferredDriftOutcome.DriftID, drift.ID)
+	}
+	if verdict.DeferredDriftOutcome.Outcome != string(ScopeDriftOutcomeSucceeded) {
+		t.Fatalf("DeferredDriftOutcome.Outcome = %q, want %q", verdict.DeferredDriftOutcome.Outcome, ScopeDriftOutcomeSucceeded)
+	}
 	stored, err := reg.Get(ctx, drift.ID)
 	if err != nil {
 		t.Fatalf("get drift: %v", err)
 	}
-	if stored.Outcome != ScopeDriftOutcomeSucceeded {
-		t.Fatalf("drift Outcome = %q, want %q", stored.Outcome, ScopeDriftOutcomeSucceeded)
+	if stored.Outcome == ScopeDriftOutcomeSucceeded {
+		t.Fatalf("evaluator must NOT call SetOutcome — the verdict defers it. Outcome=%q", stored.Outcome)
+	}
+	if stored.Outcome != ScopeDriftOutcomePending {
+		t.Fatalf("drift Outcome = %q, want %q (claim was made by guard.Claim, outcome is deferred)", stored.Outcome, ScopeDriftOutcomePending)
 	}
 }
 
@@ -1595,87 +1582,32 @@ func (m *mockTaskRiskAssessor) AssessEnvelope(_ context.Context, _ TaskRiskAsses
 	return m.verdict
 }
 
-type failingOutcomeRegistry struct {
-	ScopeDriftRegistry
-	failSetOutcome bool
-}
+// (The SetOutcome-failure rollback test that used to live here has
+// moved to postproc/session_commit_test.go's
+// TestCommitVerdictSideEffectsRollsBackClaimOnSetOutcomeFailure —
+// after Gap-1 the side-effect happens at commit time, not in the
+// evaluator, so the test belongs alongside the layer that owns the
+// behavior. The evaluator-level contract is now: "verdict carries
+// DeferredDriftOutcome spec; the registry is untouched", which
+// TestScopeDriftE2E_NewTaskAutoApproveDefersDriftOutcome above pins.)
 
-func (r *failingOutcomeRegistry) SetOutcome(ctx context.Context, driftID string, outcome ScopeDriftOutcome) error {
-	if r.failSetOutcome {
-		return errors.New("database connection lost during outcome write")
+// runInboundRewrite dispatches through the InboundRegistry exactly
+// the way the production handler does, so e2e tests exercise the same
+// routing path the handler uses rather than an ad-hoc shortcut.
+func runInboundRewrite(t *testing.T, provider conversation.Provider, httpReq *http.Request, body []byte, agent *store.Agent, reg SubstitutionRegistry) (conversation.InboundRewriteResult, error) {
+	t.Helper()
+	rewriter := DefaultInboundRegistry().ForProvider(provider)
+	if rewriter == nil {
+		t.Fatalf("no inbound rewriter registered for provider %q", provider)
 	}
-	return r.ScopeDriftRegistry.SetOutcome(ctx, driftID, outcome)
-}
-
-// TestScopeDriftE2E_NewTaskAutoApproveSetOutcomeFailureRollsBackDrift verifies that if task auto-approval
-// triggers and task creation succeeds, but the registry write for SetOutcome(Succeeded) fails, the claim is
-// rolled back and the request falls through.
-func TestScopeDriftE2E_NewTaskAutoApproveSetOutcomeFailureRollsBackDrift(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	innerReg := NewMemoryScopeDriftRegistry(0)
-	reg := &failingOutcomeRegistry{ScopeDriftRegistry: innerReg, failSetOutcome: true}
-	cache := NewMemoryPendingApprovalCache(time.Minute)
-	drift, _ := mintDriftFixture(t, reg, ScopeDriftSourceTaskScope)
-
-	taskBody := &runtimetasks.TaskCreateRequest{
-		Purpose:                "File the issue",
-		IntentVerificationMode: "strict",
-		ExpiresInSeconds:       600,
-		ExpectedTools: []runtimetasks.ExpectedTool{
-			{ToolName: "Bash", Why: "curl to github"},
-		},
-		DriftID: drift.ID,
-	}
-	taskBodyJSON, _ := json.Marshal(taskBody)
-	tu := conversation.ToolUse{
-		ID:    "tu-create",
-		Name:  "Bash",
-		Input: json.RawMessage(`{"body":` + string(mustJSON(string(taskBodyJSON))) + `}`),
-	}
-
-	// Creator succeeds on task creation, but SetOutcome will fail.
-	fc := &fakeInlineTaskCreator{}
-	assessor := &mockTaskRiskAssessor{
-		verdict: &TaskRiskAssessment{
-			RiskLevel:   "low",
-			IntentMatch: "yes",
-		},
-	}
-	cfg := PostprocessConfig{
-		AgentContext:         AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID, AgentName: "agent-drift"},
-		AuditContext:         AuditContext{ConversationID: driftTestConvID},
-		AuthorizationContext: AuthorizationContext{ScopeDrifts: reg},
-		ApprovalContext: ApprovalContext{
-			PendingApprovals:                 cache,
-			InlineTaskCreator:                fc,
-			TaskRiskAssessor:                 assessor,
-			ConversationAutoApproveThreshold: "low",
-			RecentUserTurns:                  []string{"please file the issue immediately"},
-		},
-	}
-	httpReq := httptest.NewRequest("POST", "http://daemon/api/control/tasks?surface=inline", nil)
-	call := ControlCall{Method: "POST", URL: httpReq.URL}
-
-	_, ok := MaybeInterceptInlineTaskDefinition(httpReq, cfg, func(string, string, string) {}, func(string, ...any) {}, conversation.ProviderAnthropic, tu, call)
-	if ok {
-		t.Fatal("expected task definition intercept to return false (fallthrough) due to SetOutcome failure")
-	}
-
-	// Verify that the drift outcome and chosen option were rolled back (cleared).
-	stored, err := reg.Get(ctx, drift.ID)
-	if err != nil {
-		t.Fatalf("get drift: %v", err)
-	}
-	if stored.Outcome != "" {
-		t.Fatalf("drift Outcome = %q, want empty", stored.Outcome)
-	}
-	if stored.ChosenOption != "" {
-		t.Fatalf("drift ChosenOption = %q, want empty", stored.ChosenOption)
-	}
-
-	// Verify we can claim the drift again (it was successfully rolled back).
-	if _, err := reg.ClaimOption(ctx, drift.ID, ScopeDriftOptionNewTask, "retry"); err != nil {
-		t.Fatalf("expected drift to be claimable again, but got err: %v", err)
-	}
+	return rewriter.RewriteInbound(context.Background(), conversation.InboundRewriteRequest{
+		HTTPRequest:    httpReq,
+		Provider:       provider,
+		Body:           body,
+		AgentID:        agent.ID,
+		AgentUserID:    agent.UserID,
+		ConversationID: driftTestConvID,
+		Lookup:         NewSubstitutionLookup(reg),
+		Logger:         slog.Default(),
+	})
 }

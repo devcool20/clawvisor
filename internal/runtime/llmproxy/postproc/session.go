@@ -15,12 +15,18 @@ import (
 // streaming postprocess both use this shape so capture/finalize
 // lifecycle details stay in one place.
 //
-// substitutions tracks pending-substitution registry writes that fired
-// during evaluation (scope-drift mints, recoverable-deny migrations).
-// rollback() iterates them so a request whose response is later
-// failClosed'd doesn't leak orphan entries. trackSubstitution is the
-// single entry point; postproc.go and stream.go call it after each
-// eval verdict commits.
+// substitutions tracks pending-substitution registry writes that
+// fired during evaluation (scope-drift mints, recoverable-deny
+// migrations, inline-task auto-approve). driftOutcomes tracks
+// SetOutcome writes deferred via the verdict's DeferredDriftOutcome.
+// rollback() iterates both so a request whose response is later
+// failClosed'd doesn't leak orphan entries or stale pre-clears.
+// commitVerdictSideEffects is the single entry point — it walks each
+// verdict, applies the drift outcome first (so the pre-clear lands
+// before the substitution mint that depends on it) and then registers
+// the substitution. Evaluators MUST NOT call into the registry
+// themselves; the spec-on-verdict pattern keeps the verdict pure data
+// and concentrates rollback in one place.
 type postprocessSession struct {
 	baseCfg                  llmproxy.PostprocessConfig
 	evalCfg                  llmproxy.PostprocessConfig
@@ -30,6 +36,7 @@ type postprocessSession struct {
 	finalizer                *pipeline.Finalizer
 	fed                      bool
 	substitutions            []llmproxy.PendingSubstitutionKey
+	driftOutcomes            []string
 }
 
 func newPostprocessSession(cfg llmproxy.PostprocessConfig) *postprocessSession {
@@ -93,35 +100,180 @@ func (s *postprocessSession) rollback(ctx context.Context, toolUses []conversati
 		s.feed(toolUses, verdictByTU)
 		s.finalizer.Rollback(ctx)
 	}
-	s.rollbackSubstitutions(ctx)
+	s.rollbackVerdictSideEffects(ctx)
 }
 
-// trackSubstitution records a pending-substitution registry write so
-// rollback() can revert it if the response is later failClosed'd. Nil
-// keys are ignored so callers can pass through transform results
-// directly without branching.
-func (s *postprocessSession) trackSubstitution(key *llmproxy.PendingSubstitutionKey) {
-	if s == nil || key == nil {
+// commitVerdictSideEffects walks each verdict in tool_use order and
+// realizes the spec-on-verdict signals — DeferredDriftOutcome FIRST
+// (so the pre-clear mint lands before the substitution write that
+// depends on it), then PendingSubstitution. Called AFTER all
+// evaluators have produced verdicts so the verdict itself stays free
+// of registry side-effects.
+//
+// Ordering is intentional and per-verdict atomic-ish: if drift outcome
+// succeeds but substitution fails, the drift outcome is recorded in
+// session.driftOutcomes and rolls back via session.rollback when the
+// caller fail-closes. The spec's TaskRollback handle (today: only the
+// inline-task auto-approve path populates it) is honoured via the
+// configured InlineApprovedTaskExpirer with a detached context so a
+// mid-request client disconnect doesn't cancel the rollback.
+//
+// Returns the failing error so the caller (postproc / stream) can
+// fail-closed the response — rollback() then sweeps every write made
+// on behalf of this request in one place.
+func (s *postprocessSession) commitVerdictSideEffects(ctx context.Context, verdictByTU map[string]conversation.ToolUseVerdict, toolUses []conversation.ToolUse) error {
+	if s == nil {
+		return nil
+	}
+	registry := s.baseCfg.AuthorizationContext.ScopeDrifts
+	if registry == nil {
+		return nil
+	}
+	agentID := s.baseCfg.AgentContext.AgentID
+	conversationID := s.baseCfg.AuditContext.ConversationID
+	for _, tu := range toolUses {
+		v, ok := verdictByTU[tu.ID]
+		if !ok {
+			continue
+		}
+		if spec := v.DeferredDriftOutcome; spec != nil && spec.DriftID != "" {
+			if err := registry.SetOutcome(ctx, spec.DriftID, llmproxy.ScopeDriftOutcome(spec.Outcome)); err != nil {
+				// Roll back the claim the evaluator's guard.Claim made.
+				// guard.Success() already fired by the time we got here
+				// (the verdict was emitted), so the deferred guard.Rollback
+				// in the evaluator is a no-op. The agent's retry should
+				// mint a fresh drift; leave this one claimed-but-unresolved
+				// would block ClaimOption for the same agent indefinitely.
+				_ = registry.RollbackClaim(ctx, spec.DriftID)
+				if v.PendingSubstitution != nil && v.PendingSubstitution.TaskRollback != nil {
+					s.expireRollbackTask(ctx, v.PendingSubstitution.TaskRollback, err)
+				}
+				return err
+			}
+			s.driftOutcomes = append(s.driftOutcomes, spec.DriftID)
+		}
+		if v.PendingSubstitution == nil {
+			continue
+		}
+		spec := v.PendingSubstitution
+		if agentID == "" || conversationID == "" {
+			// Identity tuple incomplete — the same guard the evaluators
+			// applied before populating the spec. Skip rather than mint
+			// a key that would collide across concurrent conversations.
+			continue
+		}
+		key := llmproxy.PendingSubstitutionKey{
+			AgentID:        agentID,
+			ConversationID: conversationID,
+			ToolUseID:      tu.ID,
+		}
+		err := registry.RegisterPendingSubstitution(ctx, key, llmproxy.PendingSubstitution{
+			DriftID:           spec.DriftID,
+			MenuText:          spec.MenuText,
+			OriginalToolName:  spec.OriginalToolName,
+			OriginalToolInput: append([]byte(nil), spec.OriginalToolInput...),
+		})
+		if err != nil {
+			if spec.TaskRollback != nil {
+				s.expireRollbackTask(ctx, spec.TaskRollback, err)
+			}
+			// Earlier drift outcomes / substitutions stay tracked; the
+			// session.rollback the caller fires next will sweep them.
+			return err
+		}
+		s.substitutions = append(s.substitutions, key)
+	}
+	return nil
+}
+
+// expireRollbackTask invokes the configured InlineApprovedTaskExpirer
+// to unwind an orphan task left behind when registration failed.
+// Detached context with a short timeout protects the rollback from a
+// canceled client connection (the same condition that may have caused
+// the registry write to fail in the first place).
+func (s *postprocessSession) expireRollbackTask(ctx context.Context, handle *conversation.PendingSubstitutionTaskRollback, regErr error) {
+	creator := s.baseCfg.InlineTaskCreator
+	if creator == nil || handle == nil {
 		return
 	}
-	s.substitutions = append(s.substitutions, *key)
+	trace := llmproxy.TraceLoggerEmit(s.baseCfg.AuditContext.Trace)
+	expirer, ok := creator.(llmproxy.InlineApprovedTaskExpirer)
+	if !ok {
+		// The creator implementation predates the rollback interface;
+		// can't undo. Trace so operators can see why an orphan exists.
+		if trace != nil {
+			trace("inline_task.auto_approve_rollback_unavailable",
+				"task_id", handle.TaskID,
+				"reason", "InlineTaskCreator does not implement InlineApprovedTaskExpirer",
+			)
+		}
+		return
+	}
+	rollbackCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+	if err := expirer.ExpireInlineApprovedTask(rollbackCtx, handle.TaskID, handle.UserID); err != nil {
+		if trace != nil {
+			trace("inline_task.auto_approve_rollback_failed",
+				"task_id", handle.TaskID,
+				"err", err.Error(),
+				"register_err", regErr.Error(),
+			)
+		}
+	}
+	// The auto-approve evaluator also set the conversation's checkout
+	// to the just-expired task. Clear it conditionally — only when the
+	// stored value still names OUR task — so a concurrent flow that
+	// re-pointed the checkout after we set it isn't clobbered. Without
+	// this, subsequent turns surface a "task missing" experience: the
+	// model fetches the active task ID, gets the expired one, and asks
+	// the user to retry.
+	if checkouts := s.baseCfg.Checkouts; checkouts != nil && handle.AgentID != "" && handle.ConversationID != "" {
+		key := llmproxy.TaskCheckoutKey{
+			UserID:         handle.UserID,
+			AgentID:        handle.AgentID,
+			ConversationID: handle.ConversationID,
+		}
+		current, ok, getErr := checkouts.Get(rollbackCtx, key)
+		if getErr == nil && ok && current.TaskID == handle.TaskID {
+			if clearErr := checkouts.Clear(rollbackCtx, key); clearErr != nil && trace != nil {
+				trace("inline_task.auto_approve_rollback_checkout_clear_failed",
+					"task_id", handle.TaskID,
+					"err", clearErr.Error(),
+				)
+			}
+		}
+	}
 }
 
-// rollbackSubstitutions deletes every tracked registry write. Idempotent
-// — subsequent calls are no-ops because the slice is cleared.
-func (s *postprocessSession) rollbackSubstitutions(ctx context.Context) {
-	if s == nil || len(s.substitutions) == 0 {
+// rollbackVerdictSideEffects undoes every registry write the session
+// performed for this request: deferred drift outcomes (via
+// RollbackClaim, which also clears the pre-clear minted by
+// SetOutcome(Succeeded)) and pending substitutions (via
+// DeletePendingSubstitution). Idempotent — subsequent calls are
+// no-ops because both slices are cleared.
+func (s *postprocessSession) rollbackVerdictSideEffects(ctx context.Context) {
+	if s == nil {
 		return
 	}
 	registry := s.baseCfg.AuthorizationContext.ScopeDrifts
 	if registry == nil {
 		s.substitutions = nil
+		s.driftOutcomes = nil
 		return
 	}
 	for _, key := range s.substitutions {
 		registry.DeletePendingSubstitution(ctx, key)
 	}
 	s.substitutions = nil
+	for _, driftID := range s.driftOutcomes {
+		// RollbackClaim resets ChosenOption + Outcome AND deletes the
+		// pre-clear minted by SetOutcome(Succeeded). The original claim
+		// was made by the evaluator (guard.Claim) whose guard.Success()
+		// already fired by the time we got here, so the full unwind is
+		// the right shape: the agent's retry mints a fresh drift.
+		_ = registry.RollbackClaim(ctx, driftID)
+	}
+	s.driftOutcomes = nil
 }
 
 func (s *postprocessSession) dropCommitted(ctx context.Context, capture *pipeline.HoldCapture) error {
@@ -134,21 +286,44 @@ func (s *postprocessSession) dropCommitted(ctx context.Context, capture *pipelin
 }
 
 func (s *postprocessSession) dropCommittedAndRollback(ctx context.Context, capture *pipeline.HoldCapture) error {
-	if s == nil || s.finalizer == nil || capture == nil {
+	if s == nil {
 		return nil
 	}
 	cleanupCtx, cancel := cleanupContext(ctx)
 	defer cancel()
-	return s.finalizer.DropCommittedAndRollback(cleanupCtx, *capture)
+	var err error
+	if s.finalizer != nil && capture != nil {
+		err = s.finalizer.DropCommittedAndRollback(cleanupCtx, *capture)
+	}
+	// The streaming write paths call this AFTER commitVerdictSideEffects
+	// has already landed substitutions / drift outcomes in the registry.
+	// Sweeping the verdict-side-effect writes here too means a partial
+	// streaming success (commit succeeded, write failed) doesn't strand
+	// the registry with substitutions for tool_uses the harness never
+	// actually saw on the wire. Runs unconditional on the session so a
+	// nil/no-capture finalizer doesn't short-circuit the verdict-side-
+	// effect sweep.
+	s.rollbackVerdictSideEffects(cleanupCtx)
+	return err
 }
 
 func (s *postprocessSession) dropAllCommittedAndRollback(ctx context.Context) error {
-	if s == nil || s.finalizer == nil {
+	if s == nil {
 		return nil
 	}
 	cleanupCtx, cancel := cleanupContext(ctx)
 	defer cancel()
-	return s.finalizer.DropAllCommittedAndRollback(cleanupCtx)
+	var err error
+	if s.finalizer != nil {
+		err = s.finalizer.DropAllCommittedAndRollback(cleanupCtx)
+	}
+	// Same rationale as dropCommittedAndRollback: any registry writes
+	// that landed during commitVerdictSideEffects must be undone when a
+	// downstream streaming write fails, or subsequent harness retries
+	// will hit stale substitution entries for tool_uses that never
+	// reached them.
+	s.rollbackVerdictSideEffects(cleanupCtx)
+	return err
 }
 
 func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {

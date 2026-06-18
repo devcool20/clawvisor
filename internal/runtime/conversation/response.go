@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -82,6 +83,24 @@ type ToolUseVerdict struct {
 	// rows can link to the same task_id.
 	CreatedTaskID string
 
+	// PendingSubstitution, when non-nil, declares that the postprocess
+	// layer should register an inbound substitution after the verdict
+	// is finalized. Evaluators MUST NOT write to the substitution
+	// registry directly — populate this field and let the postprocess
+	// layer own the registry write and its rollback. This restores
+	// the "verdict is pure data" invariant: the verdict describes
+	// what should happen; postprocess realizes it.
+	PendingSubstitution *PendingSubstitutionSpec
+
+	// DeferredDriftOutcome, when non-nil, declares that the
+	// postprocess layer should mark a scope-drift record with the
+	// given outcome after the verdict is finalized. Same pattern as
+	// PendingSubstitution: evaluators populate intent, postprocess
+	// owns the write + rollback. Committed BEFORE PendingSubstitution
+	// in the same pass so the pre-clear is in place before the
+	// substitution registers.
+	DeferredDriftOutcome *DeferredDriftOutcomeSpec
+
 	// HeldKindHint is the policy-set classification of this verdict
 	// for postproc's coalescing pass. When empty, classification falls
 	// back to the Allowed / RewriteInput shape.
@@ -98,6 +117,69 @@ type ToolUseVerdict struct {
 	// evaluator that runs, including those returning Skip —
 	// observation is a separate channel from verdict claiming.
 	Facts []EvaluationFact
+}
+
+// PendingSubstitutionSpec describes an inbound substitution the
+// postprocess layer should register after the verdict is finalized.
+// The spec is pure data: evaluators populate it; postprocess realizes
+// it. Provider-specific marshaling and registry keying happen in
+// postprocess, so this struct stays free of llmproxy-package
+// dependencies.
+//
+// Fields:
+//   - DriftID: scope-drift record this substitution is associated
+//     with (mint path), empty for paths that don't mint a drift
+//     (recoverable-deny).
+//   - MenuText: content the inbound rewriter splices into the
+//     tool_result on the next /v1/messages.
+//   - OriginalToolName / OriginalToolInput: the model's original
+//     tool_use fields, restored by the inbound rewriter into the
+//     prior assistant turn so the model never sees the harness-side
+//     placeholder.
+//   - TaskRollback: when non-nil, the inline task to expire if the
+//     registry write fails. Used by auto-approve so a failed
+//     registration unwinds the orphan task created earlier in the
+//     evaluator.
+type PendingSubstitutionSpec struct {
+	DriftID           string
+	MenuText          string
+	OriginalToolName  string
+	OriginalToolInput []byte
+	TaskRollback      *PendingSubstitutionTaskRollback
+}
+
+// PendingSubstitutionTaskRollback names an inline task the postprocess
+// layer must expire if the substitution registry write fails. Carried
+// by the auto-approve path. The expirer itself lives in the
+// PostprocessConfig (InlineTaskCreator); the spec only carries the
+// identity tuple needed to invoke it.
+//
+// AgentID + ConversationID let postprocess also clear the conversation
+// checkout the auto-approve flow set inline before returning the
+// verdict. Without that sweep, a commit failure leaves the checkout
+// pointing at the just-expired task and subsequent turns surface a
+// "task missing" experience.
+type PendingSubstitutionTaskRollback struct {
+	TaskID         string
+	UserID         string
+	AgentID        string
+	ConversationID string
+}
+
+// DeferredDriftOutcomeSpec asks the postprocess layer to mark a
+// scope-drift record with the given outcome after the verdict is
+// finalized. Like PendingSubstitution, this keeps the verdict pure
+// data: the evaluator declares intent, postprocess performs the
+// registry write. Used today by the inline-task auto-approve path,
+// which previously called SetOutcome(Succeeded) directly from the
+// evaluator.
+//
+// Outcome is carried as a string so the conversation package stays
+// free of llmproxy-package dependencies; the postprocess layer
+// converts it to the typed ScopeDriftOutcome on commit.
+type DeferredDriftOutcomeSpec struct {
+	DriftID string
+	Outcome string
 }
 
 type RewriteResult struct {
@@ -156,6 +238,169 @@ type StreamingResponseRewriter interface {
 	// arrive; the returned result still carries the full ToolUses slice
 	// for callers that don't supply a callback.
 	StreamRewrite(ctx context.Context, r io.Reader, w io.Writer, onToolUse func(ToolUse)) (StreamingRewriteResult, error)
+}
+
+// InboundSubstitutionLookup is the read-only registry view the
+// InboundRewriter consults to find pending substitutions keyed by
+// (agent, conversation, tool_use_id). The lookup is non-consuming —
+// the harness's stored history carries the placeholder for the rest
+// of the conversation, so every subsequent inbound request has to
+// restore it. The lifetime is owned by the postprocess layer that
+// registered the entry; the rewriter is purely a reader.
+type InboundSubstitutionLookup interface {
+	LookupPendingSubstitution(ctx context.Context, agentID, conversationID, toolUseID string) (InboundPendingSubstitution, bool)
+}
+
+// InboundPendingSubstitution is the rewriter's view of a registry
+// entry. Mirrors the fields PendingSubstitutionSpec carried into the
+// registry on the response leg, lifted into the conversation package
+// so the rewriter doesn't depend on llmproxy.
+type InboundPendingSubstitution struct {
+	DriftID           string
+	MenuText          string
+	OriginalToolName  string
+	OriginalToolInput []byte
+}
+
+// InboundRewriteRequest is the input to InboundRewriter.RewriteInbound.
+// Identifying context (Agent + ConversationID) keys into the
+// substitution lookup; Body + Provider drive the JSON shape walk.
+type InboundRewriteRequest struct {
+	HTTPRequest    *http.Request
+	Provider       Provider
+	Body           []byte
+	AgentID        string
+	AgentUserID    string
+	ConversationID string
+	Lookup         InboundSubstitutionLookup
+	Logger         *slog.Logger
+}
+
+// InboundRewriteResult reports what RewriteInbound did. Rewritten=false
+// + nil error means no pending substitutions applied to the body.
+type InboundRewriteResult struct {
+	Body            []byte
+	Rewritten       bool
+	AppliedDriftIDs []string
+}
+
+// InboundRewriter is the per-provider abstraction for the inbound
+// /v1/messages (or /v1/responses, /v1/chat/completions) walker that
+// restores model-original tool_use blocks and splices menu text into
+// the matching tool_result on retry. Mirrors ResponseRewriter on the
+// outbound leg so dispatch, testing, and registry shape stay
+// symmetric.
+type InboundRewriter interface {
+	Name() Provider
+	// MatchesInbound returns true when this rewriter knows how to
+	// walk the request's body shape. Provider routing is the
+	// primary signal — Anthropic vs OpenAI — with sub-shape
+	// disambiguation (Chat Completions vs Responses) handled inside
+	// RewriteInbound where the body bytes are already in scope.
+	MatchesInbound(req *http.Request) bool
+	RewriteInbound(ctx context.Context, req InboundRewriteRequest) (InboundRewriteResult, error)
+}
+
+// InboundRegistry dispatches inbound bodies to the matching
+// InboundRewriter. Parallel to ResponseRegistry so callers can route
+// either leg through one canonical Match() lookup.
+type InboundRegistry struct {
+	rewriters []InboundRewriter
+}
+
+func NewInboundRegistry(rewriters ...InboundRewriter) *InboundRegistry {
+	return &InboundRegistry{rewriters: rewriters}
+}
+
+// Match returns the first registered rewriter that claims the
+// request, or nil. Provider routing happens via MatchesInbound; the
+// caller's only job is to feed the *http.Request.
+func (r *InboundRegistry) Match(req *http.Request) InboundRewriter {
+	if r == nil {
+		return nil
+	}
+	for _, rewriter := range r.rewriters {
+		if rewriter.MatchesInbound(req) {
+			return rewriter
+		}
+	}
+	return nil
+}
+
+// ForProvider returns the registered rewriter for the given provider,
+// or nil. Parallels ResponseRegistry.ForProvider for callers that
+// dispatch by provider name (lite-proxy route resolver, tests).
+func (r *InboundRegistry) ForProvider(p Provider) InboundRewriter {
+	if r == nil {
+		return nil
+	}
+	for _, rewriter := range r.rewriters {
+		if rewriter.Name() == p {
+			return rewriter
+		}
+	}
+	return nil
+}
+
+// InboundBodyShape exposes per-provider readers and writers for the
+// inbound request body's role-based turn structure. Anthropic's
+// {messages: [{role, content}]} and OpenAI's {input | messages} both
+// project onto these primitives. Centralizing the per-provider walks
+// behind one interface lets call sites stop hand-rolling switches —
+// agent notices, secret-decision parsing, human-turn extraction,
+// assistant-text injection all share the same dispatch shape as the
+// response and inbound rewriters.
+//
+// All methods are safe to call on nil/malformed bodies — they return
+// the zero value of their return type rather than erroring, mirroring
+// the existing helper contracts the call sites depended on.
+type InboundBodyShape interface {
+	Name() Provider
+	// HasAssistantTurn reports whether the body contains at least one
+	// turn with role "assistant".
+	HasAssistantTurn(body []byte) bool
+	// RecentHumanTurns returns the most recent genuine human-authored
+	// chat turns in chronological order (most recent last), with
+	// Clawvisor-internal artifacts filtered and tail-limited to a
+	// small bound. Auto-approve assessment consumes these.
+	RecentHumanTurns(body []byte) []string
+	// LatestUserText returns the raw text of the most recent user
+	// turn. Unlike RecentHumanTurns, it doesn't filter Clawvisor
+	// internal verbs — secret-detection / reply-routing consumers
+	// need the verbatim user message.
+	LatestUserText(body []byte) string
+	// AssistantTextTurns returns flattened text for every assistant-
+	// role turn, most-recent first. Tool_use blocks are skipped.
+	AssistantTextTurns(body []byte) []string
+	// PrependAssistantText splices text into the leading assistant
+	// turn. Returns body unchanged when no assistant turn exists or
+	// when the splice can't be performed cleanly.
+	PrependAssistantText(contentType string, body []byte, text string) ([]byte, error)
+}
+
+// InboundShapeRegistry routes a Provider to its InboundBodyShape.
+// Parallel to ResponseRegistry and InboundRegistry on their respective
+// legs, so dispatch stays consistent across all three abstractions.
+type InboundShapeRegistry struct {
+	shapes []InboundBodyShape
+}
+
+func NewInboundShapeRegistry(shapes ...InboundBodyShape) *InboundShapeRegistry {
+	return &InboundShapeRegistry{shapes: shapes}
+}
+
+// ForProvider returns the shape registered for p, or nil. Callers
+// that want a non-nil "do-nothing" default should wrap the result.
+func (r *InboundShapeRegistry) ForProvider(p Provider) InboundBodyShape {
+	if r == nil {
+		return nil
+	}
+	for _, shape := range r.shapes {
+		if shape.Name() == p {
+			return shape
+		}
+	}
+	return nil
 }
 
 type ResponseRegistry struct {
