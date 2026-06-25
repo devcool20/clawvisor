@@ -728,6 +728,10 @@ func rewriteControlStructuredToolUse(t conversation.ToolUse, opts inspector.Rewr
 	}
 	raw["url"] = rewritten.String()
 
+	if strings.HasSuffix(strings.TrimSuffix(normalizedPath, "/"), "/complete") {
+		raw["method"] = "POST"
+	}
+
 	headers, _ := raw["headers"].(map[string]any)
 	if headers == nil {
 		headers = map[string]any{}
@@ -899,9 +903,26 @@ func rewriteControlCommandString(cmd string, v inspector.Verdict, opts inspector
 		if opts.CallerToken != "" && opts.CallerHeader != "" {
 			headers += " -H " + shellSingleQuote(opts.CallerHeader+": Bearer "+opts.CallerToken)
 		}
+		if v.Method == "POST" && !hasMethodOrDataFlag(args) {
+			headers += " -X POST"
+		}
 		return cmd[:arg.start] + headers + " " + shellSingleQuote(rewritten.String()) + cmd[arg.end:], true
 	}
 	return "", false
+}
+
+func hasMethodOrDataFlag(args []controlCurlArg) bool {
+	for _, arg := range args {
+		tok := arg.value
+		if tok == "-X" || tok == "--request" ||
+			tok == "-d" || tok == "--data" || tok == "--data-raw" || tok == "--data-binary" || tok == "--data-urlencode" || tok == "--data-json" ||
+			tok == "-F" || tok == "--form" ||
+			strings.HasPrefix(tok, "-d") || strings.HasPrefix(tok, "--data=") || strings.HasPrefix(tok, "--data-raw=") || strings.HasPrefix(tok, "--data-binary=") || strings.HasPrefix(tok, "--data-urlencode=") || strings.HasPrefix(tok, "--data-json=") ||
+			strings.HasPrefix(tok, "-F") || strings.HasPrefix(tok, "--form=") {
+			return true
+		}
+	}
+	return false
 }
 
 func firstNonEmptyControl(values ...string) string {
@@ -1200,13 +1221,17 @@ func parseControlURL(raw string, controlBaseURL string) (*url.URL, bool) {
 }
 
 func normalizeControlPath(path string) (string, bool) {
+	trimmed := path
+	if len(trimmed) > 1 && strings.HasSuffix(trimmed, "/") {
+		trimmed = strings.TrimSuffix(trimmed, "/")
+	}
 	switch {
-	case path == ControlAPIPath || strings.HasPrefix(path, ControlAPIPath+"/"):
-		return path, true
-	case path == ControlSyntheticPath:
+	case trimmed == ControlAPIPath || strings.HasPrefix(trimmed, ControlAPIPath+"/"):
+		return trimmed, true
+	case trimmed == ControlSyntheticPath:
 		return ControlAPIPath, true
-	case strings.HasPrefix(path, ControlSyntheticPath+"/"):
-		return ControlAPIPath + strings.TrimPrefix(path, ControlSyntheticPath), true
+	case strings.HasPrefix(trimmed, ControlSyntheticPath+"/"):
+		return ControlAPIPath + strings.TrimPrefix(trimmed, ControlSyntheticPath), true
 	default:
 		return "", false
 	}
@@ -1266,6 +1291,7 @@ func controlMethodForPath(path string) string {
 }
 
 func controlMethodForCall(path string, body []byte) string {
+	path = strings.TrimSuffix(path, "/")
 	if strings.HasSuffix(path, "/tasks") && len(body) > 0 {
 		return "POST"
 	}

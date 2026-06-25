@@ -249,7 +249,10 @@ func (h *LLMControlHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if task.ExpiresAt != nil && task.ExpiresAt.Before(now) {
-			_ = h.Store.UpdateTaskStatus(r.Context(), task.ID, "expired")
+			won, statusErr := h.Store.UpdateTaskStatusFrom(r.Context(), task.ID, "active", "expired")
+			if statusErr == nil && won {
+				_ = h.Store.DeleteChainFactsByTask(r.Context(), task.ID)
+			}
 			continue
 		}
 		checkedOut := task.ID == checkoutID

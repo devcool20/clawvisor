@@ -684,14 +684,26 @@ func (h *ApprovalsHandler) expireTimedOut(ctx context.Context) {
 		return
 	}
 	for _, task := range expiredTasks {
-		_ = h.st.UpdateTaskStatus(ctx, task.ID, "expired")
+		won, statusErr := h.st.UpdateTaskStatusFrom(ctx, task.ID, "active", "expired")
+		if statusErr != nil {
+			h.logger.WarnContext(ctx, "task expiry cleanup: status flip failed", "task_id", task.ID, "err", statusErr)
+			continue
+		}
+		if !won {
+			// Lost the CAS: task was concurrently completed or revoked. Skip.
+			continue
+		}
+
+		if err := h.st.DeleteChainFactsByTask(ctx, task.ID); err != nil {
+			h.logger.WarnContext(ctx, "chain facts cleanup failed on task expiration (Sweep)", "err", err, "task_id", task.ID)
+		}
 
 		h.updateNotificationMsg(ctx, "task", task.ID, task.UserID, "⏰ <b>Task expired</b>")
 
 		if task.CallbackURL != nil && *task.CallbackURL != "" {
 			cbKey, _ := h.st.GetAgentCallbackSecret(ctx, task.AgentID)
 			// See processExpiredApproval — same reason for using the
-			// bounded dispatcher instead of synchronous DeliverResult.
+			// Bounded dispatcher instead of synchronous DeliverResult.
 			h.dispatchCallback(*task.CallbackURL, &callback.Payload{
 				Type:   "task",
 				TaskID: task.ID,
