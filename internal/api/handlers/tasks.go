@@ -1112,7 +1112,9 @@ func (h *TasksHandler) List(w http.ResponseWriter, r *http.Request) {
 			// Opportunistically mark expired tasks in the DB so the
 			// background sweep doesn't have to catch them later.
 			won, statusErr := h.st.UpdateTaskStatusFrom(ctx, t.ID, "active", "expired")
-			if statusErr == nil && won {
+			if statusErr != nil {
+				h.logger.DebugContext(ctx, "opportunistic task expiration update failed (List)", "err", statusErr, "task_id", t.ID)
+			} else if won {
 				if err := h.st.DeleteChainFactsByTask(ctx, t.ID); err != nil {
 					h.logger.WarnContext(ctx, "chain facts cleanup failed on task expiration (List)", "err", err, "task_id", t.ID)
 				}
