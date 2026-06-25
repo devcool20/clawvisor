@@ -703,7 +703,7 @@ func (h *ApprovalsHandler) expireTimedOut(ctx context.Context) {
 		if task.CallbackURL != nil && *task.CallbackURL != "" {
 			cbKey, _ := h.st.GetAgentCallbackSecret(ctx, task.AgentID)
 			// See processExpiredApproval — same reason for using the
-			// Bounded dispatcher instead of synchronous DeliverResult.
+			// bounded dispatcher instead of synchronous DeliverResult.
 			h.dispatchCallback(*task.CallbackURL, &callback.Payload{
 				Type:   "task",
 				TaskID: task.ID,

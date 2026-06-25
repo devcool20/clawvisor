@@ -82,7 +82,9 @@ func (h *TasksHandler) dispatchCallback(url string, payload *callback.Payload, s
 		return
 	}
 	safeGo(h.logger, "callback delivery (inline)", func() {
-		_ = callback.DeliverResult(context.Background(), url, payload, signingKey)
+		cbCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = callback.DeliverResult(cbCtx, url, payload, signingKey)
 	})
 }
 

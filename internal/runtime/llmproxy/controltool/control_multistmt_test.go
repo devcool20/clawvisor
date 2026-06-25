@@ -176,8 +176,8 @@ func TestRewriteControlToolUse_CompleteCurlInjectsCallerAuth(t *testing.T) {
 }
 
 // TestRewriteControlToolUse_BodylessCompleteCurlInjectsMethodAndCallerAuth verifies
-// that a bare curl call to /complete (no -X POST) is rewritten to inject -X POST
-// to prevent NONCE_TARGET_MISMATCH 403 errors.
+// that a bare curl call to /complete (no -X POST) is rewritten to target the
+// synthetic complete URL and embeds the minted caller nonce, but does NOT coerce the method.
 func TestRewriteControlToolUse_BodylessCompleteCurlInjectsMethodAndCallerAuth(t *testing.T) {
 	tu := conversation.ToolUse{
 		ID:   "tu_1",
@@ -195,8 +195,8 @@ func TestRewriteControlToolUse_BodylessCompleteCurlInjectsMethodAndCallerAuth(t 
 		t.Errorf("verdict method = %q, want POST", verdict.Method)
 	}
 	cmd := string(rewritten)
-	if !strings.Contains(cmd, "-X POST") {
-		t.Errorf("rewritten command should inject -X POST; got %s", cmd)
+	if strings.Contains(cmd, "-X POST") {
+		t.Errorf("rewritten command should NOT inject -X POST; got %s", cmd)
 	}
 	if !strings.Contains(cmd, minted) {
 		t.Errorf("rewritten command should embed the minted caller nonce; got %s", cmd)
@@ -224,8 +224,8 @@ func TestRewriteControlToolUse_TrailingSlashCompleteCurlNormalizes(t *testing.T)
 		t.Errorf("verdict method = %q, want POST", verdict.Method)
 	}
 	cmd := string(rewritten)
-	if !strings.Contains(cmd, "-X POST") {
-		t.Errorf("rewritten command should inject -X POST; got %s", cmd)
+	if strings.Contains(cmd, "-X POST") {
+		t.Errorf("rewritten command should NOT inject -X POST; got %s", cmd)
 	}
 	if !strings.Contains(cmd, "/api/control/tasks/task-abc/complete") {
 		t.Errorf("rewritten command should target normalized path; got %s", cmd)
